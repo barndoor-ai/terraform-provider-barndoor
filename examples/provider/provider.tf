@@ -1,3 +1,10 @@
-provider "scaffolding" {
-  # example configuration here
+provider "barndoor" {
+  base_url  = "https://platform.barndoor.ai/api/system-management/public/v1"
+  token_url = "https://auth.barndoor.ai/realms/barndoor/protocol/openid-connect/token"
+  client_id = "your-service-account-client-id"
+
+  # client_secret and organization_id are best supplied via environment
+  # variables (BARNDOOR_CLIENT_SECRET, BARNDOOR_ORGANIZATION_ID) rather than
+  # committed to configuration.
+  organization_id = "your-keycloak-organization-uuid"
 }

@@ -1,34 +1,40 @@
-// Copyright IBM Corp. 2021, 2025
+// Copyright (c) Barndoor AI, Inc.
 // SPDX-License-Identifier: MPL-2.0
 
 package provider
 
 import (
+	"context"
 	"testing"
 
-	"github.com/hashicorp/terraform-plugin-framework/providerserver"
-	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
-	"github.com/hashicorp/terraform-plugin-testing/echoprovider"
+	"github.com/hashicorp/terraform-plugin-framework/provider"
 )
 
-// testAccProtoV6ProviderFactories is used to instantiate a provider during acceptance testing.
-// The factory function is called for each Terraform CLI command to create a provider
-// server that the CLI can connect to and interact with.
-var testAccProtoV6ProviderFactories = map[string]func() (tfprotov6.ProviderServer, error){
-	"scaffolding": providerserver.NewProtocol6WithError(New("test")()),
+func TestProvider_Metadata(t *testing.T) {
+	var resp provider.MetadataResponse
+	New("test")().Metadata(context.Background(), provider.MetadataRequest{}, &resp)
+
+	if resp.TypeName != "barndoor" {
+		t.Errorf("TypeName = %q, want %q", resp.TypeName, "barndoor")
+	}
+	if resp.Version != "test" {
+		t.Errorf("Version = %q, want %q", resp.Version, "test")
+	}
 }
 
-// testAccProtoV6ProviderFactoriesWithEcho includes the echo provider alongside the scaffolding provider.
-// It allows for testing assertions on data returned by an ephemeral resource during Open.
-// The echoprovider is used to arrange tests by echoing ephemeral data into the Terraform state.
-// This lets the data be referenced in test assertions with state checks.
-var testAccProtoV6ProviderFactoriesWithEcho = map[string]func() (tfprotov6.ProviderServer, error){
-	"scaffolding": providerserver.NewProtocol6WithError(New("test")()),
-	"echo":        echoprovider.NewProviderServer(),
-}
+func TestProvider_Schema(t *testing.T) {
+	var resp provider.SchemaResponse
+	New("test")().Schema(context.Background(), provider.SchemaRequest{}, &resp)
 
-func testAccPreCheck(t *testing.T) {
-	// You can add code here to run prior to any test case execution, for example assertions
-	// about the appropriate environment variables being set are common to see in a pre-check
-	// function.
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("schema diagnostics: %+v", resp.Diagnostics)
+	}
+	for _, attr := range []string{"base_url", "token_url", "client_id", "client_secret", "organization_id"} {
+		if _, ok := resp.Schema.Attributes[attr]; !ok {
+			t.Errorf("schema missing attribute %q", attr)
+		}
+	}
+	if !resp.Schema.Attributes["client_secret"].IsSensitive() {
+		t.Error("client_secret attribute should be marked Sensitive")
+	}
 }
