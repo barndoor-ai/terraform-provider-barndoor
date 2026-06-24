@@ -59,7 +59,7 @@ resource "barndoor_log_export" "audit_iam" {
 
 ### Required
 
-- `destination` (Attributes) Customer-owned S3-compatible bucket that exported audit logs are written to. Identifier fields are trimmed of surrounding whitespace by the API. (see [below for nested schema](#nestedatt--destination))
+- `destination` (Attributes) Customer-owned S3-compatible bucket that exported audit logs are written to. Identifier values must not have surrounding whitespace; omit optional fields rather than setting them to an empty string. (see [below for nested schema](#nestedatt--destination))
 
 ### Optional
 

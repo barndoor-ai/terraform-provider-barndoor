@@ -130,7 +130,8 @@ func (r *logExportResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 			},
 			"destination": schema.SingleNestedAttribute{
 				MarkdownDescription: "Customer-owned S3-compatible bucket that exported audit logs are " +
-					"written to. Identifier fields are trimmed of surrounding whitespace by the API.",
+					"written to. Identifier values must not have surrounding whitespace; omit optional " +
+					"fields rather than setting them to an empty string.",
 				Required:   true,
 				Attributes: destinationSchemaAttributes(),
 			},
@@ -283,6 +284,7 @@ func (r *logExportResource) ValidateConfig(ctx context.Context, req resource.Val
 
 	if cfg.Destination != nil {
 		validateDestinationConfig(cfg.Destination, &resp.Diagnostics)
+		validateDestinationStrings(cfg.Destination, &resp.Diagnostics)
 	}
 	if cfg.Settings != nil {
 		validateSettingsConfig(cfg.Settings, &resp.Diagnostics)
@@ -343,6 +345,46 @@ func validateDestinationConfig(d *destinationModel, diags *diag.Diagnostics) {
 		diags.AddAttributeError(base.AtName("auth_method"),
 			"Invalid auth_method",
 			fmt.Sprintf("`auth_method` must be %q or %q, got %q.", authMethodAccessKeys, authMethodIAMRole, authMethod))
+	}
+}
+
+// validateDestinationStrings rejects empty and whitespace-padded identifier
+// values. The API trims these fields server-side (see the SMS destination
+// handler), so a padded value would read back trimmed and surface as a
+// "provider produced an inconsistent result" error; an explicit empty string
+// would read back as null for the same reason. Rejecting both at plan time
+// turns those into a clear, actionable message.
+func validateDestinationStrings(d *destinationModel, diags *diag.Diagnostics) {
+	base := path.Root("destination")
+	fields := []struct {
+		name string
+		v    types.String
+	}{
+		{"endpoint", d.Endpoint},
+		{"bucket", d.Bucket},
+		{"region", d.Region},
+		{"path_prefix", d.PathPrefix},
+		{"iam_role_arn", d.IAMRoleArn},
+		{"access_key_id", d.AccessKeyID},
+		{"secret_access_key", d.SecretAccessKey},
+	}
+	for _, f := range fields {
+		if f.v.IsNull() || f.v.IsUnknown() {
+			continue
+		}
+		s := f.v.ValueString()
+		if s != strings.TrimSpace(s) {
+			// Note: the value itself is never echoed, keeping secrets out of diagnostics.
+			diags.AddAttributeError(base.AtName(f.name),
+				"Surrounding whitespace not allowed",
+				fmt.Sprintf("`%s` has leading or trailing whitespace. The API trims it, which would cause persistent drift; remove the surrounding whitespace.", f.name))
+			continue
+		}
+		if s == "" {
+			diags.AddAttributeError(base.AtName(f.name),
+				"Value must not be empty",
+				fmt.Sprintf("`%s` is set to an empty string; omit the attribute instead.", f.name))
+		}
 	}
 }
 
