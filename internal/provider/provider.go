@@ -108,9 +108,11 @@ func (p *BarndoorProvider) Configure(ctx context.Context, req provider.Configure
 	resp.DataSourceData = c
 }
 
-// Resources are registered as they are implemented (barndoor_log_export, …).
+// Resources are registered as they are implemented.
 func (p *BarndoorProvider) Resources(ctx context.Context) []func() resource.Resource {
-	return nil
+	return []func() resource.Resource{
+		NewLogExportResource,
+	}
 }
 
 // DataSources are registered as they are implemented.
