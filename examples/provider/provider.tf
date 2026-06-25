@@ -1,5 +1,5 @@
 provider "barndoor" {
-  base_url  = "https://platform.barndoor.ai/api/system-management/public/v1"
+  base_url  = "https://app.barndoor.ai/api/system-management/public/v1"
   token_url = "https://auth.barndoor.ai/realms/barndoor/protocol/openid-connect/token"
   client_id = "your-service-account-client-id"
 

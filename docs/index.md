@@ -13,7 +13,7 @@ The Barndoor provider manages Barndoor AI platform resources as code. It authent
 
 ```terraform
 provider "barndoor" {
-  base_url  = "https://platform.barndoor.ai/api/system-management/public/v1"
+  base_url  = "https://app.barndoor.ai/api/system-management/public/v1"
   token_url = "https://auth.barndoor.ai/realms/barndoor/protocol/openid-connect/token"
   client_id = "your-service-account-client-id"
 
@@ -29,7 +29,7 @@ provider "barndoor" {
 
 ### Optional
 
-- `base_url` (String) Base URL of the Barndoor public API, e.g. `https://platform.barndoor.ai/api/system-management/public/v1`. May also be set via the `BARNDOOR_BASE_URL` environment variable.
+- `base_url` (String) Base URL of the Barndoor public API, e.g. `https://app.barndoor.ai/api/system-management/public/v1` (the control-plane host, not the `platform.` MCP host). May also be set via the `BARNDOOR_BASE_URL` environment variable.
 - `client_id` (String) Client ID of the Barndoor service-account credential. May also be set via `BARNDOOR_CLIENT_ID`.
 - `client_secret` (String, Sensitive) Client secret of the Barndoor service-account credential. May also be set via `BARNDOOR_CLIENT_SECRET`. Prefer the environment variable over committing the secret to configuration.
 - `organization_id` (String) Barndoor organization ID (the Keycloak organization UUID) the credential is scoped to; it must match the credential's token claims. May also be set via `BARNDOOR_ORGANIZATION_ID`.

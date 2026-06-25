@@ -48,7 +48,7 @@ func (p *BarndoorProvider) Schema(ctx context.Context, req provider.SchemaReques
 			"public API at `base_url`.",
 		Attributes: map[string]schema.Attribute{
 			"base_url": schema.StringAttribute{
-				MarkdownDescription: "Base URL of the Barndoor public API, e.g. `https://platform.barndoor.ai/api/system-management/public/v1`. May also be set via the `BARNDOOR_BASE_URL` environment variable.",
+				MarkdownDescription: "Base URL of the Barndoor public API, e.g. `https://app.barndoor.ai/api/system-management/public/v1` (the control-plane host, not the `platform.` MCP host). May also be set via the `BARNDOOR_BASE_URL` environment variable.",
 				Optional:            true,
 			},
 			"token_url": schema.StringAttribute{
