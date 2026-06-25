@@ -117,7 +117,9 @@ func (p *BarndoorProvider) Resources(ctx context.Context) []func() resource.Reso
 
 // DataSources are registered as they are implemented.
 func (p *BarndoorProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
-	return nil
+	return []func() datasource.DataSource{
+		NewLogExportAWSTrustInfoDataSource,
+	}
 }
 
 func New(version string) func() provider.Provider {

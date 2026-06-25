@@ -4,12 +4,9 @@
 package provider
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 
@@ -677,31 +674,7 @@ func (r *logExportResource) readInto(ctx context.Context, state *logExportResour
 }
 
 func (r *logExportResource) doJSON(ctx context.Context, method, path string, body, out any) error {
-	var rdr io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return fmt.Errorf("encode request body: %w", err)
-		}
-		rdr = bytes.NewReader(b)
-	}
-
-	resp, err := r.client.Do(ctx, method, path, rdr)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return &apiError{method: method, path: path, status: resp.StatusCode, body: strings.TrimSpace(string(data))}
-	}
-	if out != nil && len(data) > 0 {
-		if err := json.Unmarshal(data, out); err != nil {
-			return fmt.Errorf("decode %s %s response: %w", method, path, err)
-		}
-	}
-	return nil
+	return doJSON(ctx, r.client, method, path, body, out)
 }
 
 // saveErrorState persists best-known state alongside an error so a subsequent
@@ -1012,25 +985,3 @@ func nullUnknownInt64(v *types.Int64) {
 		*v = types.Int64Null()
 	}
 }
-
-func isNotFound(err error) bool {
-	var apiErr *apiError
-	return errors.As(err, &apiErr) && apiErr.NotFound()
-}
-
-// apiError is a non-2xx response from the Barndoor API.
-type apiError struct {
-	method string
-	path   string
-	status int
-	body   string
-}
-
-func (e *apiError) Error() string {
-	if e.body == "" {
-		return fmt.Sprintf("%s %s: unexpected status %d", e.method, e.path, e.status)
-	}
-	return fmt.Sprintf("%s %s: unexpected status %d: %s", e.method, e.path, e.status, e.body)
-}
-
-func (e *apiError) NotFound() bool { return e.status == http.StatusNotFound }
