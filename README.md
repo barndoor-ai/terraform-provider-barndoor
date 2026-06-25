@@ -50,9 +50,18 @@ go install
 ## Developing
 
 - `make generate` — regenerate documentation (`tfplugindocs`) and license headers.
-- `make testacc` — run the acceptance suite (`TF_ACC`); requires a reachable
-  Barndoor environment and a service-account credential.
-  **Acceptance tests create real resources.**
+- `make test` — unit tests (no network, no credentials).
+- `make testacc` — run the acceptance suite (`TF_ACC`). It needs a reachable
+  Barndoor environment and a service-account credential, and **skips cleanly**
+  when the `BARNDOOR_*` connection variables are unset. The destructive
+  (create/update/destroy) tests additionally require an explicit *disposable*
+  test org and refuse to run against the live setup org — see the safety notes
+  at the top of [`internal/provider/acceptance_test.go`](internal/provider/acceptance_test.go).
+
+## Releasing
+
+See [RELEASING.md](RELEASING.md) for the signed-release + Terraform Registry
+publishing runbook.
 
 ## License
 
