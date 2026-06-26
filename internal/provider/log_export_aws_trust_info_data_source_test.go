@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
 func newTrustInfoSchema(t *testing.T) schema.Schema {
@@ -164,6 +165,52 @@ func TestAddTrustInfoError(t *testing.T) {
 			}
 			if tc.wantDetailSub != "" && !strings.Contains(got.Detail(), tc.wantDetailSub) {
 				t.Errorf("detail %q does not contain %q", got.Detail(), tc.wantDetailSub)
+			}
+		})
+	}
+}
+
+func TestResolveTrustInfoTarget(t *testing.T) {
+	tests := map[string]struct {
+		cfgOrg      types.String
+		cfgType     types.String
+		providerOrg string
+		wantOrg     string
+		wantType    string
+		wantErr     bool
+	}{
+		"both unset fall back to provider org and default type": {
+			cfgOrg: types.StringNull(), cfgType: types.StringNull(), providerOrg: "org-prov",
+			wantOrg: "org-prov", wantType: defaultExportType,
+		},
+		"config overrides both": {
+			cfgOrg: types.StringValue("org-cfg"), cfgType: types.StringValue("custom-json"), providerOrg: "org-prov",
+			wantOrg: "org-cfg", wantType: "custom-json",
+		},
+		"empty-string config org falls back to provider": {
+			cfgOrg: types.StringValue(""), cfgType: types.StringNull(), providerOrg: "org-prov",
+			wantOrg: "org-prov", wantType: defaultExportType,
+		},
+		"no org from config or provider is an error": {
+			cfgOrg: types.StringNull(), cfgType: types.StringNull(), providerOrg: "",
+			wantErr: true,
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			orgID, exportType, diags := resolveTrustInfoTarget(tc.cfgOrg, tc.cfgType, tc.providerOrg)
+			if diags.HasError() != tc.wantErr {
+				t.Fatalf("HasError() = %v, want %v (diags: %+v)", diags.HasError(), tc.wantErr, diags)
+			}
+			if tc.wantErr {
+				return
+			}
+			if orgID != tc.wantOrg {
+				t.Errorf("orgID = %q, want %q", orgID, tc.wantOrg)
+			}
+			if exportType != tc.wantType {
+				t.Errorf("exportType = %q, want %q", exportType, tc.wantType)
 			}
 		})
 	}

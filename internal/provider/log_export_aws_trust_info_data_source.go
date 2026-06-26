@@ -84,8 +84,9 @@ func (d *logExportAWSTrustInfoDataSource) Schema(_ context.Context, _ datasource
 
 func (d *logExportAWSTrustInfoDataSource) Configure(_ context.Context, req datasource.ConfigureRequest, resp *datasource.ConfigureResponse) {
 	if req.ProviderData == nil {
-		// Configure is called before the provider is configured (e.g. during
-		// schema validation); nothing to wire up yet.
+		// ProviderData is nil during the framework's early lifecycle phases
+		// (schema/validation), before the provider's Configure has populated it;
+		// there is nothing to wire up yet.
 		return
 	}
 
@@ -115,8 +116,11 @@ func (d *logExportAWSTrustInfoDataSource) Read(ctx context.Context, req datasour
 		return
 	}
 
-	orgID := valueOr(data.OrganizationID, d.client.OrganizationID())
-	exportType := valueOr(data.ExportType, defaultExportType)
+	orgID, exportType, diags := resolveTrustInfoTarget(data.OrganizationID, data.ExportType, d.client.OrganizationID())
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	info, err := fetchAWSTrustInfo(ctx, d.client, orgID, exportType)
 	if err != nil {
@@ -130,6 +134,24 @@ func (d *logExportAWSTrustInfoDataSource) Read(ctx context.Context, req datasour
 	data.ExternalID = types.StringValue(info.ExternalID)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+}
+
+// resolveTrustInfoTarget resolves the organization id and export type from
+// config, falling back to the provider's organization and the default export
+// type. It returns an error diagnostic when no organization id is available
+// from either source — the provider already requires one, so this is a guard
+// against a malformed request path (exports//... ) if that ever changes.
+func resolveTrustInfoTarget(cfgOrgID, cfgExportType types.String, providerOrgID string) (orgID, exportType string, diags diag.Diagnostics) {
+	orgID = valueOr(cfgOrgID, providerOrgID)
+	exportType = valueOr(cfgExportType, defaultExportType)
+	if orgID == "" {
+		diags.AddError(
+			"Missing organization_id",
+			"No organization_id is available. Set `organization_id` on the data source, or set it on the "+
+				"provider block (or via the BARNDOOR_ORGANIZATION_ID environment variable).",
+		)
+	}
+	return orgID, exportType, diags
 }
 
 // awsTrustInfoResponse mirrors the SMS GET .../destination/aws-trust-info body.
