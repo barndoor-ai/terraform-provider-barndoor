@@ -1,0 +1,18 @@
+# Terraform CLI config that points `barndoor-ai/barndoor` at your locally-built
+# provider binary, so `terraform plan`/`apply` skip the registry entirely (and
+# NO `terraform init` is needed). See ../../CONTRIBUTING.md section 4.
+#
+# Replace the path with your Go bin dir: `go env GOBIN` (or `$(go env GOPATH)/bin`).
+# `make dev-install` (in the repo root) prints this block with the path filled in.
+#
+# Use it without touching ~/.terraformrc:
+#   TF_CLI_CONFIG_FILE=$PWD/dev.tfrc terraform plan
+
+provider_installation {
+  dev_overrides {
+    "registry.terraform.io/barndoor-ai/barndoor" = "/replace/with/your/go/bin"
+  }
+  # For everything except the dev-overridden provider, fall back to normal
+  # resolution.
+  direct {}
+}

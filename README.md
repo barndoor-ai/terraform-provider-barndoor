@@ -49,6 +49,12 @@ go install
 
 ## Developing
 
+- **Testing locally against a local platform:** see [CONTRIBUTING.md](CONTRIBUTING.md)
+  for the full loop — `make tilt`, a local IaC credential, and `dev_overrides`
+  pointed at a local build (no registry, no `terraform init`). A ready-to-run
+  config is in [`examples/local/`](examples/local/).
+- `make dev-install` — build + install the provider and print the
+  `dev_overrides` block for `~/.terraformrc`.
 - `make generate` — regenerate documentation (`tfplugindocs`) and license headers.
 - `make test` — unit tests (no network, no credentials).
 - `make testacc` — run the acceptance suite (`TF_ACC`). It needs a reachable
