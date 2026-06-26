@@ -135,6 +135,13 @@ flag only if you have the key imported and `GPG_FINGERPRINT` exported. (Install
 GoReleaser with `go install github.com/goreleaser/goreleaser/v2@latest` if
 needed; the config is `version: 2`.)
 
+> [!NOTE]
+> The GoReleaser builds run a `go mod tidy` `before` hook (see
+> [`.goreleaser.yml`](.goreleaser.yml)), so a local `--snapshot` run can modify
+> `go.mod`/`go.sum` in your working tree. That is expected for the snapshot;
+> review and **discard any resulting churn** (`git checkout -- go.mod go.sum`)
+> rather than committing it as part of the release.
+
 ### Tag and push
 
 1. Update [`CHANGELOG.md`](CHANGELOG.md): rename the `Unreleased` heading to the
