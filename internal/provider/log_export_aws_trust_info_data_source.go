@@ -150,18 +150,21 @@ func fetchAWSTrustInfo(ctx context.Context, c *client.Client, orgID, exportType 
 }
 
 // addTrustInfoError turns the API error into an actionable diagnostic, calling
-// out the two failure modes a practitioner is most likely to hit: the feature
-// not being enabled (403) and the export not existing (404).
+// out the two failure modes a practitioner is most likely to hit: the request
+// being forbidden (403, usually the iam_role feature) and the export not
+// existing (404).
 func addTrustInfoError(diags *diag.Diagnostics, orgID, exportType string, err error) {
 	var apiErr *apiError
 	if errors.As(err, &apiErr) {
 		switch apiErr.status {
 		case http.StatusForbidden:
 			diags.AddError(
-				"IAM-role auth is not enabled for this organization",
-				fmt.Sprintf("The aws-trust-info endpoint for organization %q is only available when the "+
-					"`iam_role` auth method is enabled for the organization. Enable it (or use `access_keys` "+
-					"auth instead), then re-run.\n\nUnderlying error: %s", orgID, err.Error()),
+				"Access denied reading AWS trust info (HTTP 403)",
+				fmt.Sprintf("The Barndoor API returned 403 Forbidden for organization %q. The most common cause "+
+					"is that the `iam_role` auth method is not enabled for the organization — this endpoint is "+
+					"gated on that feature. It can also mean the configured credential is not authorized for this "+
+					"organization. Enable `iam_role` (or use `access_keys` auth, which does not need trust info), "+
+					"confirm the credential's organization, then re-run.\n\nUnderlying error: %s", orgID, err.Error()),
 			)
 			return
 		case http.StatusNotFound:

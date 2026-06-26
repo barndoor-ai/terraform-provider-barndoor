@@ -7,10 +7,12 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 )
 
 func newTrustInfoSchema(t *testing.T) schema.Schema {
@@ -117,4 +119,52 @@ func TestFetchAWSTrustInfo(t *testing.T) {
 			t.Errorf("expected NotFound, got %v", err)
 		}
 	})
+}
+
+func TestAddTrustInfoError(t *testing.T) {
+	apiErr := func(status int) error {
+		return &apiError{method: http.MethodGet, path: "exports/o/t/destination/aws-trust-info", status: status, body: "boom"}
+	}
+
+	tests := map[string]struct {
+		err           error
+		wantSummary   string
+		wantDetailSub string // optional substring the detail must contain
+	}{
+		"403 leads with iam_role but does not claim it is the only cause": {
+			err:           apiErr(http.StatusForbidden),
+			wantSummary:   "Access denied reading AWS trust info (HTTP 403)",
+			wantDetailSub: "iam_role",
+		},
+		"404 is export not found": {
+			err:         apiErr(http.StatusNotFound),
+			wantSummary: "Export not found",
+		},
+		"other status falls through to the generic error": {
+			err:         apiErr(http.StatusInternalServerError),
+			wantSummary: "Failed to read AWS trust info",
+		},
+		"non-API error falls through to the generic error": {
+			err:         errors.New("dial tcp: connection refused"),
+			wantSummary: "Failed to read AWS trust info",
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			var diags diag.Diagnostics
+			addTrustInfoError(&diags, "org-123", "datadog-json", tc.err)
+
+			if !diags.HasError() {
+				t.Fatal("expected an error diagnostic, got none")
+			}
+			got := diags.Errors()[0]
+			if got.Summary() != tc.wantSummary {
+				t.Errorf("summary = %q, want %q", got.Summary(), tc.wantSummary)
+			}
+			if tc.wantDetailSub != "" && !strings.Contains(got.Detail(), tc.wantDetailSub) {
+				t.Errorf("detail %q does not contain %q", got.Detail(), tc.wantDetailSub)
+			}
+		})
+	}
 }
