@@ -104,19 +104,27 @@ signed by a local self-signed CA (`CN=Barndoor Local CA`), so until that CA is
 trusted by the OS, every call fails with `x509: certificate signed by unknown
 authority`.
 
-`make tilt` creates and mounts the certs but does **not** trust the CA (that
-needs `sudo`). Run the dedicated target once:
+`make tilt` generates the certs (and the k8s secrets) but does **not** trust the
+CA (that needs `sudo`). Run the dedicated target once:
 
 ```bash
 # In your bdai-platform checkout:
 make trust-certs
 ```
 
-It adds `tls-certs/local-ca.crt` to the macOS **System** keychain as a trusted
-root. Go's TLS verifier on macOS consults the system keychain, so once this is
-done the provider trusts `https://auth.barndoorlocal.com` and
+It adds the local CA (`local-ca.crt`) to the macOS **System** keychain as a
+trusted root. Go's TLS verifier on macOS consults the system keychain, so once
+this is done the provider trusts `https://auth.barndoorlocal.com` and
 `https://mcp.barndoorlocal.com` with **no code change**. (Your browser will also
 stop warning on `https://app.barndoorlocal.com`.)
+
+> **If `trust-certs` errors with `CA certificate not found: …/local-ca.crt`:**
+> the cert files don't exist yet at the configured `tilt.tls-certs-dir` (default
+> `~/.barndoor/tls-certs`, overridable in `values.yaml` / `values.override.yaml`).
+> A full `make tilt` creates them; to generate just the cert files without a
+> cluster, run **`make create-certs`** first, then `make trust-certs`. (The error
+> message points at the raw `uv run … create-tls-secrets` script; the `make`
+> wrappers resolve the right `--tls-certs-dir` for you.)
 
 Not on macOS, or you'd rather not modify your trust store? Use the
 [port-forward fallback](#fallback-skip-tls-with-port-forwards).
