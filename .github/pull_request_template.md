@@ -1,16 +1,26 @@
-## Related Issue
-
-Fixes # <!-- INSERT ISSUE NUMBER -->
+<!--
+Thanks for contributing to the Barndoor Terraform provider! Please fill out the
+sections below. See CONTRIBUTING.md for build, test, and style guidance.
+-->
 
 ## Description
 
-In plain English, describe your approach to addressing the issue linked above. For example, if you made a particular design decision, let us know why you chose this path instead of another solution.
+<!-- What does this change do, and why? Link the issue it addresses. -->
 
-<!-- heimdall_github_prtemplate:grc-pci_dss-2024-01-05 -->
-## Rollback Plan
+Fixes #
 
-- [ ] If a change needs to be reverted, we will roll out an update to the code within 7 days.
+## Type of change
 
-## Changes to Security Controls
+- [ ] Bug fix (non-breaking change that fixes an issue)
+- [ ] New feature (non-breaking change that adds functionality)
+- [ ] Breaking change (fix or feature that changes existing behavior)
+- [ ] Documentation / examples only
 
-Are there any changes to security controls (access controls, encryption, logging) in this pull request? If so, explain.
+## Checklist
+
+- [ ] `make test` passes (unit tests).
+- [ ] `golangci-lint run` is clean.
+- [ ] `make generate` was run and the regenerated docs/headers are committed (CI fails otherwise).
+- [ ] Added or updated tests covering the change.
+- [ ] Updated the `Unreleased` section of [CHANGELOG.md](../CHANGELOG.md), if user-facing.
+- [ ] For schema changes: ran acceptance tests against a real Barndoor account (`make testacc`), or noted why not.

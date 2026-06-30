@@ -1,14 +1,11 @@
 schema_version = 1
 
 project {
-  license          = "MPL-2.0"
+  license          = "MIT"
   copyright_holder = "Barndoor AI, Inc."
   copyright_year   = 2026
 
   header_ignore = [
-    # internal catalog metadata (prose)
-    "META.d/**/*.yaml",
-
     # examples used within documentation (prose)
     "examples/**",
 
