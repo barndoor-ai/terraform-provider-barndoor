@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"google.golang.org/grpc"
 )
 
 // refreshBuffer re-mints the token this long before its real expiry so a
@@ -33,6 +35,17 @@ type Config struct {
 
 	// HTTPClient is optional; New installs a sane default when nil.
 	HTTPClient *http.Client
+
+	// GRPCTarget, when set, overrides the BaseURL-derived "host:port" gRPC
+	// target. Test seam: production configuration leaves it empty.
+	GRPCTarget string
+
+	// GRPCDialOptions are appended after the default dial options. Test seam:
+	// when non-empty, GRPCConn skips the default TLS transport credentials and
+	// relaxes the per-RPC credentials' transport-security requirement so an
+	// in-process (bufconn) or otherwise insecure test channel can carry the
+	// bearer token. Production configuration leaves it empty.
+	GRPCDialOptions []grpc.DialOption
 }
 
 // Client is an authenticated client for the Barndoor public API.
@@ -43,6 +56,9 @@ type Client struct {
 	mu     sync.Mutex
 	token  string
 	expiry time.Time
+
+	grpcMu   sync.Mutex
+	grpcConn *grpc.ClientConn
 }
 
 // New builds a Client from cfg.

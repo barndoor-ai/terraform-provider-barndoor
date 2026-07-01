@@ -46,9 +46,9 @@ func TestInvalidBaseURLDetail(t *testing.T) {
 		wantOK      bool   // true = accepted (empty detail)
 		wantContain string // substring the detail must contain when rejected
 	}{
-		"host root is accepted":                    {baseURL: "https://platform.barndoor.ai", wantOK: true},
+		"host root is accepted":                     {baseURL: "https://platform.barndoor.ai", wantOK: true},
 		"host root with trailing slash is accepted": {baseURL: "https://platform.barndoor.ai/", wantOK: true},
-		"host root with port is accepted":          {baseURL: "https://platform.example.com:8443", wantOK: true},
+		"host root with port is accepted":           {baseURL: "https://platform.example.com:8443", wantOK: true},
 		"pre-0.2.0 SMS-scoped URL is rejected with the migration": {
 			baseURL:     "https://platform.barndoor.ai/api/system-management/public/v1",
 			wantContain: "/api/system-management/public/v1",

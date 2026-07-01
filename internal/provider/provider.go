@@ -22,6 +22,12 @@ import (
 // Ensure BarndoorProvider satisfies the provider.Provider interface.
 var _ provider.Provider = &BarndoorProvider{}
 
+// testGRPCConfigHook is a test-only seam: when non-nil, Configure invokes it
+// with the assembled client.Config before constructing the client, letting
+// unit tests inject an in-process gRPC target and dial options (bufconn).
+// It must never be set outside tests.
+var testGRPCConfigHook func(*client.Config)
+
 // BarndoorProvider is the Barndoor Terraform provider.
 type BarndoorProvider struct {
 	// version is "dev" for local builds, "test" under acceptance tests, and the
@@ -110,13 +116,17 @@ func (p *BarndoorProvider) Configure(ctx context.Context, req provider.Configure
 		return
 	}
 
-	c := client.New(client.Config{
+	cfg := client.Config{
 		BaseURL:        baseURL,
 		TokenURL:       tokenURL,
 		ClientID:       clientID,
 		ClientSecret:   clientSecret,
 		OrganizationID: organizationID,
-	})
+	}
+	if testGRPCConfigHook != nil {
+		testGRPCConfigHook(&cfg)
+	}
+	c := client.New(cfg)
 
 	// Make the authenticated client available to resources and data sources.
 	resp.ResourceData = c
@@ -127,6 +137,7 @@ func (p *BarndoorProvider) Configure(ctx context.Context, req provider.Configure
 func (p *BarndoorProvider) Resources(ctx context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		NewLogExportResource,
+		NewPolicyResource,
 	}
 }
 
