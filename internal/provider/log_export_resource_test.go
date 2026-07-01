@@ -319,7 +319,11 @@ func TestMapServerToState_AccessKeys(t *testing.T) {
 	}
 	d := state.Destination
 	if d == nil {
+		// The explicit return keeps staticcheck's SA5011 nil-deref analysis
+		// happy even when the t.Fatal noreturn fact is unavailable (seen on
+		// CI's cached-analysis runs).
 		t.Fatal("destination should not be nil")
+		return
 	}
 	if d.Endpoint.ValueString() != "https://s3" || d.AuthMethod.ValueString() != "access_keys" {
 		t.Errorf("destination mismapped: %+v", d)
