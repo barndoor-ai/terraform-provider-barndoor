@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Barndoor Terraform provider documentation
+    url: https://registry.terraform.io/providers/barndoor-ai/barndoor/latest/docs
+    about: Provider usage, resource, and data-source reference.
+  - name: Barndoor support
+    url: https://barndoor.ai
+    about: Questions about your Barndoor account or the platform (not the provider).
+  - name: Report a security vulnerability
+    url: https://github.com/barndoor-ai/terraform-provider-barndoor/security/advisories/new
+    about: Privately disclose a security issue (see SECURITY.md). Do not open a public issue.

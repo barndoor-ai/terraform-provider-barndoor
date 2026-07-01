@@ -1,0 +1,31 @@
+# Binaries and build output
+*.dll
+*.exe
+*.test
+bin/
+dist/
+
+# Editors / OS
+.DS_Store
+.idea/
+*.iml
+*~
+.*.swp
+
+# Terraform state, plans, and local config
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform/
+.terraform.lock.hcl
+crash.log
+crash.*.log
+
+# Local provider dev scratch (e.g. dev_overrides config, ad-hoc configs)
+example.tf
+*.log
+*.bak
+*.backup
+
+# Keep windows files with windows line endings
+*.winfile eol=crlf
