@@ -1,5 +1,5 @@
 // Copyright (c) Barndoor AI, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT
 
 // Package client is a small authenticated HTTP client for the Barndoor public
 // API. It obtains a Keycloak access token via the OAuth2 client_credentials

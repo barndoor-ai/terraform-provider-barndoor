@@ -1,0 +1,69 @@
+name: Bug report
+description: Report a problem with the Barndoor Terraform provider
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug! Please do **not** include
+        secrets (client secrets, access keys, tokens) in any field below.
+  - type: input
+    id: provider_version
+    attributes:
+      label: Provider version
+      description: From `terraform version` or your `required_providers` block.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: terraform_version
+    attributes:
+      label: Terraform version
+      description: From `terraform version`.
+      placeholder: "1.9.0"
+    validations:
+      required: true
+  - type: input
+    id: resources
+    attributes:
+      label: Affected resource(s) / data source(s)
+      placeholder: "barndoor_log_export"
+    validations:
+      required: false
+  - type: textarea
+    id: config
+    attributes:
+      label: Terraform configuration
+      description: Minimal configuration that reproduces the issue. Redact secrets.
+      render: hcl
+    validations:
+      required: false
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Debug output / panic
+      description: Run with `TF_LOG=DEBUG`. For long output, link a Gist. Redact secrets.
+      render: shell
+    validations:
+      required: false

@@ -1,5 +1,5 @@
 // Copyright (c) Barndoor AI, Inc.
-// SPDX-License-Identifier: MPL-2.0
+// SPDX-License-Identifier: MIT
 
 package provider
 
@@ -12,37 +12,37 @@ package provider
 // unset they skip cleanly, so `go test ./...` and the CI test job (which sets
 // TF_ACC=1 but not the credentials) never reach a live backend.
 //
-// To run them, point the provider at a reachable environment (dev is
-// Tailscale-only):
+// To run them, point the provider at a reachable Barndoor environment and a
+// service-account credential scoped to the organization under test:
 //
 //	export TF_ACC=1
-//	export BARNDOOR_BASE_URL=https://platform.barndoordev.com/api/system-management/public/v1
-//	export BARNDOOR_TOKEN_URL=https://auth.barndoordev.com/realms/barndoor/protocol/openid-connect/token
+//	export BARNDOOR_BASE_URL=https://platform.barndoor.ai/api/system-management/public/v1
+//	export BARNDOOR_TOKEN_URL=https://auth.barndoor.ai/realms/barndoor/protocol/openid-connect/token
 //	export BARNDOOR_CLIENT_ID=...            # a client_credentials client
-//	export BARNDOOR_CLIENT_SECRET=...        # from the Keycloak admin UI
+//	export BARNDOOR_CLIENT_SECRET=...        # the client's secret
 //	export BARNDOOR_ORGANIZATION_ID=...      # the org the credential is scoped to
 //	go test ./internal/provider/ -run TestAcc -v
 //
-// # Safety: do not clobber a live export
+// # Safety: do not clobber a real export
 //
-// The dev bootstrap credential (barndoor-log-export-bootstrap) is scoped to the
-// platform setup org, which has a LIVE, actively-delivering export. Its export
-// configuration must never be created, modified, or deleted by a test.
+// An organization's audit-log export may be actively delivering. The write
+// tests must never create, modify, or delete the export configuration of an
+// organization you care about.
 //
 // Therefore:
 //
 //   - TestAccConnectivity is READ-ONLY (a single GET) and safe to run against
-//     any org, including the live setup org. It is the formalized Phase 0.2
-//     verification: prove a client_credentials token mints and the /public/v1
-//     edge read path is reachable and authorized.
+//     any org: it proves a client_credentials token mints and the /public/v1
+//     read path is reachable and authorized.
 //
 //   - The write tests (TestAccLogExportResource_lifecycle and
 //     TestAccLogExportAWSTrustInfoDataSource — the latter mints/persists an
 //     external ID) only run when BARNDOOR_ACC_TEST_ORGANIZATION_ID names a
-//     DISPOSABLE dev test org. They skip with an explicit reason otherwise, and
-//     hard-refuse (fail) if that variable is ever set to the known live setup
-//     org. Run them only with a credential scoped to a throwaway org whose
-//     export row may be freely reconfigured.
+//     DISPOSABLE test org whose export configuration may be freely changed.
+//     They skip with an explicit reason otherwise. As an extra guard, set
+//     BARNDOOR_ACC_PROTECTED_ORGANIZATION_ID to an organization that must never
+//     be touched (e.g. a production org) and the write tests hard-fail if the
+//     disposable-org variable is ever pointed at it.
 
 import (
 	"context"
@@ -61,13 +61,14 @@ import (
 )
 
 const (
-	// liveSetupOrgID is the platform setup org used to bootstrap dev auth
-	// (Phase 0.1/0.2). It hosts a live export; destructive tests refuse it.
-	liveSetupOrgID = "fcdc562c-546c-4cca-8fee-e557a642dc9d"
-
 	// envTestOrgID opts in to the destructive (write) acceptance tests by
-	// naming a disposable dev org whose export config may be clobbered.
+	// naming a disposable org whose export config may be freely changed.
 	envTestOrgID = "BARNDOOR_ACC_TEST_ORGANIZATION_ID"
+
+	// envProtectedOrgID optionally names an organization that must never be used
+	// for a destructive test (e.g. a production org). When set, the write tests
+	// hard-fail if envTestOrgID is pointed at it.
+	envProtectedOrgID = "BARNDOOR_ACC_PROTECTED_ORGANIZATION_ID"
 )
 
 // connEnv lists the connection variables every acceptance test needs.
@@ -98,27 +99,28 @@ func testAccPreCheck(t *testing.T) {
 }
 
 // requireDisposableTestOrg returns the disposable test org for a destructive
-// test, or skips. It hard-fails if the opt-in variable is ever pointed at the
-// known live setup org, so a misconfiguration can never clobber the real export.
+// test, or skips. If BARNDOOR_ACC_PROTECTED_ORGANIZATION_ID is set, it hard-fails
+// when the opt-in variable is pointed at that org, so a misconfiguration can
+// never clobber an organization you have marked off-limits.
 func requireDisposableTestOrg(t *testing.T) string {
 	t.Helper()
 	org := os.Getenv(envTestOrgID)
 	if org == "" {
 		t.Skipf("%s not set: refusing to run a destructive (write) acceptance test, which would clobber a "+
-			"real export configuration. Set it to a DISPOSABLE dev test org (never the live setup org) backed "+
-			"by a credential scoped to that org. See the file header in acceptance_test.go for details.", envTestOrgID)
+			"real export configuration. Set it to a DISPOSABLE test org (whose export config may be freely "+
+			"changed) backed by a credential scoped to that org. See the file header in acceptance_test.go for details.", envTestOrgID)
 	}
-	if org == liveSetupOrgID {
-		t.Fatalf("%s is set to the live setup org %s, which has an actively-delivering export. Refusing to run a "+
-			"destructive acceptance test against it.", envTestOrgID, liveSetupOrgID)
+	if protected := os.Getenv(envProtectedOrgID); protected != "" && org == protected {
+		t.Fatalf("%s is set to the protected org named by %s, which must never be used for a destructive "+
+			"acceptance test. Refusing to run.", envTestOrgID, envProtectedOrgID)
 	}
 	return org
 }
 
 // TestAccConnectivity is a read-only smoke test: it mints a client_credentials
-// token and reads the configured org's export over the /public/v1 edge path.
-// It never mutates anything, so it is safe against the live setup org, and it
-// formalizes the Phase 0.2 verification (token mint + authorized edge read).
+// token and reads the configured org's export over the /public/v1 path. It
+// never mutates anything, so it is safe to run against any org, and it proves
+// the auth + read path end to end (token mint + authorized read).
 func TestAccConnectivity(t *testing.T) {
 	if os.Getenv("TF_ACC") == "" {
 		t.Skip("TF_ACC not set; skipping acceptance test")

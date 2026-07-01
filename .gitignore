@@ -1,35 +1,31 @@
+# Binaries and build output
 *.dll
 *.exe
-.DS_Store
-example.tf
-terraform.tfplan
-terraform.tfstate
+*.test
 bin/
 dist/
-modules-dev/
-/pkg/
-website/.vagrant
-website/.bundle
-website/build
-website/node_modules
-.vagrant/
-*.backup
-./*.tfstate
-.terraform/
-*.log
-*.bak
+
+# Editors / OS
+.DS_Store
+.idea/
+*.iml
 *~
 .*.swp
-.idea
-*.iml
-*.test
-*.iml
 
-website/vendor
+# Terraform state, plans, and local config
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform/
+.terraform.lock.hcl
+crash.log
+crash.*.log
 
-# Test exclusions
-!command/test-fixtures/**/*.tfstate
-!command/test-fixtures/**/.terraform/
+# Local provider dev scratch (e.g. dev_overrides config, ad-hoc configs)
+example.tf
+*.log
+*.bak
+*.backup
 
 # Keep windows files with windows line endings
 *.winfile eol=crlf
