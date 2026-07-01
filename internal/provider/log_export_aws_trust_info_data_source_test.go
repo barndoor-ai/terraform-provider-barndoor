@@ -88,7 +88,7 @@ func TestFetchAWSTrustInfo(t *testing.T) {
 		if info.ExternalID != "ext-abc123" {
 			t.Errorf("external_id = %q", info.ExternalID)
 		}
-		if want := "/public/v1/exports/org-123/datadog-json/destination/aws-trust-info"; gotPath != want {
+		if want := "/api/system-management/public/v1/exports/org-123/datadog-json/destination/aws-trust-info"; gotPath != want {
 			t.Errorf("request path = %q, want %q", gotPath, want)
 		}
 		if gotMethod != http.MethodGet {

@@ -16,7 +16,7 @@ package provider
 // service-account credential scoped to the organization under test:
 //
 //	export TF_ACC=1
-//	export BARNDOOR_BASE_URL=https://platform.barndoor.ai/api/system-management/public/v1
+//	export BARNDOOR_BASE_URL=https://platform.barndoor.ai
 //	export BARNDOOR_TOKEN_URL=https://auth.barndoor.ai/realms/barndoor/protocol/openid-connect/token
 //	export BARNDOOR_CLIENT_ID=...            # a client_credentials client
 //	export BARNDOOR_CLIENT_SECRET=...        # the client's secret
@@ -32,8 +32,8 @@ package provider
 // Therefore:
 //
 //   - TestAccConnectivity is READ-ONLY (a single GET) and safe to run against
-//     any org: it proves a client_credentials token mints and the /public/v1
-//     read path is reachable and authorized.
+//     any org: it proves a client_credentials token mints and the
+//     system-management public read path is reachable and authorized.
 //
 //   - The write tests (TestAccLogExportResource_lifecycle and
 //     TestAccLogExportAWSTrustInfoDataSource — the latter mints/persists an
@@ -118,7 +118,7 @@ func requireDisposableTestOrg(t *testing.T) string {
 }
 
 // TestAccConnectivity is a read-only smoke test: it mints a client_credentials
-// token and reads the configured org's export over the /public/v1 path. It
+// token and reads the configured org's export over the SMS public API path. It
 // never mutates anything, so it is safe to run against any org, and it proves
 // the auth + read path end to end (token mint + authorized read).
 func TestAccConnectivity(t *testing.T) {

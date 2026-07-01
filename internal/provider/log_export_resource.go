@@ -608,7 +608,7 @@ func (r *logExportResource) resolveOrgID(v types.String) string {
 }
 
 func exportPath(orgID, exportType string, suffix ...string) string {
-	p := "exports/" + orgID + "/" + exportType
+	p := smsAPIPrefix + "/exports/" + orgID + "/" + exportType
 	if len(suffix) > 0 {
 		p += "/" + strings.Join(suffix, "/")
 	}

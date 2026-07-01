@@ -59,7 +59,7 @@ credential and run Terraform **without `terraform init`** — dev overrides reso
 the provider from your local build:
 
 ```bash
-export BARNDOOR_BASE_URL=https://platform.barndoor.ai/api/system-management/public/v1
+export BARNDOOR_BASE_URL=https://platform.barndoor.ai   # host root, no path
 export BARNDOOR_TOKEN_URL=https://auth.barndoor.ai/realms/barndoor/protocol/openid-connect/token
 export BARNDOOR_CLIENT_ID=...
 export BARNDOOR_CLIENT_SECRET=...
