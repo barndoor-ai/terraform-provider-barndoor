@@ -19,6 +19,12 @@ import (
 	"github.com/barndoor-ai/terraform-provider-barndoor/internal/client"
 )
 
+// smsAPIPrefix is the system-management-service public API mount point under
+// the platform host root. Since v0.2.0 `base_url` is the host root (e.g.
+// https://platform.barndoor.ai), so every SMS request path carries this
+// service prefix explicitly.
+const smsAPIPrefix = "api/system-management/public/v1"
+
 // doJSON issues an authenticated JSON request against the Barndoor public API.
 // A 2xx response body is decoded into out (when non-nil); any non-2xx status is
 // returned as an *apiError carrying up to 1MiB of the response body. It is the

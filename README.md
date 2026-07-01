@@ -31,7 +31,7 @@ terraform {
 }
 
 provider "barndoor" {
-  base_url        = "https://platform.barndoor.ai/api/system-management/public/v1"
+  base_url        = "https://platform.barndoor.ai" # host root, no path
   token_url       = "https://auth.barndoor.ai/realms/barndoor/protocol/openid-connect/token"
   client_id       = var.barndoor_client_id
   client_secret   = var.barndoor_client_secret # prefer BARNDOOR_CLIENT_SECRET

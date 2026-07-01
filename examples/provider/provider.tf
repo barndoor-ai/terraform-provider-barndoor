@@ -1,5 +1,7 @@
 provider "barndoor" {
-  base_url  = "https://platform.barndoor.ai/api/system-management/public/v1"
+  # The platform host root, with no path — the provider appends each
+  # service's API prefix itself.
+  base_url  = "https://platform.barndoor.ai"
   token_url = "https://auth.barndoor.ai/realms/barndoor/protocol/openid-connect/token"
   client_id = "your-service-account-client-id"
 

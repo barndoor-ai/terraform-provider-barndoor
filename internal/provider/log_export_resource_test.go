@@ -521,8 +521,8 @@ func TestReconcileEnabled(t *testing.T) {
 		current  bool
 		wantCall string
 	}{
-		{"start when newly enabled", true, false, "POST /public/v1/exports/org-123/datadog-json/start"},
-		{"pause when newly disabled", false, true, "POST /public/v1/exports/org-123/datadog-json/pause"},
+		{"start when newly enabled", true, false, "POST /api/system-management/public/v1/exports/org-123/datadog-json/start"},
+		{"pause when newly disabled", false, true, "POST /api/system-management/public/v1/exports/org-123/datadog-json/pause"},
 		{"no-op when already enabled", true, true, ""},
 		{"no-op when already disabled", false, false, ""},
 	}
@@ -559,7 +559,7 @@ func TestReadInto(t *testing.T) {
 			writeToken(w)
 		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/destination"):
 			_, _ = w.Write([]byte(destJSON))
-		case r.Method == http.MethodGet && r.URL.Path == "/public/v1/exports/org-123/datadog-json":
+		case r.Method == http.MethodGet && r.URL.Path == "/api/system-management/public/v1/exports/org-123/datadog-json":
 			_, _ = w.Write([]byte(exportJSON))
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -633,7 +633,9 @@ func newTestClient(t *testing.T, h http.HandlerFunc) *client.Client {
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return client.New(client.Config{
-		BaseURL:        srv.URL + "/public/v1",
+		// base_url is the host root (v0.2.0); resource paths carry the
+		// service prefix themselves.
+		BaseURL:        srv.URL,
 		TokenURL:       srv.URL + "/token",
 		ClientID:       "id",
 		ClientSecret:   "secret",

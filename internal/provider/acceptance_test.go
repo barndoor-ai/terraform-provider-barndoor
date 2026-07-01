@@ -16,7 +16,7 @@ package provider
 // service-account credential scoped to the organization under test:
 //
 //	export TF_ACC=1
-//	export BARNDOOR_BASE_URL=https://platform.barndoor.ai/api/system-management/public/v1
+//	export BARNDOOR_BASE_URL=https://platform.barndoor.ai
 //	export BARNDOOR_TOKEN_URL=https://auth.barndoor.ai/realms/barndoor/protocol/openid-connect/token
 //	export BARNDOOR_CLIENT_ID=...            # a client_credentials client
 //	export BARNDOOR_CLIENT_SECRET=...        # the client's secret
@@ -32,8 +32,8 @@ package provider
 // Therefore:
 //
 //   - TestAccConnectivity is READ-ONLY (a single GET) and safe to run against
-//     any org: it proves a client_credentials token mints and the /public/v1
-//     read path is reachable and authorized.
+//     any org: it proves a client_credentials token mints and the
+//     system-management public read path is reachable and authorized.
 //
 //   - The write tests (TestAccLogExportResource_lifecycle and
 //     TestAccLogExportAWSTrustInfoDataSource — the latter mints/persists an
@@ -43,6 +43,11 @@ package provider
 //     BARNDOOR_ACC_PROTECTED_ORGANIZATION_ID to an organization that must never
 //     be touched (e.g. a production org) and the write tests hard-fail if the
 //     disposable-org variable is ever pointed at it.
+//
+//   - TestAccPolicyResource_lifecycle additionally needs
+//     BARNDOOR_TEST_MCP_SERVER_ID (a real MCP server id in the credential's
+//     org) and skips without it. It only touches policies it creates itself
+//     (timestamped tf-acc-policy-* names); destroy archives them.
 
 import (
 	"context"
@@ -52,6 +57,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
@@ -69,6 +75,11 @@ const (
 	// for a destructive test (e.g. a production org). When set, the write tests
 	// hard-fail if envTestOrgID is pointed at it.
 	envProtectedOrgID = "BARNDOOR_ACC_PROTECTED_ORGANIZATION_ID"
+
+	// envTestMCPServerID opts in to the barndoor_policy acceptance test by
+	// naming a real MCP server in the credential's organization for the
+	// policy's required (and immutable) mcp_server_id.
+	envTestMCPServerID = "BARNDOOR_TEST_MCP_SERVER_ID"
 )
 
 // connEnv lists the connection variables every acceptance test needs.
@@ -118,7 +129,7 @@ func requireDisposableTestOrg(t *testing.T) string {
 }
 
 // TestAccConnectivity is a read-only smoke test: it mints a client_credentials
-// token and reads the configured org's export over the /public/v1 path. It
+// token and reads the configured org's export over the SMS public API path. It
 // never mutates anything, so it is safe to run against any org, and it proves
 // the auth + read path end to end (token mint + authorized read).
 func TestAccConnectivity(t *testing.T) {
@@ -231,6 +242,84 @@ func TestAccLogExportAWSTrustInfoDataSource(t *testing.T) {
 			},
 		},
 	})
+}
+
+// TestAccPolicyResource_lifecycle exercises the barndoor_policy resource
+// end to end (create → update → import → destroy) against a real environment.
+// Destroy ARCHIVES the policy (the platform never hard-deletes), so each run
+// leaves one archived tf-acc-policy-* row behind; the timestamped name keeps
+// runs from colliding with prior archives' live siblings.
+func TestAccPolicyResource_lifecycle(t *testing.T) {
+	if os.Getenv("TF_ACC") == "" {
+		t.Skip("TF_ACC not set; skipping acceptance test")
+	}
+	testAccPreCheck(t)
+
+	mcpServerID := os.Getenv(envTestMCPServerID)
+	if mcpServerID == "" {
+		t.Skipf("%s not set; skipping the barndoor_policy acceptance test. Set it to the id of an MCP "+
+			"server in the credential's organization — the policy's required, immutable mcp_server_id.", envTestMCPServerID)
+	}
+
+	name := fmt.Sprintf("tf-acc-policy-%d", time.Now().UnixNano())
+	const resourceName = "barndoor_policy.test"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				// Create with no status (server defaults to DRAFT) and one
+				// ALLOW rule.
+				Config: testAccPolicyConfig(mcpServerID, name, "DRAFT", 100),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet(resourceName, "id"),
+					resource.TestCheckResourceAttr(resourceName, "name", name),
+					resource.TestCheckResourceAttr(resourceName, "mcp_server_id", mcpServerID),
+					resource.TestCheckResourceAttr(resourceName, "status", "DRAFT"),
+					resource.TestCheckResourceAttr(resourceName, "rules.#", "1"),
+					resource.TestCheckResourceAttr(resourceName, "rules.0.effect", "ALLOW"),
+					resource.TestCheckResourceAttr(resourceName, "rules.0.active", "true"),
+				),
+			},
+			{
+				// In-place update: activate and change the rule's condition.
+				Config: testAccPolicyConfig(mcpServerID, name, "ACTIVE", 250),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "status", "ACTIVE"),
+				),
+			},
+			{
+				// Import by policy id.
+				ResourceName:      resourceName,
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// testAccPolicyConfig renders a barndoor_policy with one conditional ALLOW
+// rule. The condition is written in the canonical compact JSON form so the
+// import-verify step compares byte-identical strings.
+func testAccPolicyConfig(mcpServerID, name, status string, sizeLimit int) string {
+	return fmt.Sprintf(`
+resource "barndoor_policy" "test" {
+  name          = %[1]q
+  mcp_server_id = %[2]q
+  description   = "Terraform acceptance test policy"
+  status        = %[3]q
+  tags          = ["tf-acc"]
+
+  rules = [{
+    name      = "allow small reads"
+    effect    = "ALLOW"
+    actions   = ["*"]
+    roles     = ["*"]
+    condition = "{\"expr\":{\"expr\":\"request.size < %[4]d\"}}"
+  }]
+}
+`, name, mcpServerID, status, sizeLimit)
 }
 
 // testAccLogExportConfig renders a log-export resource for the disposable org.

@@ -5,6 +5,8 @@ package provider
 
 import (
 	"context"
+	"fmt"
+	"net/url"
 	"os"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -19,6 +21,12 @@ import (
 
 // Ensure BarndoorProvider satisfies the provider.Provider interface.
 var _ provider.Provider = &BarndoorProvider{}
+
+// testGRPCConfigHook is a test-only seam: when non-nil, Configure invokes it
+// with the assembled client.Config before constructing the client, letting
+// unit tests inject an in-process gRPC target and dial options (bufconn).
+// It must never be set outside tests.
+var testGRPCConfigHook func(*client.Config)
 
 // BarndoorProvider is the Barndoor Terraform provider.
 type BarndoorProvider struct {
@@ -45,11 +53,13 @@ func (p *BarndoorProvider) Schema(ctx context.Context, req provider.SchemaReques
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "The Barndoor provider manages Barndoor AI platform resources as code. It " +
 			"authenticates with a Keycloak `client_credentials` service account and talks to the platform's " +
-			"public API at `base_url`.",
+			"public APIs under `base_url`.",
 		Attributes: map[string]schema.Attribute{
 			"base_url": schema.StringAttribute{
-				MarkdownDescription: "Base URL of the Barndoor public API, e.g. `https://platform.barndoor.ai/api/system-management/public/v1`. May also be set via the `BARNDOOR_BASE_URL` environment variable.",
-				Optional:            true,
+				MarkdownDescription: "Base URL of the Barndoor platform: the host root with **no path**, e.g. " +
+					"`https://platform.barndoor.ai`. The provider appends each service's API prefix itself. " +
+					"May also be set via the `BARNDOOR_BASE_URL` environment variable.",
+				Optional: true,
 			},
 			"token_url": schema.StringAttribute{
 				MarkdownDescription: "OIDC token endpoint for the `client_credentials` grant, e.g. `https://auth.barndoor.ai/realms/barndoor/protocol/openid-connect/token`. May also be set via `BARNDOOR_TOKEN_URL`.",
@@ -95,13 +105,28 @@ func (p *BarndoorProvider) Configure(ctx context.Context, req provider.Configure
 		return
 	}
 
-	c := client.New(client.Config{
+	// Fail loudly on the pre-v0.2.0 base_url form rather than issuing requests
+	// against paths that no longer exist.
+	if detail := invalidBaseURLDetail(baseURL); detail != "" {
+		resp.Diagnostics.AddAttributeError(
+			path.Root("base_url"),
+			"base_url must be the platform host root",
+			detail,
+		)
+		return
+	}
+
+	cfg := client.Config{
 		BaseURL:        baseURL,
 		TokenURL:       tokenURL,
 		ClientID:       clientID,
 		ClientSecret:   clientSecret,
 		OrganizationID: organizationID,
-	})
+	}
+	if testGRPCConfigHook != nil {
+		testGRPCConfigHook(&cfg)
+	}
+	c := client.New(cfg)
 
 	// Make the authenticated client available to resources and data sources.
 	resp.ResourceData = c
@@ -112,6 +137,7 @@ func (p *BarndoorProvider) Configure(ctx context.Context, req provider.Configure
 func (p *BarndoorProvider) Resources(ctx context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		NewLogExportResource,
+		NewPolicyResource,
 	}
 }
 
@@ -135,6 +161,27 @@ func resolve(v types.String, envKey string) string {
 		return v.ValueString()
 	}
 	return os.Getenv(envKey)
+}
+
+// invalidBaseURLDetail returns a non-empty diagnostic detail when baseURL is
+// not a bare host root. Before v0.2.0 `base_url` was the system-management
+// public API URL (host + /api/system-management/public/v1); the provider now
+// derives each service's path itself, so a lingering path suffix means the
+// practitioner is still on the old form and every request would 404. This is
+// a deliberate breaking change with no compatibility shim — fail loudly with
+// the migration instead.
+func invalidBaseURLDetail(baseURL string) string {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return fmt.Sprintf("base_url %q is not a valid URL: %s.", baseURL, err)
+	}
+	if p := u.EscapedPath(); p != "" && p != "/" {
+		return fmt.Sprintf("As of provider v0.2.0, `base_url` is the Barndoor platform host root and the provider "+
+			"appends each service's API prefix itself. Remove the path suffix %q — if you were using the old "+
+			"form `https://platform.barndoor.ai/api/system-management/public/v1`, set "+
+			"`base_url = \"https://platform.barndoor.ai\"` (or the equivalent `BARNDOOR_BASE_URL`) instead.", p)
+	}
+	return ""
 }
 
 // requireConfig records a diagnostic when a required setting is empty.
