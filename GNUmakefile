@@ -24,7 +24,17 @@ dev-install: install
 lint:
 	golangci-lint run
 
+# Apply copyright headers with the copywrite binary, then run go generate for
+# docs. copywrite is a standalone tool (see CI's setup-copywrite step); install
+# it locally with `brew install hashicorp/tap/copywrite`. It is skipped, not
+# required, when absent so `make generate` still updates docs.
 generate:
+	@if command -v copywrite >/dev/null 2>&1; then \
+		copywrite headers -d . --config .copywrite.hcl; \
+	else \
+		echo "copywrite not found on PATH; skipping license headers."; \
+		echo "Install it with 'brew install hashicorp/tap/copywrite' (https://github.com/hashicorp/copywrite)."; \
+	fi
 	cd tools; go generate ./...
 
 fmt:

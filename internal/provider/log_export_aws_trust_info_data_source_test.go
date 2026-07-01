@@ -1,4 +1,4 @@
-// Copyright (c) Barndoor AI, Inc.
+// Copyright Barndoor AI, Inc. 2026
 // SPDX-License-Identifier: MIT
 
 package provider

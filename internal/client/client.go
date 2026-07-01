@@ -1,4 +1,4 @@
-// Copyright (c) Barndoor AI, Inc.
+// Copyright Barndoor AI, Inc. 2026
 // SPDX-License-Identifier: MIT
 
 // Package client is a small authenticated HTTP client for the Barndoor public
