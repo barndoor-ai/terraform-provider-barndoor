@@ -3,8 +3,8 @@ module github.com/barndoor-ai/terraform-provider-barndoor
 go 1.25.8
 
 require (
-	// pinned to preview/policy-v2-bcp-3184 (bdai-platform#5349 protos); bump to a tagged/main version once the automated SDK roll lands.
-	github.com/barndoor-ai/barndoor-go-sdk v1.0.2-0.20260701214040-f04aa91a7cce
+	// tracks barndoor-go-sdk main (post-#5349 proto roll, SDK PR #30)
+	github.com/barndoor-ai/barndoor-go-sdk v1.0.2-0.20260701224750-a830741db38a
 	github.com/hashicorp/terraform-plugin-framework v1.19.0
 	github.com/hashicorp/terraform-plugin-framework-jsontypes v0.2.0
 	github.com/hashicorp/terraform-plugin-framework-validators v0.19.0

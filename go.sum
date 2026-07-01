@@ -11,8 +11,8 @@ github.com/agext/levenshtein v1.2.3/go.mod h1:JEDfjyjHDjOF/1e4FlBE/PkbqA9OfWu2ki
 github.com/apparentlymart/go-textseg/v12 v12.0.0/go.mod h1:S/4uRK2UtaQttw1GenVJEynmyUenKwP++x/+DdGV/Ec=
 github.com/apparentlymart/go-textseg/v15 v15.0.0 h1:uYvfpb3DyLSCGWnctWKGj857c6ew1u1fNQOlOtuGxQY=
 github.com/apparentlymart/go-textseg/v15 v15.0.0/go.mod h1:K8XmNZdhEBkdlyDdvbmmsvpAG721bKi0joRfFdHIWJ4=
-github.com/barndoor-ai/barndoor-go-sdk v1.0.2-0.20260701214040-f04aa91a7cce h1:s43Iv1wH0ZIe8gzGSgMWY9DhItP9dV8TL0lcrUO3waE=
-github.com/barndoor-ai/barndoor-go-sdk v1.0.2-0.20260701214040-f04aa91a7cce/go.mod h1:MEcw1QPSKmndYPhjZkIsUJg6/7yAB669CEqjeiGF+2M=
+github.com/barndoor-ai/barndoor-go-sdk v1.0.2-0.20260701224750-a830741db38a h1:dOPlJjzVVsLhayOOZiPu+86iumeCvnMwDSlvqaTaoss=
+github.com/barndoor-ai/barndoor-go-sdk v1.0.2-0.20260701224750-a830741db38a/go.mod h1:MEcw1QPSKmndYPhjZkIsUJg6/7yAB669CEqjeiGF+2M=
 github.com/bufbuild/protocompile v0.14.1 h1:iA73zAf/fyljNjQKwYzUHD6AD4R8KMasmwa/FBatYVw=
 github.com/bufbuild/protocompile v0.14.1/go.mod h1:ppVdAIhbr2H8asPk6k4pY7t9zB1OU5DoEw9xY/FUi1c=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
