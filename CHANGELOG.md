@@ -14,6 +14,10 @@ ENHANCEMENTS:
 
 * provider: gRPC transport — the provider now maintains a lazily-created, shared gRPC channel to the platform host (TLS with system roots on port 443 unless `base_url` carries an explicit port) with per-RPC bearer-token credentials minted from the same `client_credentials` grant used for REST.
 
+BUG FIXES:
+
+* data-source/barndoor_log_export_aws_trust_info: the published example used HCL block syntax (`destination { … }`) for the `destination` attribute of `barndoor_log_export`, which is a nested attribute and requires assignment syntax (`destination = { … }`); copying the example produced invalid configuration. The acceptance-test HCL had the same bug.
+
 ## 0.1.0 (2026-07-01)
 
 FEATURES:
