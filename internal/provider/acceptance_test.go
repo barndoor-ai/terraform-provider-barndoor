@@ -331,7 +331,7 @@ func testAccLogExportConfig(orgID string, batchSize int) string {
 resource "barndoor_log_export" "test" {
   organization_id = %[1]q
 
-  destination {
+  destination = {
     endpoint          = "https://s3.us-east-1.amazonaws.com"
     region            = "us-east-1"
     bucket            = "barndoor-acc-test-disposable"
@@ -340,7 +340,7 @@ resource "barndoor_log_export" "test" {
     secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
   }
 
-  settings {
+  settings = {
     batch_size = %[2]d
   }
 

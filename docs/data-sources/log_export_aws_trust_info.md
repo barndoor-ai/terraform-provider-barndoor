@@ -49,7 +49,7 @@ resource "aws_iam_role" "barndoor_export" {
 # Feed the role ARN straight back into the export destination — one apply, end to
 # end, with no long-lived S3 keys and no secrets in Terraform state.
 resource "barndoor_log_export" "audit" {
-  destination {
+  destination = {
     endpoint     = "https://s3.us-east-1.amazonaws.com"
     region       = "us-east-1"
     bucket       = "acme-barndoor-audit"
