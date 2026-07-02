@@ -50,10 +50,17 @@ type fakeRegistryServer struct {
 	mu      sync.Mutex
 	nextID  int
 	servers map[string]*fakeMcpServer
+
+	// agents backs the /agents endpoints; see agent_resource_test.go.
+	nextAgentID int
+	agents      map[string]*fakeAgent
 }
 
 func newFakeRegistryServer() *fakeRegistryServer {
-	return &fakeRegistryServer{servers: map[string]*fakeMcpServer{}}
+	return &fakeRegistryServer{
+		servers: map[string]*fakeMcpServer{},
+		agents:  map[string]*fakeAgent{},
+	}
 }
 
 func obfuscate(s string) string {
@@ -75,6 +82,8 @@ func (f *fakeRegistryServer) handler() http.HandlerFunc {
 			writeToken(w)
 		case strings.HasPrefix(r.URL.Path, "/api/registry/v1/servers"):
 			f.handleServers(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/registry/v1/agents"):
+			f.handleAgents(w, r)
 		default:
 			http.NotFound(w, r)
 		}

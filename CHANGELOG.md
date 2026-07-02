@@ -10,6 +10,7 @@ FEATURES:
 
 * **New Resource:** `barndoor_policy` — manages an MCP-server access policy over the `barndoor.policy.v2` gRPC contract: AI Agent bindings, tags, lifecycle status (`DRAFT`/`ACTIVE`/`INACTIVE`), and rules with effects, actions, roles, and JSON condition trees. `terraform destroy` archives the policy (the platform's terminal lifecycle state).
 * **New Resource:** `barndoor_mcp_server` — manages an MCP server instance over the registry public REST API: the directory entry it instantiates, tenant OAuth or pre-populated credentials (write-only), and scope overrides. `terraform destroy` soft-deletes the server (the platform tears down its connections and stored credentials).
+* **New Resource:** `barndoor_agent` — manages an AI Agent registration over the registry public REST API: binds an agent directory entry to the organization (attaching its machine-to-machine service account) and manages the per-agent `write_confirmations_required` / `llm_gateway_enabled` toggles. `terraform destroy` unregisters the agent; the platform archives dependent policies.
 
 ENHANCEMENTS:
 
