@@ -964,11 +964,17 @@ func conditionToJSON(cond *policyv2.PolicyRuleCondition) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	b, err := json.Marshal(v)
-	if err != nil {
+	// json.Marshal HTML-escapes < > & (e.g. "a < b" becomes "a \u003c b"),
+	// which needlessly diverges state text from the config literal — CEL
+	// comparisons make < extremely common in conditions. Semantic equality
+	// still treats the forms as equal, but keep state human-readable.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
 		return "", fmt.Errorf("encode condition: %w", err)
 	}
-	return string(b), nil
+	return strings.TrimRight(buf.String(), "\n"), nil
 }
 
 // conditionToValue converts one proto condition node into the JSON object
