@@ -9,6 +9,7 @@ BREAKING CHANGES:
 FEATURES:
 
 * **New Resource:** `barndoor_policy` — manages an MCP-server access policy over the `barndoor.policy.v2` gRPC contract: AI Agent bindings, tags, lifecycle status (`DRAFT`/`ACTIVE`/`INACTIVE`), and rules with effects, actions, roles, and JSON condition trees. `terraform destroy` archives the policy (the platform's terminal lifecycle state).
+* **New Resource:** `barndoor_mcp_server` — manages an MCP server instance over the registry public REST API: the directory entry it instantiates, tenant OAuth or pre-populated credentials (write-only), and scope overrides. `terraform destroy` soft-deletes the server (the platform tears down its connections and stored credentials).
 
 ENHANCEMENTS:
 

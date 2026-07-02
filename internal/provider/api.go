@@ -72,6 +72,14 @@ func isNotFound(err error) bool {
 	return errors.As(err, &apiErr) && apiErr.NotFound()
 }
 
+// asAPIError unwraps err as an *apiError, so callers can branch on the HTTP
+// status of a non-2xx response.
+func asAPIError(err error) (*apiError, bool) {
+	var apiErr *apiError
+	ok := errors.As(err, &apiErr)
+	return apiErr, ok
+}
+
 // maxErrorBodyLen bounds how many bytes of the response body apiError.Error()
 // renders into a diagnostic. The SMS endpoints return short plain-text errors
 // today, but a large or structured body would otherwise flood
