@@ -80,6 +80,19 @@ const (
 	// naming a real MCP server in the credential's organization for the
 	// policy's required (and immutable) mcp_server_id.
 	envTestMCPServerID = "BARNDOOR_TEST_MCP_SERVER_ID"
+
+	// envTestMCPServerDirectoryID opts in to the barndoor_mcp_server
+	// acceptance test by naming a directory entry (public catalog or
+	// org-owned) the test server instantiates. The test only touches servers
+	// it creates itself (timestamped tf-acc-server-* names) and soft-deletes
+	// them on destroy.
+	envTestMCPServerDirectoryID = "BARNDOOR_TEST_MCP_SERVER_DIRECTORY_ID"
+
+	// envTestApplicationDirectoryID opts in to the barndoor_agent acceptance
+	// test by naming an agent directory entry that is visible to — and not
+	// already registered in — the credential's organization. The test
+	// registers and unregisters that one entry.
+	envTestApplicationDirectoryID = "BARNDOOR_TEST_APPLICATION_DIRECTORY_ID"
 )
 
 // connEnv lists the connection variables every acceptance test needs.
@@ -355,4 +368,133 @@ data "barndoor_log_export_aws_trust_info" "test" {
   organization_id = %[1]q
 }
 `, orgID)
+}
+
+// TestAccMcpServerResource_lifecycle exercises the barndoor_mcp_server
+// resource end to end (create → update → import → destroy) against a real
+// environment. Destroy soft-deletes the server (freeing its name/slug), so
+// runs are self-cleaning; the timestamped name keeps concurrent runs apart.
+func TestAccMcpServerResource_lifecycle(t *testing.T) {
+	if os.Getenv("TF_ACC") == "" {
+		t.Skip("TF_ACC not set; skipping acceptance test")
+	}
+	testAccPreCheck(t)
+
+	directoryID := os.Getenv(envTestMCPServerDirectoryID)
+	if directoryID == "" {
+		t.Skipf("%s not set; skipping the barndoor_mcp_server acceptance test. Set it to the id of an MCP "+
+			"server directory entry visible to the credential's organization.", envTestMCPServerDirectoryID)
+	}
+
+	name := fmt.Sprintf("tf-acc-server-%d", time.Now().UnixNano())
+	const resourceName = "barndoor_mcp_server.test"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				// Create without credentials: the server stays pending and no
+				// upstream OAuth flow is triggered.
+				Config: testAccMcpServerConfig(directoryID, name, ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet(resourceName, "id"),
+					resource.TestCheckResourceAttrSet(resourceName, "slug"),
+					resource.TestCheckResourceAttr(resourceName, "name", name),
+					resource.TestCheckResourceAttr(resourceName, "mcp_server_directory_id", directoryID),
+					resource.TestCheckResourceAttrSet(resourceName, "status"),
+				),
+			},
+			{
+				// In-place update: rename and add a scope override.
+				Config: testAccMcpServerConfig(directoryID, name+"-renamed", "\n  scopes = [\"read\"]\n"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "name", name+"-renamed"),
+					resource.TestCheckResourceAttr(resourceName, "scopes.#", "1"),
+				),
+			},
+			{
+				// Import by server id. Write-only attributes read back null.
+				ResourceName:      resourceName,
+				ImportState:       true,
+				ImportStateVerify: true,
+				ImportStateVerifyIgnore: []string{
+					"client_id", "client_secret", "meta", "prepopulated_credentials", "cascaded_fields",
+				},
+			},
+		},
+	})
+}
+
+func testAccMcpServerConfig(directoryID, name, extra string) string {
+	return fmt.Sprintf(`
+resource "barndoor_mcp_server" "test" {
+  name                    = %[1]q
+  mcp_server_directory_id = %[2]q
+%[3]s
+}
+`, name, directoryID, extra)
+}
+
+// TestAccAgentResource_lifecycle exercises the barndoor_agent resource end to
+// end (register → toggle flags → import → unregister) against a real
+// environment. Destroy soft-deletes the registration (freeing the directory
+// for re-registration), so runs are self-cleaning. Note the platform allows
+// one live registration per directory entry — point the env var at a
+// directory that is NOT already registered in the test org.
+func TestAccAgentResource_lifecycle(t *testing.T) {
+	if os.Getenv("TF_ACC") == "" {
+		t.Skip("TF_ACC not set; skipping acceptance test")
+	}
+	testAccPreCheck(t)
+
+	directoryID := os.Getenv(envTestApplicationDirectoryID)
+	if directoryID == "" {
+		t.Skipf("%s not set; skipping the barndoor_agent acceptance test. Set it to the id of an agent "+
+			"directory entry that is visible to (and not already registered in) the credential's organization.",
+			envTestApplicationDirectoryID)
+	}
+
+	const resourceName = "barndoor_agent.test"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccAgentConfig(directoryID, ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet(resourceName, "id"),
+					resource.TestCheckResourceAttr(resourceName, "application_directory_id", directoryID),
+					resource.TestCheckResourceAttr(resourceName, "write_confirmations_required", "true"),
+					resource.TestCheckResourceAttr(resourceName, "llm_gateway_enabled", "false"),
+					resource.TestCheckResourceAttrSet(resourceName, "name"),
+					resource.TestCheckResourceAttrSet(resourceName, "agent_type"),
+				),
+			},
+			{
+				// Toggle the per-agent flags in place.
+				Config: testAccAgentConfig(directoryID, "\n  write_confirmations_required = false\n"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "write_confirmations_required", "false"),
+				),
+			},
+			{
+				// Import by registration id; every attribute is
+				// server-authoritative so no ignores are needed.
+				ResourceName:      resourceName,
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func testAccAgentConfig(directoryID, extra string) string {
+	return fmt.Sprintf(`
+resource "barndoor_agent" "test" {
+  application_directory_id = %[1]q
+%[2]s
+}
+`, directoryID, extra)
 }

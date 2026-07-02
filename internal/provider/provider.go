@@ -136,7 +136,9 @@ func (p *BarndoorProvider) Configure(ctx context.Context, req provider.Configure
 // Resources are registered as they are implemented.
 func (p *BarndoorProvider) Resources(ctx context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
+		NewAgentResource,
 		NewLogExportResource,
+		NewMcpServerResource,
 		NewPolicyResource,
 	}
 }
