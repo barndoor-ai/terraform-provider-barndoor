@@ -4,6 +4,7 @@
 
 FEATURES:
 
+* **New Resource:** `barndoor_connection` — manages the organization's tenant-wide (service-account-owned) credential connection to an MCP server, for non-OAuth credential providers (`api_key`, `bearer_token`, `basic_auth`, `generic`). Credentials are write-only and any change forces a new connection. OAuth providers are rejected with an explanatory error — their interactive browser consent cannot be performed by a declarative apply. Requires platform support for `as_service` on the connection read endpoint (bdai-platform BCP-3256).
 * **New Data Source:** `barndoor_policy` — looks up an existing access policy by `id` or `name` (exact match among non-archived policies) and exposes its full attribute set, including rules.
 * **New Data Source:** `barndoor_agent` — looks up an existing AI Agent registration by `id` or display `name`; ambiguous display names fail loudly with the candidate ids.
 * **New Data Source:** `barndoor_mcp_server` — looks up an existing MCP server by `id`, `name` (matched case- and whitespace-insensitively, mirroring the API's uniqueness rule), or `slug`. Credential attributes are never part of the data source.
