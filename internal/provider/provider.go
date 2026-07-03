@@ -138,6 +138,9 @@ func (p *BarndoorProvider) Resources(ctx context.Context) []func() resource.Reso
 	return []func() resource.Resource{
 		NewAgentResource,
 		NewConnectionResource,
+		NewDlpAllowListEntryResource,
+		NewDlpEnforcementPolicyResource,
+		NewDlpOrgConfigResource,
 		NewLogExportResource,
 		NewMcpServerResource,
 		NewPolicyResource,

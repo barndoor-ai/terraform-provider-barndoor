@@ -8,6 +8,9 @@ FEATURES:
 * **New Data Source:** `barndoor_policy` — looks up an existing access policy by `id` or `name` (exact match among non-archived policies) and exposes its full attribute set, including rules.
 * **New Data Source:** `barndoor_agent` — looks up an existing AI Agent registration by `id` or display `name`; ambiguous display names fail loudly with the candidate ids.
 * **New Data Source:** `barndoor_mcp_server` — looks up an existing MCP server by `id`, `name` (matched case- and whitespace-insensitively, mirroring the API's uniqueness rule), or `slug`. Credential attributes are never part of the data source.
+* **New Resource:** `barndoor_dlp_org_config` — manages the organization's singleton Data Protection configuration (`enabled`, `global_dry_run`) over the dlp-service tenant admin REST API. The platform provisions the row per organization, so the resource adopts and configures it; `terraform destroy` resets both settings to the platform defaults (`enabled = true`, `global_dry_run = false`) rather than deleting anything (BCP-3257).
+* **New Resource:** `barndoor_dlp_enforcement_policy` — manages a Data Protection enforcement policy: MCP-server or model-provider targeting (with API-side `target_kind` inference), runtime stage, action, priority (API-assigned when unset), dry-run flag, principal scoping, and the detection engines that evaluate the traffic (BCP-3257).
+* **New Resource:** `barndoor_dlp_allow_list_entry` — manages one Data Protection allow-list entry (literal or regex pattern, optional detection-type scoping, audit reason). The platform API has no update endpoint and no get-by-id, so every attribute change replaces the entry and reads walk the paginated list (BCP-3257).
 
 ## 0.2.0 (2026-07-02)
 
