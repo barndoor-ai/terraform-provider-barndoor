@@ -54,12 +54,19 @@ type fakeRegistryServer struct {
 	// agents backs the /agents endpoints; see agent_resource_test.go.
 	nextAgentID int
 	agents      map[string]*fakeAgent
+
+	// connections backs the /servers/{id}/connect|connection endpoints
+	// (service-account-owned rows, keyed by server id); see
+	// connection_resource_test.go.
+	nextConnID  int
+	connections map[string]*fakeConnection
 }
 
 func newFakeRegistryServer() *fakeRegistryServer {
 	return &fakeRegistryServer{
-		servers: map[string]*fakeMcpServer{},
-		agents:  map[string]*fakeAgent{},
+		servers:     map[string]*fakeMcpServer{},
+		agents:      map[string]*fakeAgent{},
+		connections: map[string]*fakeConnection{},
 	}
 }
 
@@ -103,6 +110,10 @@ func (f *fakeRegistryServer) handleServers(w http.ResponseWriter, r *http.Reques
 		f.listServers(w, r)
 	case strings.HasPrefix(id, "by-slug/") && r.Method == http.MethodGet:
 		f.getServerBySlug(w, strings.TrimPrefix(id, "by-slug/"))
+	case strings.HasSuffix(id, "/connect") && r.Method == http.MethodPost:
+		f.connectServer(w, r, strings.TrimSuffix(id, "/connect"))
+	case strings.HasSuffix(id, "/connection"):
+		f.handleServerConnection(w, r, strings.TrimSuffix(id, "/connection"))
 	case id != "" && r.Method == http.MethodGet:
 		s, ok := f.servers[id]
 		if !ok || s.deleted {
