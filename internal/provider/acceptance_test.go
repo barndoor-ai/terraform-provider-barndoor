@@ -296,6 +296,18 @@ func TestAccPolicyResource_lifecycle(t *testing.T) {
 				),
 			},
 			{
+				// Read the created policy back through the data source, by name.
+				Config: testAccPolicyConfig(mcpServerID, name, "DRAFT", 100) + `
+data "barndoor_policy" "by_name" {
+  name = barndoor_policy.test.name
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrPair("data.barndoor_policy.by_name", "id", resourceName, "id"),
+					resource.TestCheckResourceAttr("data.barndoor_policy.by_name", "rules.#", "1"),
+				),
+			},
+			{
 				// In-place update: activate and change the rule's condition.
 				Config: testAccPolicyConfig(mcpServerID, name, "ACTIVE", 250),
 				Check: resource.ComposeAggregateTestCheckFunc(
@@ -406,6 +418,23 @@ func TestAccMcpServerResource_lifecycle(t *testing.T) {
 				),
 			},
 			{
+				// Read the created server back through the data source, by id
+				// and by slug.
+				Config: testAccMcpServerConfig(directoryID, name, "") + `
+data "barndoor_mcp_server" "by_id" {
+  id = barndoor_mcp_server.test.id
+}
+
+data "barndoor_mcp_server" "by_slug" {
+  slug = barndoor_mcp_server.test.slug
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrPair("data.barndoor_mcp_server.by_id", "id", resourceName, "id"),
+					resource.TestCheckResourceAttrPair("data.barndoor_mcp_server.by_slug", "id", resourceName, "id"),
+				),
+			},
+			{
 				// In-place update: rename and add a scope override.
 				Config: testAccMcpServerConfig(directoryID, name+"-renamed", "\n  scopes = [\"read\"]\n"),
 				Check: resource.ComposeAggregateTestCheckFunc(
@@ -470,6 +499,18 @@ func TestAccAgentResource_lifecycle(t *testing.T) {
 					resource.TestCheckResourceAttr(resourceName, "llm_gateway_enabled", "false"),
 					resource.TestCheckResourceAttrSet(resourceName, "name"),
 					resource.TestCheckResourceAttrSet(resourceName, "agent_type"),
+				),
+			},
+			{
+				// Read the registration back through the data source, by id.
+				Config: testAccAgentConfig(directoryID, "") + `
+data "barndoor_agent" "by_id" {
+  id = barndoor_agent.test.id
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrPair("data.barndoor_agent.by_id", "id", resourceName, "id"),
+					resource.TestCheckResourceAttrPair("data.barndoor_agent.by_id", "name", resourceName, "name"),
 				),
 			},
 			{

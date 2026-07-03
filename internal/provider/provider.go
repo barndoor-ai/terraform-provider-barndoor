@@ -146,7 +146,10 @@ func (p *BarndoorProvider) Resources(ctx context.Context) []func() resource.Reso
 // DataSources are registered as they are implemented.
 func (p *BarndoorProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{
+		NewAgentDataSource,
 		NewLogExportAWSTrustInfoDataSource,
+		NewMcpServerDataSource,
+		NewPolicyDataSource,
 	}
 }
 

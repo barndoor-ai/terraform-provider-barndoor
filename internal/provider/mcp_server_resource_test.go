@@ -99,6 +99,10 @@ func (f *fakeRegistryServer) handleServers(w http.ResponseWriter, r *http.Reques
 	switch {
 	case id == "" && r.Method == http.MethodPost:
 		f.createServer(w, r)
+	case id == "" && r.Method == http.MethodGet:
+		f.listServers(w, r)
+	case strings.HasPrefix(id, "by-slug/") && r.Method == http.MethodGet:
+		f.getServerBySlug(w, strings.TrimPrefix(id, "by-slug/"))
 	case id != "" && r.Method == http.MethodGet:
 		s, ok := f.servers[id]
 		if !ok || s.deleted {
