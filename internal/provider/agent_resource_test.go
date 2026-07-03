@@ -33,6 +33,10 @@ var fakeAgentDirectories = map[string]struct {
 }{
 	"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa": {Name: "Internal Test Agent", DCR: false},
 	"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb": {Name: "External Test Agent", DCR: true},
+	// Deliberately shares its display name with the entry above: display names
+	// are not unique, and the barndoor_agent data source's ambiguous-name test
+	// registers both.
+	"cccccccc-cccc-cccc-cccc-cccccccccccc": {Name: "External Test Agent", DCR: false},
 }
 
 type fakeAgent struct {
@@ -45,15 +49,15 @@ type fakeAgent struct {
 	protected bool
 }
 
-// respond renders the ApplicationResponse shape (directory join + computed
-// agent_type), as the GET/PATCH endpoints return it.
-func (a *fakeAgent) respond(w http.ResponseWriter) {
+// payload builds the ApplicationResponse shape (directory join + computed
+// agent_type) the GET/PATCH endpoints return; list rows reuse it.
+func (a *fakeAgent) payload() map[string]any {
 	dir := fakeAgentDirectories[a.ApplicationDirectoryID]
 	agentType := "internal"
 	if dir.DCR {
 		agentType = "external"
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	return map[string]any{
 		"id":                           a.ID,
 		"application_directory_id":     a.ApplicationDirectoryID,
 		"write_confirmations_required": a.WriteConfirmationsRequired,
@@ -61,7 +65,13 @@ func (a *fakeAgent) respond(w http.ResponseWriter) {
 		"agent_type":                   agentType,
 		"deleted_at":                   nil,
 		"application_directory":        map[string]any{"name": dir.Name},
-	})
+	}
+}
+
+// respond renders the ApplicationResponse shape as the GET/PATCH endpoints
+// return it.
+func (a *fakeAgent) respond(w http.ResponseWriter) {
+	_ = json.NewEncoder(w).Encode(a.payload())
 }
 
 func (f *fakeRegistryServer) handleAgents(w http.ResponseWriter, r *http.Request) {
@@ -72,6 +82,10 @@ func (f *fakeRegistryServer) handleAgents(w http.ResponseWriter, r *http.Request
 
 	if rest == "" && r.Method == http.MethodPost {
 		f.registerAgent(w, r)
+		return
+	}
+	if rest == "" && r.Method == http.MethodGet {
+		f.listAgents(w, r)
 		return
 	}
 
@@ -382,7 +396,7 @@ func TestAgentResource_unknownDirectoryIs422(t *testing.T) {
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
-				Config:      agentConfig("cccccccc-cccc-cccc-cccc-cccccccccccc", ""),
+				Config:      agentConfig("dddddddd-dddd-dddd-dddd-dddddddddddd", ""),
 				ExpectError: regexp.MustCompile(`Application directory not found`),
 			},
 		},

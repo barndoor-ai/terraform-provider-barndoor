@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 (Unreleased)
+
+FEATURES:
+
+* **New Data Source:** `barndoor_policy` — looks up an existing access policy by `id` or `name` (exact match among non-archived policies) and exposes its full attribute set, including rules.
+* **New Data Source:** `barndoor_agent` — looks up an existing AI Agent registration by `id` or display `name`; ambiguous display names fail loudly with the candidate ids.
+* **New Data Source:** `barndoor_mcp_server` — looks up an existing MCP server by `id`, `name` (matched case- and whitespace-insensitively, mirroring the API's uniqueness rule), or `slug`. Credential attributes are never part of the data source.
+
 ## 0.2.0 (2026-07-02)
 
 BREAKING CHANGES:
