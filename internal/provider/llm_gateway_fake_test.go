@@ -10,9 +10,11 @@ import (
 	"net/http/httptest"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
@@ -22,14 +24,17 @@ import (
 //
 // fakeLlmGatewayServer emulates the llm-gateway admin REST surface the
 // provider binds (`/api/llm-gateway/admin/providers|model-mappings|
-// model-access|rate-limits|budgets`) faithfully enough to drive real
-// plan/apply cycles: write-only provider credentials (stored, never echoed),
-// per-model-provider auth_type defaulting, settings-must-be-object
-// validation, the model-mapping orphan-alias guard and 1:1 PATCH-or-create
-// upsert with timeout materialization, listing-only reads (no get-by-id) for
-// mappings/policies/budgets, the rate-limit tri-state metric PATCH, and the
-// scope-uniqueness 409s of rate limits and budgets. Errors use the service's
-// OpenAI envelope (`{"error": {"message": ...}}`).
+// model-access|rate-limits|budgets|model-pricing|governance-config`)
+// faithfully enough to drive real plan/apply cycles: write-only provider
+// credentials (stored, never echoed), per-model-provider auth_type
+// defaulting, settings-must-be-object validation, the model-mapping
+// orphan-alias guard and 1:1 PATCH-or-create upsert with timeout
+// materialization, listing-only reads (no get-by-id) for mappings/policies/
+// budgets, the rate-limit tri-state metric PATCH, the scope-uniqueness 409s
+// of rate limits and budgets, the append-only versioned pricing store
+// (scheduled changes, skip-on-no-op, archive tombstones, per-instant
+// uniqueness), and the governance-config singleton upsert. Errors use the
+// service's OpenAI envelope (`{"error": {"message": ...}}`).
 
 // fakeLlmOrgID matches the BARNDOOR_ORGANIZATION_ID set by setupLlmGatewayTest.
 const fakeLlmOrgID = "11111111-2222-3333-4444-555555555555"
@@ -109,6 +114,29 @@ type fakeLlmTokenBudget struct {
 	Enabled         bool
 }
 
+// fakeLlmPricingVersion is one row of the append-only, versioned
+// llm_gw.model_pricing store (V34/V35): a logical rule is the group of rows
+// sharing (model_pattern, COALESCE(model_provider, ”)), the latest
+// effective_from <= now() row is the billed one, future rows are scheduled
+// changes, and archive appends an is_archived tombstone.
+type fakeLlmPricingVersion struct {
+	ID               string
+	ModelProvider    *string
+	ModelPattern     string
+	InputCost        float64
+	OutputCost       float64
+	CacheRead        *float64
+	CacheWrite       *float64
+	EffectiveFrom    time.Time
+	EffectiveFromRaw string // exact wire echo, like chrono round-tripping the input
+	ProviderID       *string
+	CatalogSlug      *string
+	SyncMode         string
+	ChangeSource     string
+	ChangeReason     *string
+	IsArchived       bool
+}
+
 type fakeLlmGatewayServer struct {
 	mu sync.Mutex
 
@@ -120,6 +148,16 @@ type fakeLlmGatewayServer struct {
 	policies   []*fakeLlmModelAccessPolicy
 	rateLimits []*fakeLlmRateLimit
 	budgets    []*fakeLlmTokenBudget
+	pricing    []*fakeLlmPricingVersion
+
+	// governance is the org's singleton governance_config row; nil means no
+	// row yet (the API then reports the column defaults).
+	governance *bool
+
+	// forbidden simulates a credential that fails the Cerbos authorize()
+	// check every admin handler runs; when set, the governance-config and
+	// model-pricing families answer 403.
+	forbidden bool
 }
 
 func newFakeLlmGatewayServer() *fakeLlmGatewayServer {
@@ -147,6 +185,10 @@ func (f *fakeLlmGatewayServer) handler() http.HandlerFunc {
 			f.handleRateLimits(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/budgets"):
 			f.handleBudgets(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/model-pricing"):
+			f.handleModelPricing(w, r)
+		case r.URL.Path == "/api/llm-gateway/admin/governance-config":
+			f.handleGovernanceConfig(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -1463,6 +1505,523 @@ func checkAllLlmBudgetsDeleted(fake *fakeLlmGatewayServer) resource.TestCheckFun
 		defer fake.mu.Unlock()
 		for _, b := range fake.budgets {
 			return fmt.Errorf("token budget %s (%s) was not deleted on destroy", b.ID, b.Name)
+		}
+		return nil
+	}
+}
+
+// --- governance config -----------------------------------------------------------
+
+// handleGovernanceConfig emulates the governance-config singleton: GET
+// reports the stored row or the column defaults when no row exists, PUT
+// upserts the full body (the endpoint has no partial-update semantics — a
+// missing field is an axum Json rejection, answered as plain-text 422).
+func (f *fakeLlmGatewayServer) handleGovernanceConfig(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.forbidden {
+		writeLlmError(w, http.StatusForbidden, "principal is not permitted to perform this action")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		val := false
+		if f.governance != nil {
+			val = *f.governance
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"require_pricing_for_mappings": val})
+	case http.MethodPut:
+		var raw map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			http.Error(w, "Failed to parse the request body as JSON: "+err.Error(),
+				http.StatusUnprocessableEntity)
+			return
+		}
+		var val bool
+		field, ok := raw["require_pricing_for_mappings"]
+		if !ok || json.Unmarshal(field, &val) != nil {
+			http.Error(w, "Failed to deserialize the JSON body into the target type: "+
+				"missing field `require_pricing_for_mappings`", http.StatusUnprocessableEntity)
+			return
+		}
+		f.governance = &val
+		_ = json.NewEncoder(w).Encode(map[string]any{"require_pricing_for_mappings": val})
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// setGovernanceValue flips the stored governance flag out-of-band, as if an
+// admin changed it in the app.
+func (f *fakeLlmGatewayServer) setGovernanceValue(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.governance = &v
+}
+
+// setForbidden toggles the simulated Cerbos authorization failure for the
+// governance-config and model-pricing families.
+func (f *fakeLlmGatewayServer) setForbidden(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forbidden = v
+}
+
+// checkLlmGovernanceReset is the CheckDestroy for governance-config tests:
+// destroy must have written the platform defaults back.
+func checkLlmGovernanceReset(fake *fakeLlmGatewayServer) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		if fake.governance == nil {
+			return fmt.Errorf("governance config was never written back on destroy")
+		}
+		if *fake.governance != llmGovernanceConfigDefaultRequirePricing {
+			return fmt.Errorf("governance require_pricing_for_mappings = %t after destroy, want the platform default %t",
+				*fake.governance, llmGovernanceConfigDefaultRequirePricing)
+		}
+		return nil
+	}
+}
+
+// --- model pricing (versioned) -----------------------------------------------------
+
+// handleModelPricing emulates the endpoints of the versioned pricing store
+// that the provider binds: POST (append version, with the production
+// change_source computation, skip-on-no-op, model_provider←catalog_slug
+// fallback, and the (rule, effective_from) uniqueness), GET history, GET
+// version/{id}, PUT {id} (scheduled-version in-place edit, 400 on effective
+// rows), and DELETE {id} (cancel-scheduled vs archive-tombstone dispatch).
+// The org-bulk endpoints (import-defaults, sync-defaults) and the restore
+// path are not bound by the provider and are not emulated.
+func (f *fakeLlmGatewayServer) handleModelPricing(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.forbidden {
+		writeLlmError(w, http.StatusForbidden, "principal is not permitted to perform this action")
+		return
+	}
+
+	rest := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/llm-gateway/admin/model-pricing"), "/")
+
+	switch {
+	case rest == "" && r.Method == http.MethodPost:
+		f.createPricing(w, r)
+	case rest == "history" && r.Method == http.MethodGet:
+		f.listPricingHistory(w, r)
+	case strings.HasPrefix(rest, "version/") && r.Method == http.MethodGet:
+		f.getPricingVersion(w, strings.TrimPrefix(rest, "version/"))
+	case rest != "" && !strings.Contains(rest, "/") && r.Method == http.MethodPut:
+		f.updatePricing(w, r, rest)
+	case rest != "" && !strings.Contains(rest, "/") && r.Method == http.MethodDelete:
+		f.deletePricing(w, rest)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// pricingProviderKey mirrors the store's COALESCE(model_provider, ”) group
+// key.
+func pricingProviderKey(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+// pricingGroup returns the versions of one logical rule, unordered. Callers
+// hold f.mu.
+func (f *fakeLlmGatewayServer) pricingGroup(pattern, providerKey string) []*fakeLlmPricingVersion {
+	var group []*fakeLlmPricingVersion
+	for _, v := range f.pricing {
+		if v.ModelPattern == pattern && pricingProviderKey(v.ModelProvider) == providerKey {
+			group = append(group, v)
+		}
+	}
+	return group
+}
+
+// pricingCurrentOf picks the latest version with effective_from <= now out
+// of a group; nil when every version is future-dated.
+func pricingCurrentOf(group []*fakeLlmPricingVersion, now time.Time) *fakeLlmPricingVersion {
+	var current *fakeLlmPricingVersion
+	for _, v := range group {
+		if v.EffectiveFrom.After(now) {
+			continue
+		}
+		if current == nil || v.EffectiveFrom.After(current.EffectiveFrom) {
+			current = v
+		}
+	}
+	return current
+}
+
+func pricingJSON(v *fakeLlmPricingVersion) map[string]any {
+	return map[string]any{
+		"id":                                  v.ID,
+		"org_id":                              fakeLlmOrgID,
+		"model_provider":                      v.ModelProvider,
+		"model_pattern":                       v.ModelPattern,
+		"input_cost_per_million_tokens":       v.InputCost,
+		"output_cost_per_million_tokens":      v.OutputCost,
+		"effective_from":                      v.EffectiveFromRaw,
+		"provider_id":                         v.ProviderID,
+		"provider_name":                       nil,
+		"catalog_slug":                        v.CatalogSlug,
+		"cache_read_cost_per_million_tokens":  v.CacheRead,
+		"cache_write_cost_per_million_tokens": v.CacheWrite,
+		"sync_mode":                           v.SyncMode,
+		"change_source":                       v.ChangeSource,
+		"change_reason":                       v.ChangeReason,
+		"created_by_user_id":                  nil,
+		"created_by_email":                    "admin@example.com",
+		"is_archived":                         v.IsArchived,
+	}
+}
+
+func floatPtrEq(a, b *float64) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	return a == nil || *a == *b
+}
+
+func (f *fakeLlmGatewayServer) createPricing(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ModelProvider *string  `json:"model_provider"`
+		ModelPattern  string   `json:"model_pattern"`
+		InputCost     float64  `json:"input_cost_per_million_tokens"`
+		OutputCost    float64  `json:"output_cost_per_million_tokens"`
+		EffectiveFrom *string  `json:"effective_from"`
+		ProviderID    *string  `json:"provider_id"`
+		CatalogSlug   *string  `json:"catalog_slug"`
+		SyncMode      *string  `json:"sync_mode"`
+		ChangeReason  *string  `json:"change_reason"`
+		CacheRead     *float64 `json:"cache_read_cost_per_million_tokens"`
+		CacheWrite    *float64 `json:"cache_write_cost_per_million_tokens"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "Failed to parse the request body as JSON: "+err.Error(),
+			http.StatusUnprocessableEntity)
+		return
+	}
+
+	// serde default: rows the admin types in by hand are pinned; an invalid
+	// value is a deserialization failure.
+	syncMode := "pinned"
+	if body.SyncMode != nil {
+		if !slices.Contains([]string{"tracking", "pinned", "auto"}, *body.SyncMode) {
+			http.Error(w, "Failed to deserialize the JSON body into the target type: sync_mode: "+
+				"unknown variant `"+*body.SyncMode+"`", http.StatusUnprocessableEntity)
+			return
+		}
+		syncMode = *body.SyncMode
+	}
+
+	// Production: model_provider falls back to catalog_slug so manual rules
+	// share the import path's group-key semantics.
+	modelProvider := body.ModelProvider
+	if modelProvider == nil {
+		modelProvider = body.CatalogSlug
+	}
+
+	now := time.Now().UTC()
+	eff := now
+	raw := now.Format(time.RFC3339Nano)
+	if body.EffectiveFrom != nil {
+		t, err := time.Parse(time.RFC3339Nano, *body.EffectiveFrom)
+		if err != nil {
+			http.Error(w, "Failed to deserialize the JSON body into the target type: effective_from: "+err.Error(),
+				http.StatusUnprocessableEntity)
+			return
+		}
+		eff, raw = t, *body.EffectiveFrom
+	}
+	isFuture := eff.After(now)
+
+	group := f.pricingGroup(body.ModelPattern, pricingProviderKey(modelProvider))
+	current := pricingCurrentOf(group, now)
+
+	// Skip-on-no-op: a non-future write matching the current effective
+	// version (costs, cache rates, sync mode; not archived) returns the
+	// current row without inserting.
+	if !isFuture && current != nil && !current.IsArchived &&
+		current.InputCost == body.InputCost && current.OutputCost == body.OutputCost &&
+		floatPtrEq(current.CacheRead, body.CacheRead) && floatPtrEq(current.CacheWrite, body.CacheWrite) &&
+		current.SyncMode == syncMode {
+		_ = json.NewEncoder(w).Encode(pricingJSON(current))
+		return
+	}
+
+	// V34 unique key: no two versions of a rule at the same instant. The
+	// production DB error surfaces as a 500.
+	for _, v := range group {
+		if v.EffectiveFrom.Equal(eff) {
+			writeLlmError(w, http.StatusInternalServerError,
+				`duplicate key value violates unique constraint "model_pricing_org_pattern_provider_effective_idx"`)
+			return
+		}
+	}
+
+	changeSource := "admin_edit"
+	if isFuture {
+		changeSource = "admin_schedule"
+	} else if len(group) == 0 {
+		changeSource = "admin_create"
+	}
+
+	v := &fakeLlmPricingVersion{
+		ID:               f.newID("ffff"),
+		ModelProvider:    modelProvider,
+		ModelPattern:     body.ModelPattern,
+		InputCost:        body.InputCost,
+		OutputCost:       body.OutputCost,
+		CacheRead:        body.CacheRead,
+		CacheWrite:       body.CacheWrite,
+		EffectiveFrom:    eff,
+		EffectiveFromRaw: raw,
+		ProviderID:       body.ProviderID,
+		CatalogSlug:      body.CatalogSlug,
+		SyncMode:         syncMode,
+		ChangeSource:     changeSource,
+		ChangeReason:     body.ChangeReason,
+	}
+	f.pricing = append(f.pricing, v)
+	_ = json.NewEncoder(w).Encode(pricingJSON(v))
+}
+
+// listPricingHistory answers GET /model-pricing/history: the rule's full
+// version stack, newest effective_from first, including future-dated and
+// tombstone rows. An absent/empty model_provider matches provider-unscoped
+// rules only (the COALESCE key).
+func (f *fakeLlmGatewayServer) listPricingHistory(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	pattern := q.Get("model_pattern")
+	if pattern == "" {
+		// axum Query rejection for the required field.
+		http.Error(w, "Failed to deserialize query string: missing field `model_pattern`",
+			http.StatusBadRequest)
+		return
+	}
+
+	group := f.pricingGroup(pattern, q.Get("model_provider"))
+	sort.Slice(group, func(i, j int) bool { return group[i].EffectiveFrom.After(group[j].EffectiveFrom) })
+	items := make([]map[string]any, 0, len(group))
+	for _, v := range group {
+		items = append(items, pricingJSON(v))
+	}
+	_ = json.NewEncoder(w).Encode(items)
+}
+
+func (f *fakeLlmGatewayServer) findPricingVersion(id string) *fakeLlmPricingVersion {
+	for _, v := range f.pricing {
+		if v.ID == id {
+			return v
+		}
+	}
+	return nil
+}
+
+func (f *fakeLlmGatewayServer) getPricingVersion(w http.ResponseWriter, id string) {
+	v := f.findPricingVersion(id)
+	if v == nil {
+		writeLlmError(w, http.StatusNotFound, fmt.Sprintf("pricing version %s not found in this org", id))
+		return
+	}
+	_ = json.NewEncoder(w).Encode(pricingJSON(v))
+}
+
+// updatePricing emulates PUT /model-pricing/{id}: an in-place edit of a
+// not-yet-effective scheduled version. Past versions are immutable (400).
+// The cache-cost keys carry the double-Option semantics: absent keeps,
+// explicit null clears.
+func (f *fakeLlmGatewayServer) updatePricing(w http.ResponseWriter, r *http.Request, id string) {
+	v := f.findPricingVersion(id)
+	if v == nil {
+		writeLlmError(w, http.StatusNotFound, fmt.Sprintf("model pricing version %s not found", id))
+		return
+	}
+	if !v.EffectiveFrom.After(time.Now().UTC()) {
+		writeLlmError(w, http.StatusBadRequest,
+			"Past pricing versions are immutable. Create a new version (POST /admin/model-pricing) to change the current price.")
+		return
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		http.Error(w, "Failed to parse the request body as JSON: "+err.Error(),
+			http.StatusUnprocessableEntity)
+		return
+	}
+
+	updated := *v
+	if field, ok := raw["input_cost_per_million_tokens"]; ok && string(field) != "null" {
+		_ = json.Unmarshal(field, &updated.InputCost)
+	}
+	if field, ok := raw["output_cost_per_million_tokens"]; ok && string(field) != "null" {
+		_ = json.Unmarshal(field, &updated.OutputCost)
+	}
+	if field, ok := raw["effective_from"]; ok && string(field) != "null" {
+		var s string
+		if err := json.Unmarshal(field, &s); err == nil {
+			if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+				updated.EffectiveFrom, updated.EffectiveFromRaw = t, s
+			}
+		}
+	}
+	if field, ok := raw["sync_mode"]; ok && string(field) != "null" {
+		var s string
+		_ = json.Unmarshal(field, &s)
+		if !slices.Contains([]string{"tracking", "pinned", "auto"}, s) {
+			http.Error(w, "Failed to deserialize the JSON body into the target type: sync_mode: "+
+				"unknown variant `"+s+"`", http.StatusUnprocessableEntity)
+			return
+		}
+		updated.SyncMode = s
+	}
+	if field, ok := raw["change_reason"]; ok && string(field) != "null" {
+		_ = json.Unmarshal(field, &updated.ChangeReason)
+	}
+	if field, ok := raw["cache_read_cost_per_million_tokens"]; ok {
+		if string(field) == "null" {
+			updated.CacheRead = nil
+		} else {
+			_ = json.Unmarshal(field, &updated.CacheRead)
+		}
+	}
+	if field, ok := raw["cache_write_cost_per_million_tokens"]; ok {
+		if string(field) == "null" {
+			updated.CacheWrite = nil
+		} else {
+			_ = json.Unmarshal(field, &updated.CacheWrite)
+		}
+	}
+
+	*v = updated
+	_ = json.NewEncoder(w).Encode(pricingJSON(v))
+}
+
+// deletePricing emulates the DELETE dispatch: a future-dated version is a
+// scheduled change to cancel (that one row is removed); an effective version
+// archives the whole rule (pending scheduled versions are cancelled and an
+// is_archived tombstone is appended, carrying the current prices forward).
+func (f *fakeLlmGatewayServer) deletePricing(w http.ResponseWriter, id string) {
+	v := f.findPricingVersion(id)
+	if v == nil {
+		writeLlmError(w, http.StatusNotFound, fmt.Sprintf("model pricing version %s not found", id))
+		return
+	}
+
+	now := time.Now().UTC()
+	if v.EffectiveFrom.After(now) {
+		f.removePricingVersion(id)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"deleted": true, "mode": "cancelled_scheduled", "cancelled_scheduled": 0, "archived": false,
+		})
+		return
+	}
+
+	cancelled, archived := f.archivePricingGroup(v.ModelPattern, pricingProviderKey(v.ModelProvider), now)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"deleted": true, "mode": "archived_rule", "cancelled_scheduled": cancelled, "archived": archived,
+	})
+}
+
+func (f *fakeLlmGatewayServer) removePricingVersion(id string) {
+	for i, v := range f.pricing {
+		if v.ID == id {
+			f.pricing = append(f.pricing[:i], f.pricing[i+1:]...)
+			return
+		}
+	}
+}
+
+// archivePricingGroup cancels pending scheduled versions of a rule and
+// appends the tombstone. Archiving an already-archived rule is an idempotent
+// no-op (archived = false). Callers hold f.mu.
+func (f *fakeLlmGatewayServer) archivePricingGroup(pattern, providerKey string, now time.Time) (cancelled int, archived bool) {
+	for _, v := range f.pricingGroup(pattern, providerKey) {
+		if v.EffectiveFrom.After(now) {
+			f.removePricingVersion(v.ID)
+			cancelled++
+		}
+	}
+	current := pricingCurrentOf(f.pricingGroup(pattern, providerKey), now)
+	if current == nil || current.IsArchived {
+		return cancelled, false
+	}
+	eff := now
+	if !eff.After(current.EffectiveFrom) {
+		eff = current.EffectiveFrom.Add(time.Microsecond)
+	}
+	reason := "Archived by admin"
+	tombstone := *current
+	tombstone.ID = f.newID("ffff")
+	tombstone.EffectiveFrom = eff
+	tombstone.EffectiveFromRaw = eff.Format(time.RFC3339Nano)
+	tombstone.ChangeSource = "admin_archive"
+	tombstone.ChangeReason = &reason
+	tombstone.IsArchived = true
+	f.pricing = append(f.pricing, &tombstone)
+	return cancelled, true
+}
+
+// markPricingArchived archives a rule out-of-band, as if an admin clicked
+// Archive in the app. providerKey uses the COALESCE semantics ("" for a
+// provider-unscoped rule).
+func (f *fakeLlmGatewayServer) markPricingArchived(t *testing.T, pattern, providerKey string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.pricingGroup(pattern, providerKey)) == 0 {
+		t.Fatalf("fake has no pricing rule %q (provider %q) to archive", pattern, providerKey)
+	}
+	f.archivePricingGroup(pattern, providerKey, time.Now().UTC())
+}
+
+// pricingGroupSnapshot returns copies of a rule's versions (newest
+// effective_from first) for test assertions.
+func (f *fakeLlmGatewayServer) pricingGroupSnapshot(pattern, providerKey string) []fakeLlmPricingVersion {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	group := f.pricingGroup(pattern, providerKey)
+	sort.Slice(group, func(i, j int) bool { return group[i].EffectiveFrom.After(group[j].EffectiveFrom) })
+	out := make([]fakeLlmPricingVersion, 0, len(group))
+	for _, v := range group {
+		out = append(out, *v)
+	}
+	return out
+}
+
+// checkAllLlmPricingArchived is the CheckDestroy for model-pricing tests:
+// destroy never hard-deletes, so every rule left in the store must be
+// archived — its latest effective version a tombstone, with no pending
+// scheduled versions.
+func checkAllLlmPricingArchived(fake *fakeLlmGatewayServer) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		now := time.Now().UTC()
+		seen := map[string]bool{}
+		for _, v := range fake.pricing {
+			key := v.ModelPattern + "\x00" + pricingProviderKey(v.ModelProvider)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			group := fake.pricingGroup(v.ModelPattern, pricingProviderKey(v.ModelProvider))
+			for _, g := range group {
+				if g.EffectiveFrom.After(now) {
+					return fmt.Errorf("pricing rule %q still has a scheduled version after destroy", v.ModelPattern)
+				}
+			}
+			current := pricingCurrentOf(group, now)
+			if current == nil || !current.IsArchived {
+				return fmt.Errorf("pricing rule %q was not archived on destroy", v.ModelPattern)
+			}
 		}
 		return nil
 	}
