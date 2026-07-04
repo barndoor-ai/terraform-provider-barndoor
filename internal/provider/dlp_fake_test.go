@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -21,12 +22,15 @@ import (
 // --- in-process fake dlp-service ----------------------------------------------
 //
 // fakeDlpServer emulates the dlp-service tenant admin REST surface the
-// provider binds (`/api/dlp/admin/v1/config|enforcement-policies|allow-list`)
-// faithfully enough to drive real plan/apply cycles: the COALESCE-upsert org
-// config (GET auto-creates), presence-based partial updates with
-// deny_unknown_fields on enforcement policies, server-assigned priorities,
-// target-shape validation, and the offset-token pagination envelope of the
-// allow list.
+// provider binds (`/api/dlp/admin/v1/config|enforcement-policies|allow-list|
+// custom-detection-types|field-control-policies`) faithfully enough to drive
+// real plan/apply cycles: the COALESCE-upsert org config (GET auto-creates),
+// presence-based partial updates with deny_unknown_fields on enforcement and
+// field-control policies, server-assigned priorities, target-shape
+// validation, the offset-token pagination envelope of the allow list, the
+// generated detection-type wire names and value trimming of custom detection
+// types, and the POST-as-upsert (always 201, version bump) plus 409
+// rules-shape validation of field control policies.
 
 // fakeDlpOrgID matches the BARNDOOR_ORGANIZATION_ID set by setupDlpTest.
 const fakeDlpOrgID = "org-123"
@@ -71,6 +75,25 @@ type fakeDlpAllowListEntry struct {
 	Reason         string
 }
 
+type fakeDlpCustomDetectionType struct {
+	ID                string
+	DetectionType     string
+	Name              string
+	Description       string
+	Patterns          []dlpCustomDetectionPatternPayload
+	DefaultSeverity   string
+	DefaultConfidence string
+}
+
+type fakeDlpFieldControlPolicy struct {
+	ID          string
+	McpServerID string
+	Name        string
+	Enabled     bool
+	Version     int64
+	Rules       json.RawMessage
+}
+
 type fakeDlpServer struct {
 	mu sync.Mutex
 
@@ -83,10 +106,20 @@ type fakeDlpServer struct {
 	nextEntryID int
 	// allowList keeps insertion order for stable offset pagination.
 	allowList []*fakeDlpAllowListEntry
+
+	nextDetectionTypeID int
+	detectionTypes      map[string]*fakeDlpCustomDetectionType
+
+	nextFieldPolicyID int
+	// fieldPolicies keeps insertion order for a stable listing.
+	fieldPolicies []*fakeDlpFieldControlPolicy
 }
 
 func newFakeDlpServer() *fakeDlpServer {
-	return &fakeDlpServer{policies: map[string]*fakeDlpEnforcementPolicy{}}
+	return &fakeDlpServer{
+		policies:       map[string]*fakeDlpEnforcementPolicy{},
+		detectionTypes: map[string]*fakeDlpCustomDetectionType{},
+	}
 }
 
 func (f *fakeDlpServer) handler() http.HandlerFunc {
@@ -100,6 +133,10 @@ func (f *fakeDlpServer) handler() http.HandlerFunc {
 			f.handleEnforcementPolicies(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/dlp/admin/v1/allow-list"):
 			f.handleAllowList(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/dlp/admin/v1/custom-detection-types"):
+			f.handleCustomDetectionTypes(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/dlp/admin/v1/field-control-policies"):
+			f.handleFieldControlPolicies(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -711,6 +748,522 @@ func checkAllDlpAllowListEntriesDeleted(fake *fakeDlpServer) resource.TestCheckF
 		defer fake.mu.Unlock()
 		for _, e := range fake.allowList {
 			return fmt.Errorf("allow-list entry %s (%s) was not deleted on destroy", e.ID, e.Pattern)
+		}
+		return nil
+	}
+}
+
+// --- custom detection types --------------------------------------------------------
+
+var fakeDlpUpdateDetectionTypeKeys = []string{
+	"name", "description", "patterns", "default_severity", "default_confidence",
+}
+
+func (f *fakeDlpServer) handleCustomDetectionTypes(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	id := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/dlp/admin/v1/custom-detection-types"), "/")
+
+	switch {
+	case id == "" && r.Method == http.MethodPost:
+		f.createCustomDetectionType(w, r)
+	case id == "" && r.Method == http.MethodGet:
+		items := make([]map[string]any, 0, len(f.detectionTypes))
+		for _, dt := range f.detectionTypes {
+			items = append(items, detectionTypeJSON(dt))
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
+	case id != "" && r.Method == http.MethodGet:
+		dt, ok := f.detectionTypes[id]
+		if !ok {
+			writeJSONMessage(w, http.StatusNotFound, fmt.Sprintf("custom detection type %s not found", id))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(detectionTypeJSON(dt))
+	case id != "" && r.Method == http.MethodPut:
+		f.updateCustomDetectionType(w, r, id)
+	case id != "" && r.Method == http.MethodDelete:
+		if _, ok := f.detectionTypes[id]; !ok {
+			writeJSONMessage(w, http.StatusNotFound, fmt.Sprintf("custom detection type %s not found", id))
+			return
+		}
+		delete(f.detectionTypes, id)
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func detectionTypeJSON(dt *fakeDlpCustomDetectionType) map[string]any {
+	patterns := make([]map[string]any, 0, len(dt.Patterns))
+	for _, p := range dt.Patterns {
+		patterns = append(patterns, map[string]any{
+			"pattern":      p.Pattern,
+			"pattern_type": p.PatternType,
+		})
+	}
+	return map[string]any{
+		"id":             dt.ID,
+		"org_id":         fakeDlpOrgID,
+		"detection_type": dt.DetectionType,
+		"name":           dt.Name,
+		"description":    dt.Description,
+		"patterns":       patterns,
+		// Production serializes the group under the key `group`.
+		"group":              "DETECTION_GROUP_CUSTOM",
+		"default_severity":   dt.DefaultSeverity,
+		"default_confidence": dt.DefaultConfidence,
+		"created_at":         fakeDlpTime,
+		"updated_at":         fakeDlpTime,
+	}
+}
+
+// validateDetectionPatterns mirrors production's
+// validate_custom_detection_patterns: at least one pattern, non-empty after
+// trimming, a known pattern_type, and compiling regexes.
+func validateDetectionPatterns(w http.ResponseWriter, patterns []dlpCustomDetectionPatternPayload) bool {
+	if len(patterns) == 0 {
+		writeJSONMessage(w, http.StatusUnprocessableEntity, "at least one pattern is required")
+		return false
+	}
+	for _, p := range patterns {
+		if strings.TrimSpace(p.Pattern) == "" {
+			writeJSONMessage(w, http.StatusUnprocessableEntity, "pattern must not be empty")
+			return false
+		}
+		if !slices.Contains([]string{"PATTERN_TYPE_LITERAL", "PATTERN_TYPE_REGEX"}, p.PatternType) {
+			writeJSONMessage(w, http.StatusUnprocessableEntity, "unknown pattern_type: "+p.PatternType)
+			return false
+		}
+		if p.PatternType == "PATTERN_TYPE_REGEX" {
+			if _, err := regexp.Compile(strings.TrimSpace(p.Pattern)); err != nil {
+				writeJSONMessage(w, http.StatusUnprocessableEntity,
+					fmt.Sprintf("invalid regex pattern '%s': %v", p.Pattern, err))
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// validateDetectionConfidence mirrors production's validate_confidence
+// (including its quirky "min_confidence" message). Severities are stored
+// verbatim without validation, like production.
+func validateDetectionConfidence(w http.ResponseWriter, confidence string) bool {
+	if !slices.Contains([]string{
+		"DETECTION_CONFIDENCE_UNSPECIFIED", "DETECTION_CONFIDENCE_LOW",
+		"DETECTION_CONFIDENCE_MEDIUM", "DETECTION_CONFIDENCE_HIGH",
+	}, confidence) {
+		writeJSONMessage(w, http.StatusUnprocessableEntity, "unknown min_confidence: "+confidence)
+		return false
+	}
+	return true
+}
+
+// trimDetectionPatterns mirrors production's per-pattern trimming.
+func trimDetectionPatterns(patterns []dlpCustomDetectionPatternPayload) []dlpCustomDetectionPatternPayload {
+	out := make([]dlpCustomDetectionPatternPayload, 0, len(patterns))
+	for _, p := range patterns {
+		out = append(out, dlpCustomDetectionPatternPayload{
+			Pattern:     strings.TrimSpace(p.Pattern),
+			PatternType: p.PatternType,
+		})
+	}
+	return out
+}
+
+func (f *fakeDlpServer) createCustomDetectionType(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name              string                             `json:"name"`
+		Description       *string                            `json:"description"`
+		Patterns          []dlpCustomDetectionPatternPayload `json:"patterns"`
+		DefaultSeverity   *string                            `json:"default_severity"`
+		DefaultConfidence *string                            `json:"default_confidence"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONMessage(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	if strings.TrimSpace(body.Name) == "" {
+		writeJSONMessage(w, http.StatusUnprocessableEntity, "name must not be empty")
+		return
+	}
+	if !validateDetectionPatterns(w, body.Patterns) {
+		return
+	}
+	if body.DefaultConfidence != nil && !validateDetectionConfidence(w, *body.DefaultConfidence) {
+		return
+	}
+
+	severity := "DETECTION_SEVERITY_MEDIUM"
+	if body.DefaultSeverity != nil {
+		severity = *body.DefaultSeverity
+	}
+	confidence := "DETECTION_CONFIDENCE_MEDIUM"
+	if body.DefaultConfidence != nil {
+		confidence = *body.DefaultConfidence
+	}
+	description := ""
+	if body.Description != nil {
+		description = strings.TrimSpace(*body.Description)
+	}
+
+	f.nextDetectionTypeID++
+	dt := &fakeDlpCustomDetectionType{
+		ID: fmt.Sprintf("cccc0000-0000-0000-0000-%012d", f.nextDetectionTypeID),
+		// Production appends a simple-format UUID; a counter is just as opaque.
+		DetectionType:     fmt.Sprintf("DETECTION_TYPE_CUSTOM_%032d", f.nextDetectionTypeID),
+		Name:              strings.TrimSpace(body.Name),
+		Description:       description,
+		Patterns:          trimDetectionPatterns(body.Patterns),
+		DefaultSeverity:   severity,
+		DefaultConfidence: confidence,
+	}
+	f.detectionTypes[dt.ID] = dt
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(detectionTypeJSON(dt))
+}
+
+// updateCustomDetectionType applies presence-based partial-update semantics:
+// only keys in the payload change, with description's "" = clear behavior.
+func (f *fakeDlpServer) updateCustomDetectionType(w http.ResponseWriter, r *http.Request, id string) {
+	dt, ok := f.detectionTypes[id]
+	if !ok {
+		writeJSONMessage(w, http.StatusNotFound, fmt.Sprintf("custom detection type %s not found", id))
+		return
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		writeJSONMessage(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	// Production has no deny_unknown_fields here, but the provider must only
+	// ever send the documented keys — fail the test if it drifts.
+	for key := range raw {
+		if !slices.Contains(fakeDlpUpdateDetectionTypeKeys, key) {
+			writeJSONMessage(w, http.StatusUnprocessableEntity, "unexpected field `"+key+"`")
+			return
+		}
+	}
+
+	updated := *dt
+	updated.Patterns = slices.Clone(dt.Patterns)
+
+	if v, ok := raw["name"]; ok {
+		_ = json.Unmarshal(v, &updated.Name)
+		if strings.TrimSpace(updated.Name) == "" {
+			writeJSONMessage(w, http.StatusUnprocessableEntity, "name must not be empty")
+			return
+		}
+		updated.Name = strings.TrimSpace(updated.Name)
+	}
+	if v, ok := raw["description"]; ok {
+		var description string
+		_ = json.Unmarshal(v, &description)
+		updated.Description = strings.TrimSpace(description)
+	}
+	if v, ok := raw["patterns"]; ok {
+		var patterns []dlpCustomDetectionPatternPayload
+		_ = json.Unmarshal(v, &patterns)
+		if !validateDetectionPatterns(w, patterns) {
+			return
+		}
+		updated.Patterns = trimDetectionPatterns(patterns)
+	}
+	if v, ok := raw["default_severity"]; ok {
+		_ = json.Unmarshal(v, &updated.DefaultSeverity)
+	}
+	if v, ok := raw["default_confidence"]; ok {
+		_ = json.Unmarshal(v, &updated.DefaultConfidence)
+		if !validateDetectionConfidence(w, updated.DefaultConfidence) {
+			return
+		}
+	}
+
+	*dt = updated
+	_ = json.NewEncoder(w).Encode(detectionTypeJSON(dt))
+}
+
+// markDetectionTypeDeleted removes a stored custom detection type out-of-band.
+func (f *fakeDlpServer) markDetectionTypeDeleted(t *testing.T, id string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.detectionTypes[id]; !ok {
+		t.Fatalf("fake has no custom detection type %q to delete", id)
+	}
+	delete(f.detectionTypes, id)
+}
+
+// checkAllDlpDetectionTypesDeleted is the CheckDestroy for custom detection
+// type tests: destroy must remove every detection type the test created.
+func checkAllDlpDetectionTypesDeleted(fake *fakeDlpServer) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		for id, dt := range fake.detectionTypes {
+			return fmt.Errorf("custom detection type %s (%s) was not deleted on destroy", id, dt.Name)
+		}
+		return nil
+	}
+}
+
+// --- field control policies --------------------------------------------------------
+
+var fakeDlpUpdateFieldPolicyKeys = []string{"name", "enabled", "rules"}
+
+func (f *fakeDlpServer) handleFieldControlPolicies(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	id := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/dlp/admin/v1/field-control-policies"), "/")
+
+	switch {
+	case id == "" && r.Method == http.MethodGet:
+		items := make([]map[string]any, 0, len(f.fieldPolicies))
+		for _, p := range f.fieldPolicies {
+			items = append(items, fieldPolicyJSON(p))
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
+	case id == "" && r.Method == http.MethodPost:
+		f.upsertFieldControlPolicy(w, r)
+	case id != "" && r.Method == http.MethodGet:
+		p := f.findFieldPolicy(id)
+		if p == nil {
+			writeJSONMessage(w, http.StatusNotFound, fmt.Sprintf("field control policy %s not found", id))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(fieldPolicyJSON(p))
+	case id != "" && r.Method == http.MethodPut:
+		f.updateFieldControlPolicy(w, r, id)
+	case id != "" && r.Method == http.MethodDelete:
+		for i, p := range f.fieldPolicies {
+			if p.ID == id {
+				f.fieldPolicies = append(f.fieldPolicies[:i], f.fieldPolicies[i+1:]...)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		writeJSONMessage(w, http.StatusNotFound, fmt.Sprintf("field control policy %s not found", id))
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// findFieldPolicy returns the stored policy with the given id, or nil.
+// Callers hold f.mu.
+func (f *fakeDlpServer) findFieldPolicy(id string) *fakeDlpFieldControlPolicy {
+	for _, p := range f.fieldPolicies {
+		if p.ID == id {
+			return p
+		}
+	}
+	return nil
+}
+
+func fieldPolicyJSON(p *fakeDlpFieldControlPolicy) map[string]any {
+	return map[string]any{
+		"id":            p.ID,
+		"org_id":        fakeDlpOrgID,
+		"mcp_server_id": p.McpServerID,
+		"name":          p.Name,
+		"enabled":       p.Enabled,
+		"version":       p.Version,
+		"rules":         p.Rules,
+		"created_by":    "svc-test",
+		"updated_by":    "svc-test",
+		"created_at":    fakeDlpTime,
+		"updated_at":    fakeDlpTime,
+	}
+}
+
+// validateFieldControlRules mirrors the leading checks of production's
+// store-level validate_field_control_rules, which answers 409 (Conflict) —
+// not 422 — for malformed rule contents. The provider treats rule contents as
+// opaque JSON, so mirroring the array/object/tool/direction checks is enough
+// to exercise its 409 path.
+func validateFieldControlRules(w http.ResponseWriter, rules json.RawMessage) bool {
+	var items []json.RawMessage
+	if err := json.Unmarshal(rules, &items); err != nil || items == nil {
+		writeJSONMessage(w, http.StatusConflict, "field control policy rules must be a JSON array")
+		return false
+	}
+	for i, item := range items {
+		var rule map[string]json.RawMessage
+		if err := json.Unmarshal(item, &rule); err != nil || rule == nil {
+			writeJSONMessage(w, http.StatusConflict, fmt.Sprintf("field control rule %d must be an object", i))
+			return false
+		}
+		var tool string
+		_ = json.Unmarshal(rule["tool"], &tool)
+		if strings.TrimSpace(tool) == "" {
+			writeJSONMessage(w, http.StatusConflict, fmt.Sprintf("field control rule %d must specify tool", i))
+			return false
+		}
+		var direction string
+		_ = json.Unmarshal(rule["direction"], &direction)
+		if direction != "output" {
+			writeJSONMessage(w, http.StatusConflict, fmt.Sprintf("field control rule %d must use output direction", i))
+			return false
+		}
+	}
+	return true
+}
+
+// upsertFieldControlPolicy mirrors production's POST: an INSERT … ON CONFLICT
+// (org_id, mcp_server_id) DO UPDATE that bumps version on the update arm and
+// answers 201 CREATED either way.
+func (f *fakeDlpServer) upsertFieldControlPolicy(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		McpServerID string           `json:"mcp_server_id"`
+		Name        string           `json:"name"`
+		Enabled     *bool            `json:"enabled"`
+		Rules       *json.RawMessage `json:"rules"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONMessage(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	if strings.TrimSpace(body.Name) == "" {
+		writeJSONMessage(w, http.StatusUnprocessableEntity, "name must not be empty")
+		return
+	}
+	if strings.TrimSpace(body.McpServerID) == "" {
+		writeJSONMessage(w, http.StatusUnprocessableEntity, "mcp_server_id must not be empty")
+		return
+	}
+	enabled := true
+	if body.Enabled != nil {
+		enabled = *body.Enabled
+	}
+	rules := json.RawMessage("[]")
+	if body.Rules != nil {
+		rules = *body.Rules
+	}
+	if !validateFieldControlRules(w, rules) {
+		return
+	}
+
+	mcpServerID := strings.TrimSpace(body.McpServerID)
+	for _, p := range f.fieldPolicies {
+		if p.McpServerID == mcpServerID {
+			p.Name = strings.TrimSpace(body.Name)
+			p.Enabled = enabled
+			p.Rules = rules
+			p.Version++
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(fieldPolicyJSON(p))
+			return
+		}
+	}
+
+	f.nextFieldPolicyID++
+	p := &fakeDlpFieldControlPolicy{
+		ID:          fmt.Sprintf("abab0000-0000-0000-0000-%012d", f.nextFieldPolicyID),
+		McpServerID: mcpServerID,
+		Name:        strings.TrimSpace(body.Name),
+		Enabled:     enabled,
+		Version:     1,
+		Rules:       rules,
+	}
+	f.fieldPolicies = append(f.fieldPolicies, p)
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(fieldPolicyJSON(p))
+}
+
+// updateFieldControlPolicy applies presence-based partial-update semantics
+// with deny_unknown_fields, bumping version when any content key is present.
+func (f *fakeDlpServer) updateFieldControlPolicy(w http.ResponseWriter, r *http.Request, id string) {
+	p := f.findFieldPolicy(id)
+	if p == nil {
+		writeJSONMessage(w, http.StatusNotFound, fmt.Sprintf("field control policy %s not found", id))
+		return
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		writeJSONMessage(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	for key := range raw {
+		if !slices.Contains(fakeDlpUpdateFieldPolicyKeys, key) {
+			writeJSONMessage(w, http.StatusUnprocessableEntity, "unknown field `"+key+"`")
+			return
+		}
+	}
+
+	updated := *p
+	bump := false
+	if v, ok := raw["name"]; ok {
+		_ = json.Unmarshal(v, &updated.Name)
+		if strings.TrimSpace(updated.Name) == "" {
+			writeJSONMessage(w, http.StatusUnprocessableEntity, "name must not be empty")
+			return
+		}
+		updated.Name = strings.TrimSpace(updated.Name)
+		bump = true
+	}
+	if v, ok := raw["enabled"]; ok {
+		_ = json.Unmarshal(v, &updated.Enabled)
+		bump = true
+	}
+	if v, ok := raw["rules"]; ok {
+		if !validateFieldControlRules(w, v) {
+			return
+		}
+		updated.Rules = v
+		bump = true
+	}
+	if bump {
+		updated.Version++
+	}
+
+	*p = updated
+	_ = json.NewEncoder(w).Encode(fieldPolicyJSON(p))
+}
+
+// seedFieldControlPolicy plants a policy out-of-band, as if another actor had
+// created it through the API.
+func (f *fakeDlpServer) seedFieldControlPolicy(mcpServerID, name string) *fakeDlpFieldControlPolicy {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextFieldPolicyID++
+	p := &fakeDlpFieldControlPolicy{
+		ID:          fmt.Sprintf("abab0000-0000-0000-0000-%012d", f.nextFieldPolicyID),
+		McpServerID: mcpServerID,
+		Name:        name,
+		Enabled:     true,
+		Version:     1,
+		Rules:       json.RawMessage("[]"),
+	}
+	f.fieldPolicies = append(f.fieldPolicies, p)
+	return p
+}
+
+// markFieldControlPolicyDeleted removes a stored policy out-of-band.
+func (f *fakeDlpServer) markFieldControlPolicyDeleted(t *testing.T, id string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, p := range f.fieldPolicies {
+		if p.ID == id {
+			f.fieldPolicies = append(f.fieldPolicies[:i], f.fieldPolicies[i+1:]...)
+			return
+		}
+	}
+	t.Fatalf("fake has no field control policy %q to delete", id)
+}
+
+// checkAllDlpFieldControlPoliciesDeleted is the CheckDestroy for field
+// control policy tests: destroy must remove every policy the test created.
+func checkAllDlpFieldControlPoliciesDeleted(fake *fakeDlpServer) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		for _, p := range fake.fieldPolicies {
+			return fmt.Errorf("field control policy %s (%s) was not deleted on destroy", p.ID, p.Name)
 		}
 		return nil
 	}
