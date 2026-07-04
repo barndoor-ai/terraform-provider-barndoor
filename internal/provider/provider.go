@@ -143,6 +143,7 @@ func (p *BarndoorProvider) Resources(ctx context.Context) []func() resource.Reso
 		NewDlpEnforcementPolicyResource,
 		NewDlpFieldControlPolicyResource,
 		NewDlpOrgConfigResource,
+		NewIdpResource,
 		NewLlmModelAccessResource,
 		NewLlmModelMappingResource,
 		NewLlmProviderResource,
@@ -158,6 +159,7 @@ func (p *BarndoorProvider) Resources(ctx context.Context) []func() resource.Reso
 func (p *BarndoorProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{
 		NewAgentDataSource,
+		NewIdpSettingsDataSource,
 		NewLogExportAWSTrustInfoDataSource,
 		NewMcpServerDataSource,
 		NewPolicyDataSource,
