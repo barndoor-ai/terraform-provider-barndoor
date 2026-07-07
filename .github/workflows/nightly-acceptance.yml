@@ -1,0 +1,112 @@
+# Nightly acceptance tests against a live Barndoor environment.
+#
+# Unlike the per-PR `Tests` workflow (which runs with TF_ACC=1 but no
+# credentials, so every live-backend test skips and only the httptest fakes
+# run), this workflow injects the `dev` GitHub environment's BARNDOOR_*
+# connection settings and runs the full acceptance suite against the dedicated
+# `radical-tomato` dev tenant. Nightly live testing is a HashiCorp Technology
+# Partner requirement.
+name: Nightly Acceptance Tests
+
+on:
+  schedule:
+    # 09:00 UTC = 05:00 America/New_York during EDT (04:00 during EST).
+    # GitHub cron is UTC with no DST awareness, so the wall-clock time drifts
+    # by an hour across the DST boundary; the exact minute is not important.
+    - cron: '0 9 * * *'
+  # Allow manual runs from the Actions tab (main only, per the environment's
+  # deployment-branch policy).
+  workflow_dispatch: {}
+
+# The test job needs only read access to the repo. The notify job additionally
+# needs to open/update a tracking issue on failure.
+permissions:
+  contents: read
+
+# Never let two nightly runs (or a manual run overlapping the cron) mutate the
+# shared test tenant at the same time.
+concurrency:
+  group: nightly-acceptance
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: 'Acceptance Tests: Terraform ${{ matrix.terraform }}'
+    runs-on: ubuntu-latest
+    # Binds the BARNDOOR_* environment secrets/variables and enforces the
+    # main-only deployment-branch policy.
+    environment: dev
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        terraform:
+          - '1.13.*'
+          - '1.14.*'
+          - '1.15.*'
+    env:
+      TF_ACC: '1'
+      BARNDOOR_BASE_URL: ${{ vars.BARNDOOR_BASE_URL }}
+      BARNDOOR_TOKEN_URL: ${{ vars.BARNDOOR_TOKEN_URL }}
+      BARNDOOR_CLIENT_ID: ${{ vars.BARNDOOR_CLIENT_ID }}
+      BARNDOOR_CLIENT_SECRET: ${{ secrets.BARNDOOR_CLIENT_SECRET }}
+      BARNDOOR_ORGANIZATION_ID: ${{ vars.BARNDOOR_ORGANIZATION_ID }}
+      # Opts in to the destructive (write) tests against the disposable tenant,
+      # and guards a protected org they must never touch.
+      BARNDOOR_ACC_TEST_ORGANIZATION_ID: ${{ vars.BARNDOOR_ACC_TEST_ORGANIZATION_ID }}
+      BARNDOOR_ACC_PROTECTED_ORGANIZATION_ID: ${{ vars.BARNDOOR_ACC_PROTECTED_ORGANIZATION_ID }}
+      # Fixture IDs for the MCP-server / policy / agent tests. These skip
+      # cleanly when unset, so the workflow is useful before they are populated.
+      BARNDOOR_TEST_MCP_SERVER_ID: ${{ vars.BARNDOOR_TEST_MCP_SERVER_ID }}
+      BARNDOOR_TEST_MCP_SERVER_DIRECTORY_ID: ${{ vars.BARNDOOR_TEST_MCP_SERVER_DIRECTORY_ID }}
+      BARNDOOR_TEST_APPLICATION_DIRECTORY_ID: ${{ vars.BARNDOOR_TEST_APPLICATION_DIRECTORY_ID }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ matrix.terraform }}
+          terraform_wrapper: false
+      - run: go mod download
+      - name: Acceptance tests
+        run: go test -v -cover -timeout 25m ./internal/provider/
+        timeout-minutes: 25
+
+  # Interim failure alerting: open (or comment on) a tracking issue so nightly
+  # failures are never silent. This is a stopgap until failures are routed to
+  # Slack via the barndoor infra-tools CLI (see the follow-up).
+  notify-failure:
+    name: Report nightly failure
+    needs: acceptance
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update tracking issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          LABEL="nightly-failure"
+          # Ensure the label exists (idempotent).
+          gh label create "$LABEL" --repo "$REPO" --color B60205 \
+            --description "Nightly acceptance test failure" 2>/dev/null || true
+
+          BODY="Nightly acceptance tests failed: ${RUN_URL}"
+          EXISTING=$(gh issue list --repo "$REPO" --label "$LABEL" --state open \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$REPO" --body "$BODY"
+            echo "Commented on existing issue #$EXISTING"
+          else
+            gh issue create --repo "$REPO" --label "$LABEL" \
+              --title "Nightly acceptance tests failing" --body "$BODY"
+          fi
