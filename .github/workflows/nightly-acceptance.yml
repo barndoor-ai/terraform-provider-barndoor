@@ -4,18 +4,13 @@
 # credentials, so every live-backend test skips and only the httptest fakes
 # run), this workflow injects the `dev` GitHub environment's BARNDOOR_*
 # connection settings and runs the full acceptance suite against the dedicated
-# `radical-tomato` dev tenant. Nightly live testing is a HashiCorp Technology
-# Partner requirement.
+# `radical-tomato` dev tenant.
 name: Nightly Acceptance Tests
 
 on:
   schedule:
     # 09:00 UTC = 05:00 America/New_York during EDT (04:00 during EST).
-    # GitHub cron is UTC with no DST awareness, so the wall-clock time drifts
-    # by an hour across the DST boundary; the exact minute is not important.
     - cron: '0 9 * * *'
-  # Allow manual runs from the Actions tab (main only, per the environment's
-  # deployment-branch policy).
   workflow_dispatch: {}
 
 # The test job needs only read access to the repo. The notify job additionally
