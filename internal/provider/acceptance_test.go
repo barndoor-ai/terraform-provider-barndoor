@@ -222,6 +222,9 @@ func TestAccLogExportResource_lifecycle(t *testing.T) {
 				ImportState:       true,
 				ImportStateId:     fmt.Sprintf("%s/%s", testOrg, defaultExportType),
 				ImportStateVerify: true,
+				// This resource is an org-singleton with no "id" attribute; its
+				// identifier is organization_id (the framework defaults to "id").
+				ImportStateVerifyIdentifierAttribute: "organization_id",
 				ImportStateVerifyIgnore: []string{
 					"destination.access_key_id",
 					"destination.secret_access_key",
