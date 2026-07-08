@@ -585,6 +585,18 @@ func (r *logExportResource) ImportState(ctx context.Context, req resource.Import
 
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("organization_id"), orgID)...)
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("export_type"), exportType)...)
+
+	// Seed an empty settings object so the follow-up Read hydrates its
+	// server-computed values. mapServerToState only overlays settings onto a
+	// non-nil model (to avoid resurrecting an omitted block on refresh), and
+	// import is the one path that starts with no prior state — without this
+	// seed, batch_size/flush_interval_seconds/max_retries come back null.
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("settings"), settingsModel{
+		BatchSize:            types.Int64Null(),
+		FlushIntervalSeconds: types.Int64Null(),
+		MaxRetries:           types.Int64Null(),
+		IncludedEventTypes:   types.ListNull(types.StringType),
+	})...)
 }
 
 // --- API interaction helpers -------------------------------------------------
