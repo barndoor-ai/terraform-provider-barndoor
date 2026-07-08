@@ -14,7 +14,9 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
 	"github.com/barndoor-ai/terraform-provider-barndoor/internal/client"
 )
@@ -30,6 +32,45 @@ func newLogExportSchema(t *testing.T) schema.Schema {
 		t.Fatalf("schema failed framework validation: %+v", diags)
 	}
 	return resp.Schema
+}
+
+// TestLogExportImportState_SeedsSettings guards the import path: ImportState
+// must seed a non-nil settings block so the follow-up Read overlays the
+// server-computed batch_size/flush_interval_seconds/max_retries. Without the
+// seed, mapServerToState's non-nil guard skips settings and ImportStateVerify
+// fails on the dropped attributes.
+func TestLogExportImportState_SeedsSettings(t *testing.T) {
+	ctx := context.Background()
+	schemaObj := newLogExportSchema(t)
+	resp := &resource.ImportStateResponse{
+		State: tfsdk.State{
+			Schema: schemaObj,
+			Raw:    tftypes.NewValue(schemaObj.Type().TerraformType(ctx), nil),
+		},
+	}
+
+	(&logExportResource{}).ImportState(ctx, resource.ImportStateRequest{ID: "org-123/audit-log"}, resp)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("ImportState diagnostics: %+v", resp.Diagnostics)
+	}
+
+	var state logExportResourceModel
+	if diags := resp.State.Get(ctx, &state); diags.HasError() {
+		t.Fatalf("state.Get: %+v", diags)
+	}
+
+	if got := state.OrganizationID.ValueString(); got != "org-123" {
+		t.Errorf("organization_id = %q, want org-123", got)
+	}
+	if got := state.ExportType.ValueString(); got != "audit-log" {
+		t.Errorf("export_type = %q, want audit-log", got)
+	}
+	if state.Settings == nil {
+		t.Fatal("settings not seeded on import: Read will not hydrate server-computed values")
+	}
+	if !state.Settings.BatchSize.IsNull() {
+		t.Errorf("seeded batch_size = %v, want null (Read overlays the real value)", state.Settings.BatchSize)
+	}
 }
 
 func TestLogExportResource_Metadata(t *testing.T) {
