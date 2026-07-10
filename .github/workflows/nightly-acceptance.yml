@@ -34,6 +34,11 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      # Serialize the matrix: all versions run against the same dev tenant, and
+      # the org-singleton resources (e.g. barndoor_log_export) would race if two
+      # jobs mutated them at once. One version at a time keeps the nightly
+      # deterministic; the extra wall-clock is fine for a scheduled run.
+      max-parallel: 1
       matrix:
         terraform:
           - '1.13.*'
