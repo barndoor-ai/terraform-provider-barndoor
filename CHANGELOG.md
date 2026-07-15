@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 (2026-07-15)
+
+BUG FIXES:
+
+* resource/`barndoor_log_export`: `terraform import` now hydrates the `settings` block (`batch_size`, `flush_interval_seconds`, `max_retries`) from the server. Previously import left `settings` null, producing incomplete state and a spurious in-place diff on the next plan.
+
 ## 0.3.0 (2026-07-06)
 
 FEATURES:
