@@ -5,6 +5,7 @@
 NOTES:
 
 * docs/resource/barndoor_connection: documented `terraform import` — the import key is the **server's** UUID or slug (an organization holds at most one tenant-wide connection per server). Previously this was the only resource page without an Import section.
+* resource/`barndoor_policy`: the `actions` schema description and the examples now spell out the platform's action format — each entry is `*` or a `tools/call:`-prefixed tool name. The published examples showed bare tool names (e.g. `search`, `create_*`), which the API rejects.
 * docs: every configuration under `examples/` is now validated with `terraform validate` in CI (`make validate-examples` runs the same check locally), so invalid example HCL can no longer ship in the published docs. The examples that referenced undeclared variables or resources are now self-contained.
 
 ## 0.3.1 (2026-07-15)
