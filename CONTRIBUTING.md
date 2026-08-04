@@ -10,6 +10,7 @@ follow for pull requests.
 - [Test a local build against your Barndoor account](#test-a-local-build-against-your-barndoor-account)
 - [Acceptance tests](#acceptance-tests)
 - [Generate docs and license headers](#generate-docs-and-license-headers)
+- [Validate the examples](#validate-the-examples)
 - [Lint and format](#lint-and-format)
 - [Pull requests](#pull-requests)
 
@@ -113,6 +114,19 @@ make generate
 This runs [`tfplugindocs`](https://github.com/hashicorp/terraform-plugin-docs)
 (which needs `terraform` on your `PATH`) and
 [`copywrite`](https://github.com/hashicorp/copywrite).
+
+## Validate the examples
+
+The configurations under [`examples/`](examples/) are embedded in the
+generated docs, so CI runs `terraform validate` on every one of them against a
+locally built provider. Keep each example self-contained (declare the
+variables it references; use placeholder UUIDs for ids of resources it doesn't
+declare) and run the same check locally — needs `terraform` on your `PATH`, no
+credentials:
+
+```bash
+make validate-examples
+```
 
 ## Lint and format
 

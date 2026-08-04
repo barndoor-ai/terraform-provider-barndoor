@@ -34,7 +34,8 @@ resource "barndoor_policy" "salesforce_read_only" {
 
       # actions and roles are required: the API would default an omitted
       # list to ["*"] (everything), so say it explicitly when you mean it.
-      actions = ["search", "get_record", "list_records"]
+      # Each action is "*" or a tools/call:-prefixed tool name.
+      actions = ["tools/call:search", "tools/call:get_record", "tools/call:list_records"]
       roles   = ["role:analyst", "group:data-team"]
 
       # Optional condition tree: each node has exactly one of `expr`

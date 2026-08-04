@@ -25,8 +25,9 @@ resource "barndoor_policy" "github_readonly" {
   mcp_server_id = data.barndoor_mcp_server.github.id
 
   rules = [{
-    effect  = "DENY"
-    actions = ["create_*", "update_*", "delete_*"]
+    effect = "DENY"
+    # Each action is "*" or a tools/call:-prefixed tool name.
+    actions = ["tools/call:create_issue", "tools/call:merge_pull_request", "tools/call:push_files"]
     roles   = ["*"]
   }]
 }

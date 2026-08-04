@@ -61,3 +61,18 @@ variable "search_api_key" {
 - `id` (String) Connection UUID assigned by the API.
 - `mcp_server_id` (String) Resolved UUID of the connected MCP server (equal to `server_id` unless a slug was configured).
 - `status` (String) Connection status computed by the platform: `connected`, `pending`, or `error`.
+
+## Import
+
+Import is supported using the following syntax:
+
+The [`terraform import` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
+
+```shell
+# Import by the *server's* UUID or slug — an organization holds at most one
+# tenant-wide connection per server, so the connection is keyed by its server.
+# Credential attributes are write-only and not recoverable from the API; they
+# read back null.
+terraform import barndoor_connection.search 11111111-1111-1111-1111-111111111111
+terraform import barndoor_connection.search my-server-slug
+```

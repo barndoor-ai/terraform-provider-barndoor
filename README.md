@@ -8,16 +8,20 @@
 Manage [Barndoor AI](https://barndoor.ai) platform resources as code, built on
 the [Terraform Plugin Framework](https://github.com/hashicorp/terraform-plugin-framework).
 
-> **Status: early development.** The provider is being built one resource at a
-> time. The first resource — audit **log export** — is in progress; this initial
-> release establishes the provider, authentication, and release pipeline.
+> **Status: actively developed.** As of v0.3.1 the provider manages
+> **18 resources and 5 data sources** across the Barndoor platform: MCP servers
+> and tenant-wide connections, AI Agent registrations, access policies, Data
+> Protection (DLP), the LLM Gateway, enterprise SSO (IdP), and audit log
+> export.
 
 ## Documentation
 
 Full, generated provider documentation lives on the Terraform Registry:
 **[registry.terraform.io/providers/barndoor-ai/barndoor/latest/docs](https://registry.terraform.io/providers/barndoor-ai/barndoor/latest/docs)**.
 The source for those pages is in [`docs/`](docs/), with runnable
-[`examples/`](examples/).
+[`examples/`](examples/). Product-level guides — how the provider fits into
+the Barndoor platform — live in the [Barndoor product
+docs](https://docs.barndoor.ai) under the **Terraform** tab.
 
 ## Quick start
 

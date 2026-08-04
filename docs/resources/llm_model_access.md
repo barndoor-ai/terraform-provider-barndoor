@@ -37,7 +37,7 @@ resource "barndoor_llm_model_access" "engineering_denylist" {
 
   targets = [
     { kind = "model", model = "gpt-4o-mini" },
-    { kind = "provider", provider_id = barndoor_llm_provider.staging.id },
+    { kind = "provider", provider_id = "11111111-1111-1111-1111-111111111111" }, # a barndoor_llm_provider id
   ]
 
   traffic_type = "all"

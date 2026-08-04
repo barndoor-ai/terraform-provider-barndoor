@@ -252,9 +252,11 @@ func policyRuleNestedObject() schema.NestedAttributeObject {
 				},
 			},
 			"actions": schema.ListAttribute{
-				MarkdownDescription: "Tool/action names the rule matches. **Required** (with at least one " +
-					"entry) because the API defaults an omitted list to `[\"*\"]` — everything — which is a " +
-					"footgun when left implicit; say `[\"*\"]` explicitly to match all actions.",
+				MarkdownDescription: "Tool/action names the rule matches. Each entry must be `*` (match " +
+					"everything) or a `tools/call:`-prefixed tool name (e.g. `tools/call:search`) — the API " +
+					"rejects bare tool names. **Required** (with at least one entry) because the API defaults " +
+					"an omitted list to `[\"*\"]` — everything — which is a footgun when left implicit; say " +
+					"`[\"*\"]` explicitly to match all actions.",
 				ElementType: types.StringType,
 				Required:    true,
 				Validators: []validator.List{

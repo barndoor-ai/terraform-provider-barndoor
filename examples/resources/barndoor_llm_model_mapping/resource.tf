@@ -1,7 +1,7 @@
 # 1:1 enablement: makes gpt-4o servable on the provider (addressable as
 # <provider>/gpt-4o; set bare_alias = true to also serve the bare name).
 resource "barndoor_llm_model_mapping" "gpt_4o" {
-  provider_id    = barndoor_llm_provider.openai.id
+  provider_id    = "11111111-1111-1111-1111-111111111111" # a barndoor_llm_provider id
   model_alias    = "gpt-4o"
   upstream_model = "gpt-4o"
 }
@@ -10,7 +10,7 @@ resource "barndoor_llm_model_mapping" "gpt_4o" {
 # (provider, upstream_model) pair must exist first — the API rejects
 # orphan aliases.
 resource "barndoor_llm_model_mapping" "fast" {
-  provider_id    = barndoor_llm_provider.openai.id
+  provider_id    = "11111111-1111-1111-1111-111111111111" # same provider
   model_alias    = "fast"
   upstream_model = "gpt-4o"
 
