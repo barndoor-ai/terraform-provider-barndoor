@@ -22,3 +22,17 @@ resource "barndoor_mcp_server" "internal_api" {
   })
   cascaded_fields = ["api_key"]
 }
+
+variable "github_oauth_client_id" {
+  type = string
+}
+
+variable "github_oauth_client_secret" {
+  type      = string
+  sensitive = true
+}
+
+variable "internal_api_key" {
+  type      = string
+  sensitive = true
+}

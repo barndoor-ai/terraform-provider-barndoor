@@ -55,6 +55,25 @@ jobs:
           git diff --compact-summary --exit-code || \
             (echo; echo "Unexpected difference in directories after code generation. Run 'make generate' command and commit."; exit 1)
 
+  # Validate every examples/ configuration against the locally built provider,
+  # so broken example HCL can't ship in the published docs (a block-syntax bug
+  # in an example shipped in 0.2.0 — see CHANGELOG). Offline and secret-free:
+  # `terraform validate` never configures the provider.
+  validate-examples:
+    name: Validate examples
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_wrapper: false
+      - run: make validate-examples
+
   # Run acceptance tests in a matrix with Terraform CLI versions
   test:
     name: 'Acceptance Tests: Terraform ${{ matrix.terraform }}'

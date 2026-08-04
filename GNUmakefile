@@ -37,6 +37,11 @@ generate:
 	fi
 	cd tools; go generate ./...
 
+# Validate every examples/ configuration with `terraform validate` against a
+# locally built provider (offline, no credentials). Needs terraform on PATH.
+validate-examples:
+	sh tools/validate-examples.sh
+
 fmt:
 	gofmt -s -w -e .
 
@@ -46,4 +51,4 @@ test:
 testacc:
 	TF_ACC=1 go test -v -cover -timeout 120m ./...
 
-.PHONY: fmt lint test testacc build install dev-install generate
+.PHONY: fmt lint test testacc build install dev-install generate validate-examples

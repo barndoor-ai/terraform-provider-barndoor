@@ -24,7 +24,7 @@ resource "barndoor_agent" "claude" {
 # The registration id is what access policies bind to.
 resource "barndoor_policy" "claude_github" {
   name            = "Claude x GitHub"
-  mcp_server_id   = barndoor_mcp_server.github.id
+  mcp_server_id   = "22222222-2222-2222-2222-222222222222" # a barndoor_mcp_server id
   application_ids = [barndoor_agent.claude.id]
   status          = "ACTIVE"
 
