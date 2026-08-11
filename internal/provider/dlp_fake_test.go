@@ -6,6 +6,7 @@ package provider
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -22,23 +23,29 @@ import (
 // --- in-process fake dlp-service ----------------------------------------------
 //
 // fakeDlpServer emulates the dlp-service tenant admin REST surface the
-// provider binds (`/api/dlp/admin/v1/config|enforcement-policies|allow-list|
-// custom-detection-types|field-control-policies`) faithfully enough to drive
-// real plan/apply cycles: the COALESCE-upsert org config (GET auto-creates),
-// presence-based partial updates with deny_unknown_fields on enforcement and
-// field-control policies, server-assigned priorities, target-shape
-// validation, the offset-token pagination envelope of the allow list, the
-// generated detection-type wire names and value trimming of custom detection
-// types, and the POST-as-upsert (always 201, version bump) plus 409
-// rules-shape validation of field control policies.
+// provider binds (`/api/dlp/admin/v1/config|enforcement-policies|
+// detection-engines|allow-list|custom-detection-types|field-control-policies`)
+// faithfully enough to drive real plan/apply cycles: the COALESCE-upsert org
+// config (GET auto-creates), presence-based partial updates with
+// deny_unknown_fields on enforcement and field-control policies,
+// server-assigned priorities, target-shape validation, the offset-token
+// pagination envelope of the allow list, the generated detection-type wire
+// names and value trimming of custom detection types, the POST-as-upsert
+// (always 201, version bump) plus 409 rules-shape validation of field control
+// policies, and the detection engines' bare-array listing, (name,
+// provider_type) uniqueness, double-Option provider_connection_name, and
+// sole-coverage 409 delete guard.
 
 // fakeDlpOrgID matches the BARNDOOR_ORGANIZATION_ID set by setupDlpTest.
 const fakeDlpOrgID = "org-123"
 
-// fakeDlpDetectionEngineID is the one detection engine the fake org owns;
-// enforcement policies referencing any other engine id get the production
-// 404.
+// fakeDlpDetectionEngineID is the detection engine the fake org is pre-seeded
+// with (as if created through the app); enforcement policies referencing an
+// engine id that is not stored get the production 404.
 const fakeDlpDetectionEngineID = "dddd0000-0000-0000-0000-000000000001"
+
+// fakeDlpSeededEngineName is the pre-seeded engine's display name.
+const fakeDlpSeededEngineName = "Pre-seeded profile"
 
 // fakeDlpAllowListPageCap clamps the page size the allow-list listing serves,
 // so tests with a handful of entries still exercise the provider's
@@ -85,6 +92,15 @@ type fakeDlpCustomDetectionType struct {
 	DefaultConfidence string
 }
 
+type fakeDlpDetectionEngine struct {
+	ID                     string
+	Name                   string
+	ProviderType           string
+	ProviderConnectionName *string
+	EnabledDetectionTypes  []string
+	Config                 json.RawMessage
+}
+
 type fakeDlpFieldControlPolicy struct {
 	ID          string
 	McpServerID string
@@ -110,6 +126,13 @@ type fakeDlpServer struct {
 	nextDetectionTypeID int
 	detectionTypes      map[string]*fakeDlpCustomDetectionType
 
+	nextEngineID     int
+	detectionEngines map[string]*fakeDlpDetectionEngine
+	// lastEngineUpdate records the raw PUT body per engine id, so tests can
+	// assert on what the provider actually sent (e.g. the explicit JSON null
+	// that clears provider_connection_name).
+	lastEngineUpdate map[string]json.RawMessage
+
 	nextFieldPolicyID int
 	// fieldPolicies keeps insertion order for a stable listing.
 	fieldPolicies []*fakeDlpFieldControlPolicy
@@ -119,6 +142,16 @@ func newFakeDlpServer() *fakeDlpServer {
 	return &fakeDlpServer{
 		policies:       map[string]*fakeDlpEnforcementPolicy{},
 		detectionTypes: map[string]*fakeDlpCustomDetectionType{},
+		detectionEngines: map[string]*fakeDlpDetectionEngine{
+			fakeDlpDetectionEngineID: {
+				ID:                    fakeDlpDetectionEngineID,
+				Name:                  fakeDlpSeededEngineName,
+				ProviderType:          "presidio",
+				EnabledDetectionTypes: []string{"DETECTION_TYPE_EMAIL_ADDRESS"},
+				Config:                json.RawMessage(`{}`),
+			},
+		},
+		lastEngineUpdate: map[string]json.RawMessage{},
 	}
 }
 
@@ -131,6 +164,8 @@ func (f *fakeDlpServer) handler() http.HandlerFunc {
 			f.handleConfig(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/dlp/admin/v1/enforcement-policies"):
 			f.handleEnforcementPolicies(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/dlp/admin/v1/detection-engines"):
+			f.handleDetectionEngines(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/dlp/admin/v1/allow-list"):
 			f.handleAllowList(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/dlp/admin/v1/custom-detection-types"):
@@ -336,8 +371,9 @@ func validDlpRuntimeStage(stage string) bool {
 }
 
 // validatePolicyShape mirrors production's validate_enforcement_target_shape
-// and companion checks. Callers pass the final (post-merge) field values.
-func validatePolicyShape(w http.ResponseWriter, p *fakeDlpEnforcementPolicy) bool {
+// and companion checks. Callers pass the final (post-merge) field values and
+// hold f.mu.
+func (f *fakeDlpServer) validatePolicyShape(w http.ResponseWriter, p *fakeDlpEnforcementPolicy) bool {
 	if strings.TrimSpace(p.Name) == "" {
 		writeJSONMessage(w, http.StatusUnprocessableEntity, "name must not be empty")
 		return false
@@ -391,7 +427,7 @@ func validatePolicyShape(w http.ResponseWriter, p *fakeDlpEnforcementPolicy) boo
 		return false
 	}
 	for _, engineID := range p.DetectionEngineIDs {
-		if engineID != fakeDlpDetectionEngineID {
+		if _, ok := f.detectionEngines[engineID]; !ok {
 			writeJSONMessage(w, http.StatusNotFound,
 				fmt.Sprintf("detection engine %s not found in org", engineID))
 			return false
@@ -483,7 +519,7 @@ func (f *fakeDlpServer) createPolicy(w http.ResponseWriter, r *http.Request) {
 	if p.ProviderIDs == nil {
 		p.ProviderIDs = []string{}
 	}
-	if !validatePolicyShape(w, p) {
+	if !f.validatePolicyShape(w, p) {
 		return
 	}
 
@@ -575,7 +611,7 @@ func (f *fakeDlpServer) updatePolicy(w http.ResponseWriter, r *http.Request, id 
 		_ = json.Unmarshal(v, &updated.DetectionEngineIDs)
 	}
 
-	if !validatePolicyShape(w, &updated) {
+	if !f.validatePolicyShape(w, &updated) {
 		return
 	}
 
@@ -602,6 +638,398 @@ func checkAllDlpPoliciesDeleted(fake *fakeDlpServer) resource.TestCheckFunc {
 		defer fake.mu.Unlock()
 		for id, p := range fake.policies {
 			return fmt.Errorf("enforcement policy %s (%s) was not deleted on destroy", id, p.Name)
+		}
+		return nil
+	}
+}
+
+// --- detection engines -------------------------------------------------------------
+
+// fakeDlpValidEngineDetectionTypes accepts the built-in namespace only, like
+// the allow-list fake; production also accepts the org's custom detection
+// type names.
+func fakeDlpValidEngineDetectionTypes(w http.ResponseWriter, detectionTypes []string) bool {
+	if len(detectionTypes) == 0 {
+		writeJSONMessage(w, http.StatusBadRequest,
+			"enabled_detection_types must include at least one detection type")
+		return false
+	}
+	for _, dt := range detectionTypes {
+		if !strings.HasPrefix(dt, "DETECTION_TYPE_") {
+			writeJSONMessage(w, http.StatusBadRequest, fmt.Sprintf("unknown detection type '%s'", dt))
+			return false
+		}
+	}
+	return true
+}
+
+// fakeDlpEngineClass mirrors production's provider_type_capabilities table:
+// the full set of valid provider types, mapped to their capability class.
+func fakeDlpEngineClass(providerType string) (string, bool) {
+	switch providerType {
+	case "builtin_regex", "custom_regex", "builtin_pii_regex", "builtin_secrets_regex":
+		return "native", true
+	case "presidio", "gliner", "rampart", "google_dlp", "aws_comprehend_pii", "azure_ai_language_pii":
+		return "span_detection", true
+	case "prompt_injection", "aws_bedrock_guardrails", "azure_content_safety", "code_execution":
+		return "guardrail_intervention", true
+	}
+	return "", false
+}
+
+// engineJSON renders the DetectionEngineResponse shape, deriving the computed
+// capability fields from provider_type like production does.
+func engineJSON(e *fakeDlpDetectionEngine) map[string]any {
+	class, _ := fakeDlpEngineClass(e.ProviderType)
+	guardrail := class == "guardrail_intervention"
+
+	supportedActions := []string{
+		"POLICY_ACTION_BLOCK", "POLICY_ACTION_REDACT", "POLICY_ACTION_MASK",
+		"POLICY_ACTION_TOKENIZE", "POLICY_ACTION_ALERT_ONLY", "POLICY_ACTION_PASSTHROUGH",
+	}
+	supportedTypes := []string{"DETECTION_TYPE_EMAIL_ADDRESS", "DETECTION_TYPE_PHONE_NUMBER"}
+	if guardrail {
+		supportedActions = []string{"POLICY_ACTION_BLOCK", "POLICY_ACTION_ALERT_ONLY", "POLICY_ACTION_PASSTHROUGH"}
+		supportedTypes = []string{"DETECTION_TYPE_PROMPT_ATTACK"}
+	}
+
+	enabledTypes := e.EnabledDetectionTypes
+	if enabledTypes == nil {
+		enabledTypes = []string{}
+	}
+	config := e.Config
+	if len(config) == 0 {
+		config = json.RawMessage(`{}`)
+	}
+	return map[string]any{
+		"id":                        e.ID,
+		"org_id":                    fakeDlpOrgID,
+		"name":                      e.Name,
+		"provider_type":             e.ProviderType,
+		"provider_connection_name":  e.ProviderConnectionName,
+		"enabled_detection_types":   enabledTypes,
+		"supported_detection_types": supportedTypes,
+		"supported_actions":         supportedActions,
+		"provider_class":            class,
+		"capabilities": map[string]any{
+			"provider_class":                 class,
+			"pii_detection":                  !guardrail,
+			"secret_detection":               false,
+			"prompt_attack_detection":        guardrail,
+			"span_offsets":                   !guardrail,
+			"confidence_scores":              true,
+			"native_masking":                 guardrail,
+			"native_blocking":                guardrail,
+			"supports_tokenization_pipeline": !guardrail,
+		},
+		"runtime_stages": []string{
+			"RUNTIME_STAGE_PROMPT", "RUNTIME_STAGE_RESPONSE",
+			"RUNTIME_STAGE_TOOL_INPUT", "RUNTIME_STAGE_TOOL_OUTPUT",
+		},
+		"config":     config,
+		"created_by": "svc-test",
+		"updated_by": "svc-test",
+		"created_at": fakeDlpTime,
+		"updated_at": fakeDlpTime,
+	}
+}
+
+// engineNameTaken mirrors the (org_id, name, provider_type) unique key.
+// Callers hold f.mu.
+func (f *fakeDlpServer) engineNameTaken(name, providerType, excludeID string) bool {
+	for _, e := range f.detectionEngines {
+		if e.ID != excludeID && e.Name == name && e.ProviderType == providerType {
+			return true
+		}
+	}
+	return false
+}
+
+var fakeDlpUpdateEngineKeys = []string{
+	"name", "provider_type", "provider_connection_name", "enabled_detection_types", "config",
+}
+
+func (f *fakeDlpServer) handleDetectionEngines(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	id := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/dlp/admin/v1/detection-engines"), "/")
+
+	switch {
+	case id == "" && r.Method == http.MethodPost:
+		f.createDetectionEngine(w, r)
+	case id == "" && r.Method == http.MethodGet:
+		// Production returns a BARE array (no envelope, no pagination),
+		// sorted by name.
+		items := make([]*fakeDlpDetectionEngine, 0, len(f.detectionEngines))
+		for _, e := range f.detectionEngines {
+			items = append(items, e)
+		}
+		slices.SortFunc(items, func(a, b *fakeDlpDetectionEngine) int {
+			return strings.Compare(a.Name, b.Name)
+		})
+		out := make([]map[string]any, 0, len(items))
+		for _, e := range items {
+			out = append(out, engineJSON(e))
+		}
+		_ = json.NewEncoder(w).Encode(out)
+	case id != "" && r.Method == http.MethodGet:
+		e, ok := f.detectionEngines[id]
+		if !ok {
+			writeJSONMessage(w, http.StatusNotFound, fmt.Sprintf("detection engine %s", id))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(engineJSON(e))
+	case id != "" && r.Method == http.MethodPut:
+		f.updateDetectionEngine(w, r, id)
+	case id != "" && r.Method == http.MethodDelete:
+		f.deleteDetectionEngine(w, id)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (f *fakeDlpServer) createDetectionEngine(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name                   string          `json:"name"`
+		ProviderType           string          `json:"provider_type"`
+		ProviderConnectionName *string         `json:"provider_connection_name"`
+		EnabledDetectionTypes  []string        `json:"enabled_detection_types"`
+		Config                 json.RawMessage `json:"config"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONMessage(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	name := strings.TrimSpace(body.Name)
+	providerType := strings.TrimSpace(body.ProviderType)
+	if name == "" {
+		writeJSONMessage(w, http.StatusBadRequest, "detection engine name is required")
+		return
+	}
+	if _, ok := fakeDlpEngineClass(providerType); !ok {
+		writeJSONMessage(w, http.StatusBadRequest,
+			fmt.Sprintf("unsupported detection engine provider_type '%s'", providerType))
+		return
+	}
+	if !fakeDlpValidEngineDetectionTypes(w, body.EnabledDetectionTypes) {
+		return
+	}
+	if f.engineNameTaken(name, providerType, "") {
+		writeJSONMessage(w, http.StatusConflict,
+			"detection engine with this name and provider already exists for this org")
+		return
+	}
+
+	config := body.Config
+	if len(config) == 0 {
+		config = json.RawMessage(`{}`)
+	}
+	f.nextEngineID++
+	e := &fakeDlpDetectionEngine{
+		ID:                     fmt.Sprintf("dddd0000-0000-0000-0000-%012d", 100+f.nextEngineID),
+		Name:                   name,
+		ProviderType:           providerType,
+		ProviderConnectionName: body.ProviderConnectionName,
+		EnabledDetectionTypes:  body.EnabledDetectionTypes,
+		Config:                 config,
+	}
+	f.detectionEngines[e.ID] = e
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(engineJSON(e))
+}
+
+// updateDetectionEngine applies presence-based partial-update semantics with
+// production's double-Option quirk on provider_connection_name (absent key =
+// keep, JSON null = clear). Production tolerates unknown keys, but the
+// provider must only ever send the documented ones — fail the test if it
+// drifts. The raw body is recorded for test assertions.
+func (f *fakeDlpServer) updateDetectionEngine(w http.ResponseWriter, r *http.Request, id string) {
+	e, ok := f.detectionEngines[id]
+	if !ok {
+		writeJSONMessage(w, http.StatusNotFound, fmt.Sprintf("detection engine %s", id))
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSONMessage(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	f.lastEngineUpdate[id] = json.RawMessage(body)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		writeJSONMessage(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	for key := range raw {
+		if !slices.Contains(fakeDlpUpdateEngineKeys, key) {
+			writeJSONMessage(w, http.StatusBadRequest, "unexpected field `"+key+"`")
+			return
+		}
+	}
+
+	updated := *e
+	updated.EnabledDetectionTypes = slices.Clone(e.EnabledDetectionTypes)
+
+	if v, ok := raw["name"]; ok {
+		_ = json.Unmarshal(v, &updated.Name)
+		if strings.TrimSpace(updated.Name) == "" {
+			writeJSONMessage(w, http.StatusBadRequest, "detection engine name cannot be empty")
+			return
+		}
+		updated.Name = strings.TrimSpace(updated.Name)
+	}
+	if v, ok := raw["provider_type"]; ok {
+		_ = json.Unmarshal(v, &updated.ProviderType)
+		updated.ProviderType = strings.TrimSpace(updated.ProviderType)
+		if _, ok := fakeDlpEngineClass(updated.ProviderType); !ok {
+			writeJSONMessage(w, http.StatusBadRequest,
+				fmt.Sprintf("unsupported detection engine provider_type '%s'", updated.ProviderType))
+			return
+		}
+	}
+	if v, ok := raw["provider_connection_name"]; ok {
+		// Production: the key present with JSON null clears the connection
+		// name; a string sets it (serde's double Option).
+		var name *string
+		_ = json.Unmarshal(v, &name)
+		updated.ProviderConnectionName = name
+	}
+	if v, ok := raw["enabled_detection_types"]; ok {
+		updated.EnabledDetectionTypes = nil
+		_ = json.Unmarshal(v, &updated.EnabledDetectionTypes)
+		if !fakeDlpValidEngineDetectionTypes(w, updated.EnabledDetectionTypes) {
+			return
+		}
+	}
+	if v, ok := raw["config"]; ok {
+		updated.Config = v
+	}
+
+	if f.engineNameTaken(updated.Name, updated.ProviderType, e.ID) {
+		writeJSONMessage(w, http.StatusConflict,
+			"detection engine with this name and provider already exists for this org")
+		return
+	}
+
+	*e = updated
+	_ = json.NewEncoder(w).Encode(engineJSON(e))
+}
+
+// deleteDetectionEngine mirrors production's guarded delete: it refuses (409)
+// when the engine is the ONLY engine on any enforcement policy, otherwise it
+// detaches the engine from every policy and deletes it (204).
+func (f *fakeDlpServer) deleteDetectionEngine(w http.ResponseWriter, id string) {
+	if _, ok := f.detectionEngines[id]; !ok {
+		writeJSONMessage(w, http.StatusNotFound, fmt.Sprintf("detection engine %s", id))
+		return
+	}
+
+	for _, p := range f.policies {
+		if !slices.Contains(p.DetectionEngineIDs, id) {
+			continue
+		}
+		sole := true
+		for _, engineID := range p.DetectionEngineIDs {
+			if engineID != id {
+				sole = false
+				break
+			}
+		}
+		if sole {
+			writeJSONMessage(w, http.StatusConflict,
+				"This detection engine is the only engine on one or more enforcement policies "+
+					"and cannot be deleted. Remove it from those policies first.")
+			return
+		}
+	}
+	for _, p := range f.policies {
+		p.DetectionEngineIDs = slices.DeleteFunc(slices.Clone(p.DetectionEngineIDs), func(engineID string) bool {
+			return engineID == id
+		})
+	}
+	delete(f.detectionEngines, id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// seedDetectionEngine plants an engine out-of-band, as if another actor had
+// created it through the app.
+func (f *fakeDlpServer) seedDetectionEngine(name, providerType string) *fakeDlpDetectionEngine {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextEngineID++
+	e := &fakeDlpDetectionEngine{
+		ID:                    fmt.Sprintf("dddd0000-0000-0000-0000-%012d", 100+f.nextEngineID),
+		Name:                  name,
+		ProviderType:          providerType,
+		EnabledDetectionTypes: []string{"DETECTION_TYPE_EMAIL_ADDRESS"},
+		Config:                json.RawMessage(`{}`),
+	}
+	f.detectionEngines[e.ID] = e
+	return e
+}
+
+// seedPolicyReferencingEngine plants an enforcement policy whose only engine
+// is engineID, so deleting the engine trips production's sole-coverage guard.
+func (f *fakeDlpServer) seedPolicyReferencingEngine(name, engineID string) *fakeDlpEnforcementPolicy {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextPolicyID++
+	p := &fakeDlpEnforcementPolicy{
+		ID:                 fmt.Sprintf("eeee0000-0000-0000-0000-%012d", f.nextPolicyID),
+		Name:               name,
+		TargetKind:         "MCP_SERVER",
+		RuntimeStage:       "RUNTIME_STAGE_UNSPECIFIED",
+		Action:             "POLICY_ACTION_BLOCK",
+		Priority:           f.nextPriority("MCP_SERVER"),
+		ProviderIDs:        []string{},
+		DetectionEngineIDs: []string{engineID},
+	}
+	f.policies[p.ID] = p
+	return p
+}
+
+// markDetectionEngineDeleted removes a stored engine out-of-band.
+func (f *fakeDlpServer) markDetectionEngineDeleted(t *testing.T, id string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.detectionEngines[id]; !ok {
+		t.Fatalf("fake has no detection engine %q to delete", id)
+	}
+	delete(f.detectionEngines, id)
+}
+
+// getDetectionEngine returns a copy of the stored engine, or nil — for test
+// assertions on server-observed state.
+func (f *fakeDlpServer) getDetectionEngine(id string) *fakeDlpDetectionEngine {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e, ok := f.detectionEngines[id]
+	if !ok {
+		return nil
+	}
+	clone := *e
+	return &clone
+}
+
+// checkAllDlpDetectionEnginesDeleted is the CheckDestroy for detection engine
+// tests: destroy must remove every engine the test created, leaving only the
+// pre-seeded one.
+func checkAllDlpDetectionEnginesDeleted(fake *fakeDlpServer) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		for id, e := range fake.detectionEngines {
+			if id == fakeDlpDetectionEngineID {
+				continue
+			}
+			return fmt.Errorf("detection engine %s (%s) was not deleted on destroy", id, e.Name)
+		}
+		if _, ok := fake.detectionEngines[fakeDlpDetectionEngineID]; !ok {
+			return fmt.Errorf("the pre-seeded detection engine must never be deleted by tests")
 		}
 		return nil
 	}
