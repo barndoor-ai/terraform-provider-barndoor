@@ -61,7 +61,7 @@ resource "barndoor_policy" "sales_guardrails_v2" {
 
 Read-Only:
 
-- `actions` (List of String) Tool/action names the rule matches (`*` matches all).
+- `actions` (List of String) Tool/action names the rule matches: `*` (match everything) or `tools/call:`-prefixed tool names (e.g. `tools/call:search`).
 - `active` (Boolean) Whether the rule is enforced.
 - `condition` (String) Condition tree as canonical JSON, when the rule carries one.
 - `description` (String) Free-form description of the rule.

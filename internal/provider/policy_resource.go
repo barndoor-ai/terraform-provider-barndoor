@@ -75,6 +75,11 @@ var effectFromProto = map[policyv2.Effect]string{
 // at plan time instead of apply time.
 var ruleNamePattern = regexp.MustCompile(`^[A-Za-z0-9 _-]+$`)
 
+// ruleActionPattern mirrors the API's action-format restriction (`*` or a
+// `tools/call:`-prefixed tool name) so a bare tool name fails at plan time
+// instead of apply time.
+var ruleActionPattern = regexp.MustCompile(`^(\*|tools/call:.+)$`)
+
 // policyUpdateMaskPaths is every field Update writes. The mask is ALWAYS sent
 // with exactly these paths: Terraform's plan is the full desired state, and a
 // masked empty field clears the server-side value — that is the point of the
@@ -261,6 +266,10 @@ func policyRuleNestedObject() schema.NestedAttributeObject {
 				Required:    true,
 				Validators: []validator.List{
 					listvalidator.SizeAtLeast(1),
+					listvalidator.ValueStringsAre(
+						stringvalidator.RegexMatches(ruleActionPattern,
+							`must be "*" or a tools/call:-prefixed tool name (e.g. "tools/call:search")`),
+					),
 				},
 			},
 			"roles": schema.ListAttribute{

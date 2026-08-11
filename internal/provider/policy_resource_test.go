@@ -325,7 +325,7 @@ resource "barndoor_policy" "test" {
   rules = [{
     name      = "allow search"
     effect    = "ALLOW"
-    actions   = ["search", "read"]
+    actions   = ["tools/call:search", "tools/call:read"]
     roles     = ["role:analyst", "group:data-team"]
     condition = %[2]q
   }]
@@ -397,7 +397,7 @@ func TestPolicyResource_rulesRoundTrip(t *testing.T) {
 					resource.TestCheckResourceAttr(resourceName, "rules.0.name", "allow search"),
 					resource.TestCheckResourceAttr(resourceName, "rules.0.effect", "ALLOW"),
 					resource.TestCheckResourceAttr(resourceName, "rules.0.active", "true"),
-					resource.TestCheckResourceAttr(resourceName, "rules.0.actions.0", "search"),
+					resource.TestCheckResourceAttr(resourceName, "rules.0.actions.0", "tools/call:search"),
 					resource.TestCheckResourceAttr(resourceName, "rules.0.roles.1", "group:data-team"),
 					resource.TestCheckResourceAttr(resourceName, "rules.0.condition", testConditionConfigured),
 					func(s *terraform.State) error {
@@ -469,6 +469,36 @@ func TestPolicyResource_nameConflict(t *testing.T) {
 			{
 				Config:      policyConfigMinimal("taken-name"),
 				ExpectError: regexp.MustCompile(`already exists`),
+			},
+		},
+	})
+}
+
+func TestPolicyResource_bareActionNameIsAPlanError(t *testing.T) {
+	setupPolicyTest(t)
+
+	config := `
+resource "barndoor_policy" "test" {
+  name          = "tf-test-bare-action"
+  mcp_server_id = "mcp-server-1"
+
+  rules = [{
+    name    = "bad rule"
+    effect  = "ALLOW"
+    actions = ["search"]
+    roles   = ["*"]
+  }]
+}
+`
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				// Keep the pattern to one token: the CLI re-wraps diagnostic
+				// text, so multi-word phrases can be split across lines.
+				ExpectError: regexp.MustCompile(`tools/call:-prefixed`),
 			},
 		},
 	})

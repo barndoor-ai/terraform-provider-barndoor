@@ -136,9 +136,10 @@ func (d *policyDataSource) Schema(_ context.Context, _ datasource.SchemaRequest,
 							Computed:            true,
 						},
 						"actions": schema.ListAttribute{
-							MarkdownDescription: "Tool/action names the rule matches (`*` matches all).",
-							ElementType:         types.StringType,
-							Computed:            true,
+							MarkdownDescription: "Tool/action names the rule matches: `*` (match everything) " +
+								"or `tools/call:`-prefixed tool names (e.g. `tools/call:search`).",
+							ElementType: types.StringType,
+							Computed:    true,
 						},
 						"roles": schema.ListAttribute{
 							MarkdownDescription: "Principals the rule matches: `role:<name>`, `group:<name>`, or `*`.",
