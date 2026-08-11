@@ -87,6 +87,10 @@ func (f *fakeRegistryServer) handler() http.HandlerFunc {
 		switch {
 		case r.URL.Path == "/token":
 			writeToken(w)
+		case strings.HasPrefix(r.URL.Path, "/api/registry/v1/server-directory"):
+			f.handleServerDirectory(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/registry/v1/agent-directory"):
+			f.handleAgentDirectory(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/registry/v1/servers"):
 			f.handleServers(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/registry/v1/agents"):

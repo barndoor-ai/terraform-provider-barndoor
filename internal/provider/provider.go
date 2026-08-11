@@ -162,11 +162,13 @@ func (p *BarndoorProvider) Resources(ctx context.Context) []func() resource.Reso
 func (p *BarndoorProvider) DataSources(ctx context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{
 		NewAgentDataSource,
+		NewAgentDirectoryDataSource,
 		NewDlpDetectionEngineDataSource,
 		NewIdpSettingsDataSource,
 		NewLlmProviderDataSource,
 		NewLogExportAWSTrustInfoDataSource,
 		NewMcpServerDataSource,
+		NewMcpServerDirectoryDataSource,
 		NewPolicyDataSource,
 	}
 }
