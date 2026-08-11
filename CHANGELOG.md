@@ -5,6 +5,7 @@
 ENHANCEMENTS:
 
 * resource/`barndoor_policy`: rule `actions` entries are now validated at plan time — each must be `*` or a `tools/call:`-prefixed tool name, mirroring the API's format check. Previously a bare tool name passed the plan and failed at apply (BCP-3630).
+* provider: transient API failures are now retried with exponential backoff and jitter (up to 4 attempts, honoring `Retry-After`). REST: HTTP 429 retries for every method; 502/503/504 and transport errors retry for idempotent methods (GET/PUT/DELETE), plus dial-phase connection failures for every method. The OAuth token grant retries the same way. gRPC (`barndoor_policy`): `UNAVAILABLE` retries via the channel's retry policy. Previously every request was a single attempt, so a blip mid-apply failed the run (BCP-3630).
 
 NOTES:
 

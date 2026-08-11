@@ -8,6 +8,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -90,13 +91,16 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 		"client_secret": {c.cfg.ClientSecret},
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.TokenURL, strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", fmt.Errorf("build token request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := c.httpClient.Do(req)
+	// The client_credentials grant is idempotent (re-minting a token has no
+	// side effects), so the POST is marked safe for the full retry policy.
+	resp, err := doWithRetry(ctx, c.httpClient, http.MethodPost, true, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.TokenURL, strings.NewReader(form.Encode()))
+		if err != nil {
+			return nil, fmt.Errorf("build token request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return req, nil
+	})
 	if err != nil {
 		return "", fmt.Errorf("token request to %s: %w", c.cfg.TokenURL, err)
 	}
@@ -127,21 +131,39 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 
 // Do issues an authenticated request to path (resolved against BaseURL) and
 // returns the raw response. The caller owns and must close the response body.
+//
+// Transient failures (429 for every method; 502/503/504 and transport errors
+// for idempotent methods) are retried with backoff — see retry.go. The body is
+// buffered up front so each attempt re-sends it from the start.
 func (c *Client) Do(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
 	token, err := c.accessToken(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	endpoint := strings.TrimSuffix(c.cfg.BaseURL, "/") + "/" + strings.TrimPrefix(path, "/")
-	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Accept", "application/json")
+	var payload []byte
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		payload, err = io.ReadAll(body)
+		if err != nil {
+			return nil, fmt.Errorf("read request body: %w", err)
+		}
 	}
-	return c.httpClient.Do(req)
+
+	endpoint := strings.TrimSuffix(c.cfg.BaseURL, "/") + "/" + strings.TrimPrefix(path, "/")
+	return doWithRetry(ctx, c.httpClient, method, false, func() (*http.Request, error) {
+		var rdr io.Reader
+		if payload != nil {
+			rdr = bytes.NewReader(payload)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, endpoint, rdr)
+		if err != nil {
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Accept", "application/json")
+		if payload != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		return req, nil
+	})
 }
