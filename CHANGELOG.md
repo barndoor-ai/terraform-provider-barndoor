@@ -4,6 +4,8 @@
 
 FEATURES:
 
+* **New Resource:** `barndoor_dlp_detection_engine` — manages a Data Protection detection engine (a "Protection Profile" in the platform app): the binding of a detection provider (`provider_type`) to the detection types it scans for, plus an optional provider connection and JSON config. Engines are unique per organization by (`name`, `provider_type`) and every attribute updates in place; deleting an engine that is the only one on an enforcement policy fails with a pointer at the referencing `detection_engine_ids`. Closes the bootstrap gap where `barndoor_dlp_enforcement_policy.detection_engine_ids` could only be filled with UUIDs copied from the app (BCP-3630).
+* **New Data Source:** `barndoor_dlp_detection_engine` — looks up an existing detection engine (Protection Profile) by `id` or by `name`, optionally narrowed by `provider_type` (the same name may exist for several provider types — one merged profile in the app); ambiguous names fail loudly with the candidate ids and their provider types (BCP-3630).
 * **New Data Source:** `barndoor_llm_provider` — looks up an existing LLM Gateway upstream provider by `id` or `name` (matched case-insensitively, mirroring the API's uniqueness rule), so a provider created in the Barndoor app can be referenced — e.g. to attach model mappings, model-access policies, or pricing rules — without hand-copying its UUID. The provider's credential is never returned by the API and is not part of the data source (BCP-3630).
 
 ENHANCEMENTS:
