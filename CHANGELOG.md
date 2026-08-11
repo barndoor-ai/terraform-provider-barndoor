@@ -2,7 +2,13 @@
 
 ## Unreleased
 
+ENHANCEMENTS:
+
+* resource/`barndoor_policy`: rule `actions` entries are now validated at plan time — each must be `*` or a `tools/call:`-prefixed tool name, mirroring the API's format check. Previously a bare tool name passed the plan and failed at apply (BCP-3630).
+
 NOTES:
+
+* data-source/`barndoor_policy`: the `actions` attribute description now documents the `tools/call:` action format (the resource side was fixed earlier, the data source was missed) (BCP-3630).
 
 * docs/resource/barndoor_connection: documented `terraform import` — the import key is the **server's** UUID or slug (an organization holds at most one tenant-wide connection per server). Previously this was the only resource page without an Import section.
 * resource/`barndoor_policy`: the `actions` schema description and the examples now spell out the platform's action format — each entry is `*` or a `tools/call:`-prefixed tool name. The published examples showed bare tool names (e.g. `search`, `create_*`), which the API rejects.
