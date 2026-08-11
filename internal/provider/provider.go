@@ -162,6 +162,7 @@ func (p *BarndoorProvider) DataSources(ctx context.Context) []func() datasource.
 	return []func() datasource.DataSource{
 		NewAgentDataSource,
 		NewIdpSettingsDataSource,
+		NewLlmProviderDataSource,
 		NewLogExportAWSTrustInfoDataSource,
 		NewMcpServerDataSource,
 		NewPolicyDataSource,
