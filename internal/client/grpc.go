@@ -41,7 +41,21 @@ func (c *Client) GRPCConn(_ context.Context) (*grpc.ClientConn, error) {
 		return nil, err
 	}
 
-	var opts []grpc.DialOption
+	// Match the REST layer's transient-failure retries (retry.go): UNAVAILABLE
+	// is gRPC's "server never processed this" signal, so retrying it is safe
+	// for every RPC including creates. Other codes are terminal.
+	opts := []grpc.DialOption{grpc.WithDefaultServiceConfig(`{
+		"methodConfig": [{
+			"name": [{"service": "barndoor.policy.v2.PolicyService"}],
+			"retryPolicy": {
+				"maxAttempts": 4,
+				"initialBackoff": "0.5s",
+				"maxBackoff": "8s",
+				"backoffMultiplier": 2,
+				"retryableStatusCodes": ["UNAVAILABLE"]
+			}
+		}]
+	}`)}
 	if len(c.cfg.GRPCDialOptions) > 0 {
 		// Test-only path: the caller supplies the transport (e.g. a bufconn
 		// dialer with insecure credentials), so the per-RPC credentials must
