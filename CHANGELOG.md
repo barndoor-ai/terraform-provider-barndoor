@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+FEATURES:
+
+* **New Data Source:** `barndoor_llm_provider` — looks up an existing LLM Gateway upstream provider by `id` or `name` (matched case-insensitively, mirroring the API's uniqueness rule), so a provider created in the Barndoor app can be referenced — e.g. to attach model mappings, model-access policies, or pricing rules — without hand-copying its UUID. The provider's credential is never returned by the API and is not part of the data source (BCP-3630).
+
 ENHANCEMENTS:
 
 * resource/`barndoor_policy`: rule `actions` entries are now validated at plan time — each must be `*` or a `tools/call:`-prefixed tool name, mirroring the API's format check. Previously a bare tool name passed the plan and failed at apply (BCP-3630).
