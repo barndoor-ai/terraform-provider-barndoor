@@ -53,6 +53,12 @@ needed; the config is `version: 2`.)
    version and date, and confirm the entries are accurate. Commit on `main`.
 2. Choose the next semantic version with a leading `v` (the workflow triggers on
    `v*`), following semver relative to the last release.
+   **Major releases only:** the platform settings page's Terraform config block
+   pins `version = "~> 0.3"`
+   (`bdai-platform services/frontend/client/src/routes/settings/-components/TerraformProviderConfigBlock.tsx`
+   and its test). That two-part pessimistic constraint floats across every 0.x
+   minor, so minor/patch releases need no UI change — but a `v1.0.0` falls
+   outside it, so bump the pin (and the test) alongside a major release.
 3. Tag a commit on `main` and push the tag:
 
    ```shell
