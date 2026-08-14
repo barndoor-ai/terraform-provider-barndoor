@@ -51,15 +51,20 @@ needed; the config is `version: 2`.)
 
 1. Update [`CHANGELOG.md`](CHANGELOG.md): rename the `Unreleased` heading to the
    version and date, and confirm the entries are accurate. Commit on `main`.
-2. Choose the next semantic version with a leading `v` (the workflow triggers on
+2. Product docs: run the
+   [`release-docs-sync`](.claude/skills/release-docs-sync/SKILL.md) skill to
+   classify the delta and **prepare** (not merge) any docs.barndoor.ai PR —
+   it merges only after the Verify section below passes.
+3. Choose the next semantic version with a leading `v` (the workflow triggers on
    `v*`), following semver relative to the last release.
    **Major releases only:** the platform settings page's Terraform config block
    pins `version = "~> 0.3"`
    (`bdai-platform services/frontend/client/src/routes/settings/-components/TerraformProviderConfigBlock.tsx`
    and its test). That two-part pessimistic constraint floats across every 0.x
    minor, so minor/patch releases need no UI change — but a `v1.0.0` falls
-   outside it, so bump the pin (and the test) alongside a major release.
-3. Tag a commit on `main` and push the tag:
+   outside it, so bump the pin (and the test) alongside a major release. The
+   docs site's pins (see the skill above) follow the same rule.
+4. Tag a commit on `main` and push the tag:
 
    ```shell
    git checkout main && git pull
@@ -93,6 +98,11 @@ detects the new release tag and publishes it (usually within a few minutes).
   ```
 
   `terraform init` should download and verify the signed provider.
+
+- If the release warranted a docs.barndoor.ai update (see
+  [`release-docs-sync`](.claude/skills/release-docs-sync/SKILL.md)), re-run its
+  example checks against the published version and merge the prepared docs PR
+  now — it publishes to production on merge.
 
 ---
 
