@@ -266,6 +266,7 @@ func (r *mcpServerResource) Create(ctx context.Context, req resource.CreateReque
 		resp.Diagnostics.AddError("Failed to read the MCP server after create", err.Error())
 		plan.Slug = types.StringNull()
 		plan.Status = types.StringNull()
+		plan.PublishedAt = types.StringNull()
 		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		return
 	}

@@ -332,6 +332,21 @@ func (f *fakeRegistryServer) serverPublishedAt(t *testing.T, id string) *string 
 	return s.PublishedAt
 }
 
+// unpublishServer clears a stored server's publish stamp out-of-band. There is
+// deliberately NO unpublish route on the fake (the real API has none) — this
+// mutates fake state directly, to exercise the provider's handling of a server
+// that reads back unpublished (a replaced/restored row).
+func (f *fakeRegistryServer) unpublishServer(t *testing.T, id string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.servers[id]
+	if !ok {
+		t.Fatalf("fake has no server %q to unpublish", id)
+	}
+	s.PublishedAt = nil
+}
+
 // serverDeleted reports whether the stored server is soft-deleted.
 func (f *fakeRegistryServer) serverDeleted(t *testing.T, id string) bool {
 	t.Helper()

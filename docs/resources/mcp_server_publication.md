@@ -53,7 +53,7 @@ resource "barndoor_mcp_server_publication" "github" {
 
 ### Required
 
-- `mcp_server_id` (String) ID of the MCP server to publish; also the `terraform import` key. A server has at most one publication.
+- `mcp_server_id` (String) ID of the MCP server to publish; also the `terraform import` key. A server has at most one publication. Importing a server that is not published yet fails (there is no publication to import) — apply this resource to publish it instead.
 
 ### Read-Only
 

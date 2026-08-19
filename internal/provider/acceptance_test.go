@@ -693,6 +693,9 @@ func TestAccMcpServerPublication_lifecycle(t *testing.T) {
 	const serverName = "barndoor_mcp_server.test"
 	const pubName = "barndoor_mcp_server_publication.test"
 
+	// One client for every listing check, so they share a minted token.
+	accClient := newAccClient()
+
 	serverAndPolicy := testAccMcpServerConfig(directoryID, name, "") + fmt.Sprintf(`
 resource "barndoor_policy" "test" {
   name          = %[1]q
@@ -727,7 +730,7 @@ resource "barndoor_mcp_server_publication" "test" {
 				Config: serverAndPolicy,
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckNoResourceAttr(serverName, "published_at"),
-					accCheckServerInPublishedListing(serverName, false),
+					accCheckServerInPublishedListing(accClient, serverName, false),
 				),
 			},
 			{
@@ -738,7 +741,7 @@ resource "barndoor_mcp_server_publication" "test" {
 				Config: serverAndPolicy + publication,
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrSet(pubName, "published_at"),
-					accCheckServerInPublishedListing(serverName, true),
+					accCheckServerInPublishedListing(accClient, serverName, true),
 				),
 			},
 			{
@@ -756,7 +759,7 @@ resource "barndoor_mcp_server_publication" "test" {
 				Config: serverAndPolicy,
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrSet(serverName, "published_at"),
-					accCheckServerInPublishedListing(serverName, true),
+					accCheckServerInPublishedListing(accClient, serverName, true),
 				),
 			},
 		},
@@ -777,8 +780,9 @@ func accServerIDFromState(serverName string) func(*terraform.State) (string, err
 
 // accCheckServerInPublishedListing asserts (via a direct API read with the
 // test credential — no audience filter, see the test comment) whether the
-// server appears in the published listing (`availability_status=true`).
-func accCheckServerInPublishedListing(serverName string, want bool) resource.TestCheckFunc {
+// server appears in the published listing (`availability_status=true`). The
+// client is shared across checks so each one does not mint a fresh token.
+func accCheckServerInPublishedListing(c *client.Client, serverName string, want bool) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
 		rs, ok := s.RootModule().Resources[serverName]
 		if !ok {
@@ -786,7 +790,7 @@ func accCheckServerInPublishedListing(serverName string, want bool) resource.Tes
 		}
 		serverID := rs.Primary.ID
 
-		matches, err := searchRegistry(context.Background(), newAccClient(), registryAPIPrefix+"/servers",
+		matches, err := searchRegistry(context.Background(), c, registryAPIPrefix+"/servers",
 			url.Values{"availability_status": []string{"true"}},
 			func(row mcpServerListRow) bool { return row.ID == serverID })
 		if err != nil {
