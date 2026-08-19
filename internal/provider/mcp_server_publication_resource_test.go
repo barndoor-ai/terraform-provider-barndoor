@@ -46,9 +46,9 @@ func TestMcpServerPublicationResource_Schema(t *testing.T) {
 
 // --- lifecycle (real plan/apply against the fake) ---------------------------------
 
-// publishedServerConfig renders an active (credentialed) server; extra appends
+// activeServerConfig renders an active (credentialed) server; extra appends
 // further blocks, e.g. the publication resource.
-func publishedServerConfig(extra string) string {
+func activeServerConfig(extra string) string {
 	return mcpServerConfig("tf-test-pub", "\n  client_id = \"tenant-client-id\"\n") + extra
 }
 
@@ -69,7 +69,7 @@ func TestMcpServerPublicationResource_lifecycle(t *testing.T) {
 		Steps: []resource.TestStep{
 			{
 				// The server alone: unpublished, published_at reads null.
-				Config: publishedServerConfig(""),
+				Config: activeServerConfig(""),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckNoResourceAttr(serverName, "published_at"),
 					func(s *terraform.State) error {
@@ -88,7 +88,7 @@ func TestMcpServerPublicationResource_lifecycle(t *testing.T) {
 				// server resource and data source pick it up on their next
 				// refresh — asserted in the following step — because they are
 				// read before the publication applies within this step.)
-				Config: publishedServerConfig(publicationBlock),
+				Config: activeServerConfig(publicationBlock),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAt),
 					resource.TestCheckResourceAttrPair(pubName, "mcp_server_id", serverName, "id"),
@@ -97,7 +97,7 @@ func TestMcpServerPublicationResource_lifecycle(t *testing.T) {
 			{
 				// Re-apply: idempotent (no changes), and the refresh surfaces
 				// the publish state on the server resource and data source.
-				Config: publishedServerConfig(publicationBlock + `
+				Config: activeServerConfig(publicationBlock + `
 data "barndoor_mcp_server" "test" {
   id = barndoor_mcp_server.test.id
 }
@@ -109,7 +109,7 @@ data "barndoor_mcp_server" "test" {
 			},
 			{
 				// Import by server id.
-				Config:                               publishedServerConfig(publicationBlock),
+				Config:                               activeServerConfig(publicationBlock),
 				ResourceName:                         pubName,
 				ImportState:                          true,
 				ImportStateIdFunc:                    func(*terraform.State) (string, error) { return serverID, nil },
@@ -119,7 +119,7 @@ data "barndoor_mcp_server" "test" {
 			{
 				// Removing the publication must NOT unpublish (there is no
 				// unpublish) and must NOT touch the server.
-				Config: publishedServerConfig(""),
+				Config: activeServerConfig(""),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr(serverName, "published_at", fakePublishedAt),
 					func(*terraform.State) error {
@@ -133,7 +133,7 @@ data "barndoor_mcp_server" "test" {
 			{
 				// Re-adding the declaration adopts the existing publication
 				// (idempotent re-publish), keeping the original stamp.
-				Config: publishedServerConfig(publicationBlock),
+				Config: activeServerConfig(publicationBlock),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAt),
 				),
@@ -157,7 +157,7 @@ func TestMcpServerPublicationResource_preconditionsRejected(t *testing.T) {
 			{
 				// An active server without an ACTIVE policy: the diagnostic
 				// must point at the depends_on ordering fix.
-				Config:      publishedServerConfig(publicationBlock),
+				Config:      activeServerConfig(publicationBlock),
 				ExpectError: regexp.MustCompile(`(?s)cannot be published yet.*no ACTIVE policy.*depends_on`),
 			},
 		},
@@ -173,7 +173,7 @@ func TestMcpServerPublicationResource_outOfBandServerDeleteDropsPublication(t *t
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
-				Config: publishedServerConfig(""),
+				Config: activeServerConfig(""),
 				Check: func(s *terraform.State) error {
 					rs, ok := s.RootModule().Resources["barndoor_mcp_server.test"]
 					if !ok {
@@ -185,7 +185,7 @@ func TestMcpServerPublicationResource_outOfBandServerDeleteDropsPublication(t *t
 				},
 			},
 			{
-				Config: publishedServerConfig(publicationBlock),
+				Config: activeServerConfig(publicationBlock),
 				Check:  resource.TestCheckResourceAttrSet(pubName, "published_at"),
 			},
 			{
@@ -197,7 +197,7 @@ func TestMcpServerPublicationResource_outOfBandServerDeleteDropsPublication(t *t
 				// correct behavior: a recreated server must not silently
 				// republish without its policy).
 				PreConfig:   func() { fake.markServerDeleted(t, serverID) },
-				Config:      publishedServerConfig(publicationBlock),
+				Config:      activeServerConfig(publicationBlock),
 				ExpectError: regexp.MustCompile(`(?s)cannot be published yet`),
 			},
 		},
