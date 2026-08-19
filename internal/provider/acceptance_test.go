@@ -35,14 +35,20 @@ package provider
 //     any org: it proves a client_credentials token mints and the
 //     system-management public read path is reachable and authorized.
 //
-//   - The write tests (TestAccLogExportResource_lifecycle and
-//     TestAccLogExportAWSTrustInfoDataSource — the latter mints/persists an
+//   - The write tests (TestAccLogExportResource_lifecycle,
+//     TestAccLogExportResource_azureLifecycle, and
+//     TestAccLogExportAWSTrustInfoDataSource — the last mints/persists an
 //     external ID) only run when BARNDOOR_ACC_TEST_ORGANIZATION_ID names a
 //     DISPOSABLE test org whose export configuration may be freely changed.
 //     They skip with an explicit reason otherwise. As an extra guard, set
 //     BARNDOOR_ACC_PROTECTED_ORGANIZATION_ID to an organization that must never
 //     be touched (e.g. a production org) and the write tests hard-fail if the
 //     disposable-org variable is ever pointed at it.
+//
+//   - TestAccLogExportResource_azureLifecycle additionally needs
+//     BARNDOOR_ACC_TEST_AZURE_BLOB, because Azure destinations are gated per
+//     organization by the log-export-azure-blob feature flag and the API
+//     answers 403 while it is off.
 //
 //   - TestAccPolicyResource_lifecycle additionally needs
 //     BARNDOOR_TEST_MCP_SERVER_ID (a real MCP server id in the credential's
@@ -75,6 +81,14 @@ const (
 	// for a destructive test (e.g. a production org). When set, the write tests
 	// hard-fail if envTestOrgID is pointed at it.
 	envProtectedOrgID = "BARNDOOR_ACC_PROTECTED_ORGANIZATION_ID"
+
+	// envTestAzureBlob opts in to the azure_blob log-export acceptance test.
+	// Azure destinations are gated per organization by a platform feature flag
+	// (log-export-azure-blob); with it off the API answers 403 and the test
+	// would fail for a reason that has nothing to do with the provider. Set it
+	// to any non-empty value once the flag is enabled for the disposable test
+	// org named by envTestOrgID.
+	envTestAzureBlob = "BARNDOOR_ACC_TEST_AZURE_BLOB"
 
 	// envTestMCPServerID opts in to the barndoor_policy acceptance test by
 	// naming a real MCP server in the credential's organization for the
@@ -232,6 +246,100 @@ func TestAccLogExportResource_lifecycle(t *testing.T) {
 			},
 		},
 	})
+}
+
+// TestAccLogExportResource_azureLifecycle exercises an azure_blob destination
+// end to end (create → update → import → destroy) against a disposable dev org.
+// Destructive: gated on a disposable test org, and additionally on
+// BARNDOOR_ACC_TEST_AZURE_BLOB because Azure destinations are feature-flagged
+// per organization.
+//
+// The interesting assertion is the plan itself: with `provider = "azure_blob"`
+// the S3-only attributes are never written, so `use_ssl` comes from the schema
+// default (true) while the API reports false for every Azure row. A create step
+// that leaves a non-empty plan behind fails the harness, which is what pins the
+// state-mapping behaviour end to end.
+func TestAccLogExportResource_azureLifecycle(t *testing.T) {
+	testOrg := requireDisposableTestOrg(t)
+	if os.Getenv(envTestAzureBlob) == "" {
+		t.Skipf("%s not set; skipping the azure_blob log-export acceptance test. Azure destinations are "+
+			"gated by the log-export-azure-blob feature flag — set this once the flag is enabled for the "+
+			"disposable test org.", envTestAzureBlob)
+	}
+	const resourceName = "barndoor_log_export.test_azure"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				// Create: streaming stays disabled so the placeholder container
+				// is stored but never probed.
+				Config: testAccLogExportAzureConfig(testOrg, "barndoor/"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "organization_id", testOrg),
+					resource.TestCheckResourceAttr(resourceName, "enabled", "false"),
+					resource.TestCheckResourceAttr(resourceName, "destination.provider", storageProviderAzureBlob),
+					resource.TestCheckResourceAttr(resourceName, "destination.bucket", "barndoor-acc-test-disposable"),
+					resource.TestCheckResourceAttr(resourceName, "destination.auth_method", authMethodAccountKey),
+					resource.TestCheckResourceAttr(resourceName, "destination.path_prefix", "barndoor/"),
+					resource.TestCheckResourceAttr(resourceName, "destination.has_credentials", "true"),
+					// The S3-only attributes keep their schema defaults rather
+					// than the empty values the API reports for an Azure row.
+					resource.TestCheckResourceAttr(resourceName, "destination.use_ssl", "true"),
+					resource.TestCheckResourceAttr(resourceName, "destination.use_path_style", "false"),
+					resource.TestCheckNoResourceAttr(resourceName, "destination.region"),
+					resource.TestCheckNoResourceAttr(resourceName, "destination.iam_role_arn"),
+					resource.TestCheckNoResourceAttr(resourceName, "destination.external_id"),
+				),
+			},
+			{
+				// Update: change the prefix in place; the destination is
+				// rewritten with the same provider and auth method.
+				Config: testAccLogExportAzureConfig(testOrg, "barndoor/audit/"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "destination.path_prefix", "barndoor/audit/"),
+					resource.TestCheckResourceAttr(resourceName, "destination.use_ssl", "true"),
+				),
+			},
+			{
+				// Import: the account key is config-only (never returned by the
+				// API), so it reads back null and is excluded from the diff.
+				ResourceName:                         resourceName,
+				ImportState:                          true,
+				ImportStateId:                        fmt.Sprintf("%s/%s", testOrg, defaultExportType),
+				ImportStateVerify:                    true,
+				ImportStateVerifyIdentifierAttribute: "organization_id",
+				ImportStateVerifyIgnore: []string{
+					"destination.account_key",
+				},
+			},
+		},
+	})
+}
+
+// testAccLogExportAzureConfig renders an azure_blob log-export resource for the
+// disposable org. The account key is Azurite's published emulator key — a
+// documented public placeholder, stored but never probed while streaming is
+// disabled. Note what the config does NOT set: region, use_ssl, use_path_style,
+// iam_role_arn, and the S3 keys are all rejected by the API for Azure.
+func testAccLogExportAzureConfig(orgID, pathPrefix string) string {
+	return fmt.Sprintf(`
+resource "barndoor_log_export" "test_azure" {
+  organization_id = %[1]q
+
+  destination = {
+    provider    = "azure_blob"
+    endpoint    = "https://barndooracctest.blob.core.windows.net"
+    bucket      = "barndoor-acc-test-disposable"
+    path_prefix = %[2]q
+    auth_method = "account_key"
+    account_key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+  }
+
+  enabled = false
+}
+`, orgID, pathPrefix)
 }
 
 // TestAccLogExportAWSTrustInfoDataSource reads the trust-info data source.

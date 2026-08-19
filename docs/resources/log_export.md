@@ -3,12 +3,12 @@
 page_title: "barndoor_log_export Resource - Barndoor"
 subcategory: ""
 description: |-
-  Manages a Barndoor organization's audit-log export: the customer-owned S3-compatible destination, delivery settings, and whether streaming is enabled. The export row itself is provisioned per organization by the platform; this resource configures it.
+  Manages a Barndoor organization's audit-log export: the customer-owned destination (an S3-compatible bucket or an Azure Blob Storage container), delivery settings, and whether streaming is enabled. The export row itself is provisioned per organization by the platform; this resource configures it.
 ---
 
 # barndoor_log_export (Resource)
 
-Manages a Barndoor organization's audit-log export: the customer-owned S3-compatible destination, delivery settings, and whether streaming is enabled. The export row itself is provisioned per organization by the platform; this resource configures it.
+Manages a Barndoor organization's audit-log export: the customer-owned destination (an S3-compatible bucket or an Azure Blob Storage container), delivery settings, and whether streaming is enabled. The export row itself is provisioned per organization by the platform; this resource configures it.
 
 ## Example Usage
 
@@ -53,12 +53,56 @@ resource "barndoor_log_export" "audit_iam" {
   }
 }
 
+# Or stream to an Azure Blob Storage container. `endpoint` is the blob service
+# root URL (no path), `bucket` is the container name, and `auth_method` is
+# required — the access_keys default only applies to S3. Note what is absent:
+# region, use_ssl, use_path_style, iam_role_arn and the S3 access keys are all
+# rejected for an Azure destination. Requires the azure_blob feature for the org.
+resource "barndoor_log_export" "audit_azure" {
+  enabled = false
+
+  destination = {
+    provider    = "azure_blob"
+    endpoint    = "https://acmeaudit.blob.core.windows.net"
+    bucket      = "barndoor-audit-logs"
+    path_prefix = "barndoor/"
+    auth_method = "account_key"
+    account_key = var.azure_storage_account_key
+  }
+}
+
+# The same container authenticated with a shared access signature instead of the
+# storage account key. Set exactly one of account_key / sas_token, matching
+# auth_method; a leading "?" on the SAS is accepted and normalized away.
+resource "barndoor_log_export" "audit_azure_sas" {
+  export_type = "datadog-json"
+  enabled     = false
+
+  destination = {
+    provider    = "azure_blob"
+    endpoint    = "https://acmeaudit.blob.core.windows.net"
+    bucket      = "barndoor-audit-logs"
+    auth_method = "sas_token"
+    sas_token   = var.azure_sas_token
+  }
+}
+
 variable "s3_access_key_id" {
   type      = string
   sensitive = true
 }
 
 variable "s3_secret_access_key" {
+  type      = string
+  sensitive = true
+}
+
+variable "azure_storage_account_key" {
+  type      = string
+  sensitive = true
+}
+
+variable "azure_sas_token" {
   type      = string
   sensitive = true
 }
@@ -69,7 +113,7 @@ variable "s3_secret_access_key" {
 
 ### Required
 
-- `destination` (Attributes) Customer-owned S3-compatible bucket that exported audit logs are written to. Identifier values must not have surrounding whitespace; omit optional fields rather than setting them to an empty string. (see [below for nested schema](#nestedatt--destination))
+- `destination` (Attributes) Customer-owned bucket or container that exported audit logs are written to — an S3-compatible bucket (`provider = "s3"`, the default) or an Azure Blob Storage container (`provider = "azure_blob"`). The two providers accept disjoint attribute sets; the API rejects an attribute belonging to the other one. Identifier values must not have surrounding whitespace; omit optional fields rather than setting them to an empty string. (see [below for nested schema](#nestedatt--destination))
 
 ### Optional
 
@@ -83,24 +127,27 @@ variable "s3_secret_access_key" {
 
 Required:
 
-- `bucket` (String) Destination bucket name.
-- `endpoint` (String) S3 endpoint URL, e.g. `https://s3.us-east-1.amazonaws.com` or an S3-compatible endpoint.
+- `bucket` (String) Destination bucket name — the **container** name when `provider` is `azure_blob`.
+- `endpoint` (String) Destination endpoint URL. For `provider = "s3"`, the S3 endpoint — e.g. `https://s3.us-east-1.amazonaws.com` — or an S3-compatible endpoint. For `provider = "azure_blob"`, the blob service **root** URL, e.g. `https://myaccount.blob.core.windows.net`: `https` is required and the URL must carry no path (a path-style emulator endpoint such as `http://127.0.0.1:10000/devstoreaccount1` is the one exception).
 
 Optional:
 
-- `access_key_id` (String) Access key ID for the bucket. Required when `auth_method` is `access_keys`; must be omitted otherwise. Not returned by the API, so it is tracked only from configuration.
-- `auth_method` (String) How Barndoor authenticates to the bucket: `access_keys` (default) or `iam_role`. `iam_role` requires the feature to be enabled for the organization.
-- `iam_role_arn` (String) ARN of the IAM role Barndoor assumes to write to the bucket. Required when `auth_method` is `iam_role`; must be omitted otherwise.
+- `access_key_id` (String) Access key ID for the bucket. Required when `auth_method` is `access_keys`; must be omitted otherwise (including for every `azure_blob` destination). Not returned by the API, so it is tracked only from configuration.
+- `account_key` (String, Sensitive) Azure storage account access key for the container's storage account. Required when `provider` is `azure_blob` and `auth_method` is `account_key`; must be omitted otherwise. Never returned by the API, so it is tracked only from configuration.
+- `auth_method` (String) How Barndoor authenticates to the destination. For `provider = "s3"`: `access_keys` (default) or `iam_role` — `iam_role` requires the feature to be enabled for the organization. For `provider = "azure_blob"`: `account_key` or `sas_token`, which is **required** (the `access_keys` default does not apply to Azure destinations).
+- `iam_role_arn` (String) ARN of the IAM role Barndoor assumes to write to the bucket. Required when `auth_method` is `iam_role`; must be omitted otherwise (including for every `azure_blob` destination).
 - `path_prefix` (String) Optional key prefix that exported objects are written under.
-- `region` (String) Bucket region (e.g. `us-east-1`).
-- `secret_access_key` (String, Sensitive) Secret access key for the bucket. Required when `auth_method` is `access_keys`; must be omitted otherwise. Never returned by the API.
-- `use_path_style` (Boolean) Whether to use path-style bucket addressing (required by some S3-compatible stores). Defaults to `false`.
-- `use_ssl` (Boolean) Whether to connect to the endpoint over TLS. Defaults to `true`.
+- `provider` (String) Storage provider backing the destination: `s3` (default — Amazon S3 or any S3-compatible store) or `azure_blob` (Azure Blob Storage). `azure_blob` requires the feature to be enabled for the organization; the API answers 403 with an explanatory message when it is not.
+- `region` (String) Bucket region (e.g. `us-east-1`). S3 only; must be omitted when `provider` is `azure_blob`.
+- `sas_token` (String, Sensitive) Azure shared access signature (SAS) token granting write access to the container. Required when `provider` is `azure_blob` and `auth_method` is `sas_token`; must be omitted otherwise. A leading `?` is accepted and normalized away by the API. Never returned by the API, so it is tracked only from configuration.
+- `secret_access_key` (String, Sensitive) Secret access key for the bucket. Required when `auth_method` is `access_keys`; must be omitted otherwise (including for every `azure_blob` destination). Never returned by the API.
+- `use_path_style` (Boolean) Whether to use path-style bucket addressing (required by some S3-compatible stores). Defaults to `false`. S3 only; must be omitted when `provider` is `azure_blob`.
+- `use_ssl` (Boolean) Whether to connect to the endpoint over TLS. Defaults to `true`. S3 only; must be omitted when `provider` is `azure_blob`, where the scheme comes from `endpoint`.
 
 Read-Only:
 
-- `external_id` (String) Computed `sts:ExternalId` minted for the destination's IAM trust policy. Populated only when `auth_method` is `iam_role`.
-- `has_credentials` (Boolean) Computed flag indicating whether the API has stored access-key credentials for this destination.
+- `external_id` (String) Computed `sts:ExternalId` minted for the destination's IAM trust policy. Populated only for S3 destinations whose `auth_method` is `iam_role`; always null for `azure_blob`.
+- `has_credentials` (Boolean) Computed flag indicating whether the API has stored credentials for this destination.
 
 
 <a id="nestedatt--settings"></a>

@@ -126,12 +126,32 @@ func TestAddTrustInfoError(t *testing.T) {
 	apiErr := func(status int) error {
 		return &apiError{method: http.MethodGet, path: "exports/o/t/destination/aws-trust-info", status: status, body: "boom"}
 	}
+	apiErrBody := func(status int, body string) error {
+		return &apiError{method: http.MethodGet, path: "exports/o/t/destination/aws-trust-info", status: status, body: body}
+	}
 
 	tests := map[string]struct {
 		err           error
 		wantSummary   string
 		wantDetailSub string // optional substring the detail must contain
 	}{
+		// The API answers 400 when the export's destination is Azure. Surfacing
+		// the raw HTTP error there is useless: the practitioner's actual mistake
+		// is using this data source at all, so the diagnostic must say so.
+		"400 for an azure destination explains the data source does not apply": {
+			err:           apiErrBody(http.StatusBadRequest, "aws trust info is not applicable to an azure_blob destination"),
+			wantSummary:   "AWS trust info does not apply to an Azure Blob Storage destination",
+			wantDetailSub: "azure_blob",
+		},
+		"400 for an azure destination is matched on a prose message too": {
+			err:         apiErrBody(http.StatusBadRequest, `{"detail":"AWS trust info is not applicable to an Azure Blob Storage destination"}`),
+			wantSummary: "AWS trust info does not apply to an Azure Blob Storage destination",
+		},
+		"a 400 that says nothing about azure keeps the generic 400 message": {
+			err:           apiErrBody(http.StatusBadRequest, "export_type must not be empty"),
+			wantSummary:   "Invalid request reading AWS trust info (HTTP 400)",
+			wantDetailSub: "iam_role",
+		},
 		"403 leads with iam_role but does not claim it is the only cause": {
 			err:           apiErr(http.StatusForbidden),
 			wantSummary:   "Access denied reading AWS trust info (HTTP 403)",

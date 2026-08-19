@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
@@ -55,7 +56,10 @@ func (d *logExportAWSTrustInfoDataSource) Schema(_ context.Context, _ datasource
 			"auth method in the same `terraform apply`. The external ID is minted and stored on first read and " +
 			"is then stable for the destination.\n\n" +
 			"This endpoint is only available when the `iam_role` auth method is enabled for the organization; " +
-			"otherwise the read fails. See the example for the end-to-end `iam_role` wiring.",
+			"otherwise the read fails. It also does not apply to an Azure Blob Storage destination " +
+			"(`destination.provider = \"azure_blob\"`), which authenticates with an account key or SAS token " +
+			"instead — reading it for one fails with an explanatory error. See the example for the end-to-end " +
+			"`iam_role` wiring.",
 		Attributes: map[string]schema.Attribute{
 			"organization_id": schema.StringAttribute{
 				MarkdownDescription: "Organization ID (Keycloak organization UUID) that owns the export. " +
@@ -172,13 +176,34 @@ func fetchAWSTrustInfo(ctx context.Context, c *client.Client, orgID, exportType 
 }
 
 // addTrustInfoError turns the API error into an actionable diagnostic, calling
-// out the two failure modes a practitioner is most likely to hit: the request
-// being forbidden (403, usually the iam_role feature) and the export not
+// out the failure modes a practitioner is most likely to hit: the destination
+// being an Azure one this data source does not apply to (400), the request
+// being forbidden (403, usually the iam_role feature), and the export not
 // existing (404).
 func addTrustInfoError(diags *diag.Diagnostics, orgID, exportType string, err error) {
 	var apiErr *apiError
 	if errors.As(err, &apiErr) {
 		switch apiErr.status {
+		case http.StatusBadRequest:
+			if isAzureDestinationError(apiErr) {
+				diags.AddError(
+					"AWS trust info does not apply to an Azure Blob Storage destination",
+					fmt.Sprintf("The %q export for organization %q has an Azure Blob Storage destination "+
+						"(`destination.provider = \"azure_blob\"`); AWS trust info only applies to S3 "+
+						"destinations using the `iam_role` auth method. Azure destinations authenticate with "+
+						"`account_key` or `sas_token` set directly on the destination, so there is no "+
+						"principal ARN or external ID to read. Remove this data source, or point it at an "+
+						"export whose destination is S3.\n\nUnderlying error: %s", exportType, orgID, err.Error()),
+				)
+				return
+			}
+			diags.AddError(
+				"Invalid request reading AWS trust info (HTTP 400)",
+				fmt.Sprintf("The Barndoor API rejected the trust-info request for the %q export of organization "+
+					"%q. Confirm the export's destination is an S3 destination configured for the `iam_role` "+
+					"auth method.\n\nUnderlying error: %s", exportType, orgID, err.Error()),
+			)
+			return
 		case http.StatusForbidden:
 			diags.AddError(
 				"Access denied reading AWS trust info (HTTP 403)",
@@ -200,4 +225,14 @@ func addTrustInfoError(diags *diag.Diagnostics, orgID, exportType string, err er
 		}
 	}
 	diags.AddError("Failed to read AWS trust info", err.Error())
+}
+
+// isAzureDestinationError reports whether a 400 is the API's "aws trust info is
+// not applicable to an azure_blob destination" rejection. 400 is not exclusive
+// to that case, so the body is inspected rather than assumed; a 400 that says
+// nothing about Azure falls through to the generic message. The match is on the
+// bare vendor name so it survives the message being written as `azure_blob`,
+// "Azure Blob Storage", or anything in between.
+func isAzureDestinationError(apiErr *apiError) bool {
+	return strings.Contains(strings.ToLower(apiErr.displayBody()), "azure")
 }
