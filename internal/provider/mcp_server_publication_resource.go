@@ -115,8 +115,7 @@ func (r *mcpServerPublicationResource) Configure(_ context.Context, req resource
 // published_at, so adopting an out-of-band publication works without special
 // handling.
 func (r *mcpServerPublicationResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
-	if r.client == nil {
-		addPublicationNotConfigured(&resp.Diagnostics)
+	if !r.requireClient(&resp.Diagnostics) {
 		return
 	}
 
@@ -145,8 +144,7 @@ func (r *mcpServerPublicationResource) Create(ctx context.Context, req resource.
 }
 
 func (r *mcpServerPublicationResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
-	if r.client == nil {
-		addPublicationNotConfigured(&resp.Diagnostics)
+	if !r.requireClient(&resp.Diagnostics) {
 		return
 	}
 
@@ -208,11 +206,15 @@ func (r *mcpServerPublicationResource) ImportState(ctx context.Context, req reso
 	resource.ImportStatePassthroughID(ctx, path.Root("mcp_server_id"), req, resp)
 }
 
-func addPublicationNotConfigured(diags *diag.Diagnostics) {
-	diags.AddError(
-		"Provider not configured",
-		"The Barndoor client is not available. This usually means the provider failed to configure.",
-	)
+func (r *mcpServerPublicationResource) requireClient(diags *diag.Diagnostics) bool {
+	if r.client == nil {
+		diags.AddError(
+			"Provider not configured",
+			"The Barndoor client is not available. This usually means the provider failed to configure.",
+		)
+		return false
+	}
+	return true
 }
 
 // addPublishAPIError turns a publish-endpoint error into an actionable

@@ -137,6 +137,18 @@ var testAccProtoV6ProviderFactories = map[string]func() (tfprotov6.ProviderServe
 	"barndoor": providerserver.NewProtocol6WithError(New("test")()),
 }
 
+// newAccClient builds a direct API client from the BARNDOOR_* connection
+// environment, for checks that read the API outside a Terraform plan/apply.
+func newAccClient() *client.Client {
+	return client.New(client.Config{
+		BaseURL:        os.Getenv("BARNDOOR_BASE_URL"),
+		TokenURL:       os.Getenv("BARNDOOR_TOKEN_URL"),
+		ClientID:       os.Getenv("BARNDOOR_CLIENT_ID"),
+		ClientSecret:   os.Getenv("BARNDOOR_CLIENT_SECRET"),
+		OrganizationID: os.Getenv("BARNDOOR_ORGANIZATION_ID"),
+	})
+}
+
 // testAccPreCheck skips the test unless the full BARNDOOR_* connection
 // environment is present. (resource.TestCase additionally requires TF_ACC.)
 func testAccPreCheck(t *testing.T) {
@@ -177,13 +189,7 @@ func TestAccConnectivity(t *testing.T) {
 	}
 	testAccPreCheck(t)
 
-	c := client.New(client.Config{
-		BaseURL:        os.Getenv("BARNDOOR_BASE_URL"),
-		TokenURL:       os.Getenv("BARNDOOR_TOKEN_URL"),
-		ClientID:       os.Getenv("BARNDOOR_CLIENT_ID"),
-		ClientSecret:   os.Getenv("BARNDOOR_CLIENT_SECRET"),
-		OrganizationID: os.Getenv("BARNDOOR_ORGANIZATION_ID"),
-	})
+	c := newAccClient()
 
 	// GET .../exports/{org}/{exportType} is purely read-only. Calling Do mints
 	// the token, so a successful (or authorized-but-404) response proves the
@@ -780,14 +786,7 @@ func accCheckServerInPublishedListing(serverName string, want bool) resource.Tes
 		}
 		serverID := rs.Primary.ID
 
-		c := client.New(client.Config{
-			BaseURL:        os.Getenv("BARNDOOR_BASE_URL"),
-			TokenURL:       os.Getenv("BARNDOOR_TOKEN_URL"),
-			ClientID:       os.Getenv("BARNDOOR_CLIENT_ID"),
-			ClientSecret:   os.Getenv("BARNDOOR_CLIENT_SECRET"),
-			OrganizationID: os.Getenv("BARNDOOR_ORGANIZATION_ID"),
-		})
-		matches, err := searchRegistry(context.Background(), c, registryAPIPrefix+"/servers",
+		matches, err := searchRegistry(context.Background(), newAccClient(), registryAPIPrefix+"/servers",
 			url.Values{"availability_status": []string{"true"}},
 			func(row mcpServerListRow) bool { return row.ID == serverID })
 		if err != nil {
