@@ -42,8 +42,15 @@ type fakeMcpServer struct {
 	// ClientID holds the obfuscated echo the real API returns; the real value
 	// is never stored, mirroring production.
 	ClientID *string `json:"client_id"`
+	// PublishedAt mirrors the one-way publish stamp (BCP-3039): set exactly
+	// once by POST /servers/{id}/publish, never cleared.
+	PublishedAt *string `json:"published_at"`
 
 	deleted bool
+	// hasActivePolicy emulates the publish route's ACTIVE-policy precondition
+	// (verified against policy-service in production). Fresh servers have no
+	// policy, so publish 422s until a test grants one via grantActivePolicy.
+	hasActivePolicy bool
 }
 
 type fakeRegistryServer struct {
@@ -116,6 +123,8 @@ func (f *fakeRegistryServer) handleServers(w http.ResponseWriter, r *http.Reques
 		f.getServerBySlug(w, strings.TrimPrefix(id, "by-slug/"))
 	case strings.HasSuffix(id, "/connect") && r.Method == http.MethodPost:
 		f.connectServer(w, r, strings.TrimSuffix(id, "/connect"))
+	case strings.HasSuffix(id, "/publish") && r.Method == http.MethodPost:
+		f.publishServer(w, strings.TrimSuffix(id, "/publish"))
 	case strings.HasSuffix(id, "/connection"):
 		f.handleServerConnection(w, r, strings.TrimSuffix(id, "/connection"))
 	case id != "" && r.Method == http.MethodGet:
@@ -270,6 +279,59 @@ func (f *fakeRegistryServer) updateServer(w http.ResponseWriter, r *http.Request
 	_ = json.NewEncoder(w).Encode(s)
 }
 
+// fakePublishedAt is the deterministic stamp the fake's publish endpoint sets.
+const fakePublishedAt = "2026-08-19T00:00:00Z"
+
+// publishServer emulates POST /servers/{id}/publish: one-way, idempotent, and
+// gated (in production order) on operational availability then an ACTIVE
+// policy. Re-publishing an already-published server is a no-op success that
+// skips the gates, like production.
+func (f *fakeRegistryServer) publishServer(w http.ResponseWriter, id string) {
+	s, ok := f.servers[id]
+	if !ok || s.deleted {
+		writeJSONError(w, http.StatusNotFound, "MCP server not found")
+		return
+	}
+	if s.PublishedAt == nil {
+		if s.Status != "active" {
+			writeJSONError(w, http.StatusUnprocessableEntity, "Cannot publish: server is not operationally available")
+			return
+		}
+		if !s.hasActivePolicy {
+			writeJSONError(w, http.StatusUnprocessableEntity, "Cannot publish: server has no ACTIVE policy")
+			return
+		}
+		ts := fakePublishedAt
+		s.PublishedAt = &ts
+	}
+	_ = json.NewEncoder(w).Encode(s)
+}
+
+// grantActivePolicy marks a stored server as having an ACTIVE policy, standing
+// in for the barndoor_policy resource the real depends_on ordering waits on.
+func (f *fakeRegistryServer) grantActivePolicy(t *testing.T, id string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.servers[id]
+	if !ok {
+		t.Fatalf("fake has no server %q to grant a policy to", id)
+	}
+	s.hasActivePolicy = true
+}
+
+// serverPublishedAt returns the stored publish stamp (nil = unpublished).
+func (f *fakeRegistryServer) serverPublishedAt(t *testing.T, id string) *string {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.servers[id]
+	if !ok {
+		t.Fatalf("fake has no server %q", id)
+	}
+	return s.PublishedAt
+}
+
 // markServerDeleted soft-deletes a stored server out-of-band.
 func (f *fakeRegistryServer) markServerDeleted(t *testing.T, id string) {
 	t.Helper()
@@ -352,7 +414,7 @@ func TestMcpServerResource_Schema(t *testing.T) {
 	for _, attr := range []string{
 		"id", "name", "mcp_server_directory_id", "slug", "status", "oauth_base_url_override",
 		"uses_managed_credentials", "client_id", "client_secret", "scopes", "meta",
-		"prepopulated_credentials", "cascaded_fields",
+		"prepopulated_credentials", "cascaded_fields", "published_at",
 	} {
 		if _, ok := s.Attributes[attr]; !ok {
 			t.Errorf("schema missing attribute %q", attr)
@@ -364,7 +426,7 @@ func TestMcpServerResource_Schema(t *testing.T) {
 			t.Errorf("%s must be Sensitive", sensitive)
 		}
 	}
-	for _, computed := range []string{"id", "slug", "status"} {
+	for _, computed := range []string{"id", "slug", "status", "published_at"} {
 		if !s.Attributes[computed].IsComputed() {
 			t.Errorf("%s should be Computed", computed)
 		}
