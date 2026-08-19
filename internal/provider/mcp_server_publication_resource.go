@@ -71,7 +71,8 @@ func (r *mcpServerPublicationResource) Schema(_ context.Context, _ resource.Sche
 		Attributes: map[string]schema.Attribute{
 			"mcp_server_id": schema.StringAttribute{
 				MarkdownDescription: "ID of the MCP server to publish; also the `terraform import` key. " +
-					"A server has at most one publication.",
+					"A server has at most one publication. Importing a server that is not published yet " +
+					"fails (there is no publication to import) — apply this resource to publish it instead.",
 				Required: true,
 				PlanModifiers: []planmodifier.String{
 					// Replacing the publication never touches the old server:
@@ -179,15 +180,16 @@ func (r *mcpServerPublicationResource) Read(ctx context.Context, req resource.Re
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-// Update is unreachable: mcp_server_id forces replacement and published_at is
-// computed. It exists to satisfy the resource.Resource interface.
-func (r *mcpServerPublicationResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var plan mcpServerPublicationResourceModel
-	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+// Update is unreachable: mcp_server_id is the only configurable attribute and
+// it forces replacement. Failing loudly matters here — an in-place update
+// would copy the plan into state WITHOUT calling the publish endpoint, so
+// Terraform would report a published server that was never published.
+func (r *mcpServerPublicationResource) Update(_ context.Context, _ resource.UpdateRequest, resp *resource.UpdateResponse) {
+	resp.Diagnostics.AddError(
+		"Unexpected update of barndoor_mcp_server_publication",
+		"Every configurable attribute of barndoor_mcp_server_publication forces replacement, so an "+
+			"in-place update should be impossible. This is a bug in the provider.",
+	)
 }
 
 // Delete removes the publication from state WITHOUT unpublishing — there is no

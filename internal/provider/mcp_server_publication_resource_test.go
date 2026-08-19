@@ -168,6 +168,137 @@ func TestMcpServerPublicationResource_preconditionsRejected(t *testing.T) {
 	})
 }
 
+// checkResourceAbsent fails when name is still present in state — the
+// discriminating assertion for a Read that must RemoveResource.
+func checkResourceAbsent(name string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		if _, ok := s.RootModule().Resources[name]; ok {
+			return fmt.Errorf("%s is still in state; the refresh should have dropped it", name)
+		}
+		return nil
+	}
+}
+
+// TestMcpServerPublicationResource_repointForcesReplace pins that changing
+// mcp_server_id REPLACES the publication (publishing the new server) rather
+// than updating in place. Without the RequiresReplace plan modifier this
+// routes to Update, which must fail loudly rather than report a server as
+// published without ever calling the publish endpoint.
+func TestMcpServerPublicationResource_repointForcesReplace(t *testing.T) {
+	fake := setupRegistryTest(t)
+	const pubName = "barndoor_mcp_server_publication.test"
+
+	// Two active servers, each with a policy, so either may be published.
+	twoServers := `
+resource "barndoor_mcp_server" "a" {
+  name                    = "tf-test-repoint-a"
+  mcp_server_directory_id = "11111111-1111-1111-1111-111111111111"
+  client_id               = "tenant-client-id"
+}
+
+resource "barndoor_mcp_server" "b" {
+  name                    = "tf-test-repoint-b"
+  mcp_server_directory_id = "11111111-1111-1111-1111-111111111111"
+  client_id               = "tenant-client-id"
+}
+`
+	pubFor := func(ref string) string {
+		return fmt.Sprintf(`
+resource "barndoor_mcp_server_publication" "test" {
+  mcp_server_id = barndoor_mcp_server.%s.id
+}
+`, ref)
+	}
+
+	var idA, idB string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: twoServers,
+				Check: func(s *terraform.State) error {
+					idA = s.RootModule().Resources["barndoor_mcp_server.a"].Primary.ID
+					idB = s.RootModule().Resources["barndoor_mcp_server.b"].Primary.ID
+					fake.grantActivePolicy(t, idA)
+					fake.grantActivePolicy(t, idB)
+					return nil
+				},
+			},
+			{
+				Config: twoServers + pubFor("a"),
+				Check:  resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAt),
+			},
+			{
+				// Repointing must replace, which publishes server B. If this
+				// ever routed to Update, B would be reported published while
+				// the publish endpoint was never called for it.
+				Config: twoServers + pubFor("b"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrPair(pubName, "mcp_server_id", "barndoor_mcp_server.b", "id"),
+					func(*terraform.State) error {
+						if fake.serverPublishedAt(t, idB) == nil {
+							return fmt.Errorf("repointing did not publish server B (%s)", idB)
+						}
+						// A stays published — publishing is one-way.
+						if fake.serverPublishedAt(t, idA) == nil {
+							return fmt.Errorf("repointing unpublished server A (%s)", idA)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// TestMcpServerPublicationResource_unpublishedOutOfBandRepublishes covers
+// Read's "server reads back unpublished" branch: the publication is dropped
+// from state so the next apply republishes.
+func TestMcpServerPublicationResource_unpublishedOutOfBandRepublishes(t *testing.T) {
+	fake := setupRegistryTest(t)
+	const pubName = "barndoor_mcp_server_publication.test"
+
+	var serverID string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: activeServerConfig(""),
+				Check: func(s *terraform.State) error {
+					serverID = s.RootModule().Resources["barndoor_mcp_server.test"].Primary.ID
+					fake.grantActivePolicy(t, serverID)
+					return nil
+				},
+			},
+			{
+				Config: activeServerConfig(publicationBlock),
+				Check:  resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAt),
+			},
+			{
+				// The row reads back unpublished (replaced/restored
+				// out-of-band). The refresh must DROP the publication.
+				PreConfig:          func() { fake.unpublishServer(t, serverID) },
+				RefreshState:       true,
+				ExpectNonEmptyPlan: true,
+				Check:              checkResourceAbsent(pubName),
+			},
+			{
+				// …and the next apply republishes it.
+				Config: activeServerConfig(publicationBlock),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAt),
+					func(*terraform.State) error {
+						if fake.serverPublishedAt(t, serverID) == nil {
+							return fmt.Errorf("server %s was not republished", serverID)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
 func TestMcpServerPublicationResource_outOfBandServerDeleteDropsPublication(t *testing.T) {
 	fake := setupRegistryTest(t)
 	const pubName = "barndoor_mcp_server_publication.test"
@@ -193,14 +324,18 @@ func TestMcpServerPublicationResource_outOfBandServerDeleteDropsPublication(t *t
 				Check:  resource.TestCheckResourceAttrSet(pubName, "published_at"),
 			},
 			{
-				// Out-of-band server delete: the refresh must drop both the
-				// server AND its publication, and the apply recreates both
-				// (the new server gets a fresh policy grant via PreConfig's
-				// ordering being impossible — so expect the publish to fail on
-				// the recreated, policy-less server; that failure IS the
-				// correct behavior: a recreated server must not silently
-				// republish without its policy).
-				PreConfig:   func() { fake.markServerDeleted(t, serverID) },
+				// Out-of-band server delete: the refresh must drop the
+				// publication itself (not merely fail later because the server
+				// was recreated) — assert its absence from refreshed state.
+				PreConfig:          func() { fake.markServerDeleted(t, serverID) },
+				RefreshState:       true,
+				ExpectNonEmptyPlan: true,
+				Check:              checkResourceAbsent(pubName),
+			},
+			{
+				// Applying then recreates the server, and the publish must
+				// FAIL on the fresh, policy-less server: a recreated server
+				// must never silently republish without its policy.
 				Config:      activeServerConfig(publicationBlock),
 				ExpectError: regexp.MustCompile(`(?s)cannot be published yet`),
 			},
