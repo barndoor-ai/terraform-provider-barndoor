@@ -118,13 +118,17 @@ data "barndoor_mcp_server" "test" {
 			},
 			{
 				// Removing the publication must NOT unpublish (there is no
-				// unpublish) and must NOT touch the server.
+				// unpublish) and must NOT touch the server — in particular it
+				// must never delete it, which would tear down its connections.
 				Config: activeServerConfig(""),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr(serverName, "published_at", fakePublishedAt),
 					func(*terraform.State) error {
 						if fake.serverPublishedAt(t, serverID) == nil {
 							return fmt.Errorf("destroying the publication unpublished server %s", serverID)
+						}
+						if fake.serverDeleted(t, serverID) {
+							return fmt.Errorf("destroying the publication deleted server %s", serverID)
 						}
 						return nil
 					},

@@ -332,6 +332,18 @@ func (f *fakeRegistryServer) serverPublishedAt(t *testing.T, id string) *string 
 	return s.PublishedAt
 }
 
+// serverDeleted reports whether the stored server is soft-deleted.
+func (f *fakeRegistryServer) serverDeleted(t *testing.T, id string) bool {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.servers[id]
+	if !ok {
+		t.Fatalf("fake has no server %q", id)
+	}
+	return s.deleted
+}
+
 // markServerDeleted soft-deletes a stored server out-of-band.
 func (f *fakeRegistryServer) markServerDeleted(t *testing.T, id string) {
 	t.Helper()
