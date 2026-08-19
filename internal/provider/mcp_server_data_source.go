@@ -53,6 +53,7 @@ type mcpServerDataSourceModel struct {
 	OauthBaseURLOverride   types.String `tfsdk:"oauth_base_url_override"`
 	UsesManagedCredentials types.Bool   `tfsdk:"uses_managed_credentials"`
 	Scopes                 types.List   `tfsdk:"scopes"`
+	PublishedAt            types.String `tfsdk:"published_at"`
 }
 
 func (d *mcpServerDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
@@ -109,6 +110,12 @@ func (d *mcpServerDataSource) Schema(_ context.Context, _ datasource.SchemaReque
 					"directory entry's default scopes apply).",
 				ElementType: types.StringType,
 				Computed:    true,
+			},
+			"published_at": schema.StringAttribute{
+				MarkdownDescription: "RFC 3339 timestamp of when the server was published (made " +
+					"discoverable to end users); null while unpublished. Publishing is one-way: there is " +
+					"no unpublish.",
+				Computed: true,
 			},
 		},
 	}
@@ -205,6 +212,7 @@ func applyMcpServerDataSource(ctx context.Context, server *mcpServerResponse, da
 	data.Status = types.StringValue(server.Status)
 	data.McpServerDirectoryID = types.StringValue(server.McpServerDirectoryID)
 	data.OauthBaseURLOverride = optionalStringFromPtr(server.OauthBaseURLOverride, types.StringNull())
+	data.PublishedAt = types.StringPointerValue(server.PublishedAt)
 	if server.UsesManagedCredentials == nil {
 		data.UsesManagedCredentials = types.BoolNull()
 	} else {

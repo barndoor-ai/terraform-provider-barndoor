@@ -153,6 +153,7 @@ func (p *BarndoorProvider) Resources(ctx context.Context) []func() resource.Reso
 		NewLlmRateLimitResource,
 		NewLlmTokenBudgetResource,
 		NewLogExportResource,
+		NewMcpServerPublicationResource,
 		NewMcpServerResource,
 		NewPolicyResource,
 	}
