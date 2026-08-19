@@ -684,8 +684,11 @@ func TestAccMcpServerPublication_lifecycle(t *testing.T) {
 
 	directoryID := os.Getenv(envTestPublishableMCPServerDirectoryID)
 	if directoryID == "" {
-		t.Skipf("%s not set; skipping the barndoor_mcp_server_publication acceptance test. Set it to a "+
-			"directory entry whose servers are operationally available without an OAuth connection.",
+		t.Skipf("PUBLISH COVERAGE ABSENT: %s is not set, so nothing verifies that publishing makes a "+
+			"server discoverable. This is not a passing test — it is no test. Set the variable (as a `dev` "+
+			"environment Actions variable for the nightly workflow) to a directory entry whose servers are "+
+			"operationally available WITHOUT an OAuth connection; publishing requires operational "+
+			"availability, and a server from an ordinary OAuth entry stays `pending`.",
 			envTestPublishableMCPServerDirectoryID)
 	}
 
