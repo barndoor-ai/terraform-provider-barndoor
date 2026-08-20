@@ -4,14 +4,14 @@ page_title: "barndoor_log_export_aws_trust_info Data Source - Barndoor"
 subcategory: ""
 description: |-
   Reads Barndoor's AWS principal ARN and the per-destination external ID for a log export, so a customer can build the aws_iam_role trust policy for the export's iam_role auth method in the same terraform apply. The external ID is minted and stored on first read and is then stable for the destination.
-  This endpoint is only available when the iam_role auth method is enabled for the organization; otherwise the read fails. See the example for the end-to-end iam_role wiring.
+  This endpoint is only available when the iam_role auth method is enabled for the organization; otherwise the read fails. It also does not apply to an Azure Blob Storage destination (destination.provider = "azure_blob"), which authenticates with an account key or SAS token instead — reading it for one fails with an explanatory error. See the example for the end-to-end iam_role wiring.
 ---
 
 # barndoor_log_export_aws_trust_info (Data Source)
 
 Reads Barndoor's AWS principal ARN and the per-destination external ID for a log export, so a customer can build the `aws_iam_role` trust policy for the export's `iam_role` auth method in the same `terraform apply`. The external ID is minted and stored on first read and is then stable for the destination.
 
-This endpoint is only available when the `iam_role` auth method is enabled for the organization; otherwise the read fails. See the example for the end-to-end `iam_role` wiring.
+This endpoint is only available when the `iam_role` auth method is enabled for the organization; otherwise the read fails. It also does not apply to an Azure Blob Storage destination (`destination.provider = "azure_blob"`), which authenticates with an account key or SAS token instead — reading it for one fails with an explanatory error. See the example for the end-to-end `iam_role` wiring.
 
 ## Example Usage
 

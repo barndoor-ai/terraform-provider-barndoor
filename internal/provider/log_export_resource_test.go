@@ -8,9 +8,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -100,17 +102,27 @@ func TestLogExportResource_Schema(t *testing.T) {
 	}
 
 	for _, attr := range []string{
-		"endpoint", "region", "bucket", "path_prefix", "use_ssl", "use_path_style",
+		"provider", "endpoint", "region", "bucket", "path_prefix", "use_ssl", "use_path_style",
 		"auth_method", "iam_role_arn", "access_key_id", "secret_access_key",
-		"external_id", "has_credentials",
+		"account_key", "sas_token", "external_id", "has_credentials",
 	} {
 		if _, ok := dest.Attributes[attr]; !ok {
 			t.Errorf("destination missing attribute %q", attr)
 		}
 	}
 
-	if secret := dest.Attributes["secret_access_key"]; !secret.IsSensitive() {
-		t.Error("destination.secret_access_key must be Sensitive")
+	// Every credential attribute must be Sensitive so it is redacted in plan
+	// output. (access_key_id is an identifier, not a secret, and is not.)
+	for _, secret := range []string{"secret_access_key", "account_key", "sas_token"} {
+		if !dest.Attributes[secret].IsSensitive() {
+			t.Errorf("destination.%s must be Sensitive", secret)
+		}
+	}
+
+	// provider carries the s3 default, so an existing S3 configuration that
+	// never mentions it keeps planning empty.
+	if p := dest.Attributes["provider"]; !p.IsOptional() || !p.IsComputed() {
+		t.Error("destination.provider should be Optional and Computed (it defaults to s3)")
 	}
 	for _, computed := range []string{"external_id", "has_credentials"} {
 		if !dest.Attributes[computed].IsComputed() {
@@ -134,8 +146,30 @@ func TestLogExportResource_Schema(t *testing.T) {
 	}
 }
 
+// s3Request asserts buildDestinationRequest dispatched to the S3 body and
+// returns it. A model that should serialize as S3 but comes back as the Azure
+// type is a routing bug, not an assertion failure on a field.
+func s3Request(t *testing.T, d *destinationModel) configureDestinationRequest {
+	t.Helper()
+	req, ok := buildDestinationRequest(d).(configureDestinationRequest)
+	if !ok {
+		t.Fatalf("buildDestinationRequest returned %T, want configureDestinationRequest", buildDestinationRequest(d))
+	}
+	return req
+}
+
+func azureRequest(t *testing.T, d *destinationModel) configureAzureDestinationRequest {
+	t.Helper()
+	req, ok := buildDestinationRequest(d).(configureAzureDestinationRequest)
+	if !ok {
+		t.Fatalf("buildDestinationRequest returned %T, want configureAzureDestinationRequest", buildDestinationRequest(d))
+	}
+	return req
+}
+
 func TestBuildDestinationRequest_AccessKeys(t *testing.T) {
 	d := &destinationModel{
+		Provider:        types.StringValue(storageProviderS3),
 		Endpoint:        types.StringValue("https://s3.us-east-1.amazonaws.com"),
 		Region:          types.StringValue("us-east-1"),
 		Bucket:          types.StringValue("audit-logs"),
@@ -148,8 +182,11 @@ func TestBuildDestinationRequest_AccessKeys(t *testing.T) {
 		SecretAccessKey: types.StringValue("secret"),
 	}
 
-	req := buildDestinationRequest(d)
+	req := s3Request(t, d)
 
+	if req.Provider != storageProviderS3 {
+		t.Errorf("provider = %q, want %q (sent explicitly, not left to the server default)", req.Provider, storageProviderS3)
+	}
 	if req.AuthMethod != authMethodAccessKeys {
 		t.Errorf("auth_method = %q, want %q", req.AuthMethod, authMethodAccessKeys)
 	}
@@ -164,8 +201,27 @@ func TestBuildDestinationRequest_AccessKeys(t *testing.T) {
 	}
 }
 
+// TestBuildDestinationRequest_NullProviderIsS3 covers the upgrade path: a
+// configuration written before `provider` existed leaves it null in state until
+// the next plan applies the default, and must still serialize as S3.
+func TestBuildDestinationRequest_NullProviderIsS3(t *testing.T) {
+	d := &destinationModel{
+		Provider:        types.StringNull(),
+		Endpoint:        types.StringValue("https://s3.us-east-1.amazonaws.com"),
+		Bucket:          types.StringValue("audit-logs"),
+		AuthMethod:      types.StringValue(authMethodAccessKeys),
+		AccessKeyID:     types.StringValue("AKIA..."),
+		SecretAccessKey: types.StringValue("secret"),
+	}
+
+	if req := s3Request(t, d); req.Provider != storageProviderS3 {
+		t.Errorf("provider = %q, want %q", req.Provider, storageProviderS3)
+	}
+}
+
 func TestBuildDestinationRequest_IAMRole(t *testing.T) {
 	d := &destinationModel{
+		Provider:        types.StringValue(storageProviderS3),
 		Endpoint:        types.StringValue("https://s3.us-east-1.amazonaws.com"),
 		Region:          types.StringValue("us-east-1"),
 		Bucket:          types.StringValue("audit-logs"),
@@ -175,7 +231,7 @@ func TestBuildDestinationRequest_IAMRole(t *testing.T) {
 		SecretAccessKey: types.StringNull(),
 	}
 
-	req := buildDestinationRequest(d)
+	req := s3Request(t, d)
 
 	if req.AuthMethod != authMethodIAMRole {
 		t.Errorf("auth_method = %q, want %q", req.AuthMethod, authMethodIAMRole)
@@ -186,6 +242,185 @@ func TestBuildDestinationRequest_IAMRole(t *testing.T) {
 	if req.AccessKeyID != "" || req.SecretAccessKey != "" {
 		t.Errorf("access keys must be empty for iam_role: %+v", req)
 	}
+}
+
+func TestBuildDestinationRequest_AzureAccountKey(t *testing.T) {
+	req := azureRequest(t, azureAccountKeyModel())
+
+	if req.Provider != storageProviderAzureBlob {
+		t.Errorf("provider = %q, want %q", req.Provider, storageProviderAzureBlob)
+	}
+	if req.Endpoint != "https://acmeaudit.blob.core.windows.net" {
+		t.Errorf("endpoint = %q", req.Endpoint)
+	}
+	if req.Bucket != "barndoor-audit" {
+		t.Errorf("bucket (container) = %q", req.Bucket)
+	}
+	if req.PathPrefix != "acme/" {
+		t.Errorf("path_prefix = %q", req.PathPrefix)
+	}
+	if req.AuthMethod != authMethodAccountKey {
+		t.Errorf("auth_method = %q, want %q", req.AuthMethod, authMethodAccountKey)
+	}
+	if req.AccountKey != "azure-account-key" {
+		t.Errorf("account_key not propagated: %q", req.AccountKey)
+	}
+	if req.SASToken != "" {
+		t.Errorf("sas_token = %q, want empty for account_key auth", req.SASToken)
+	}
+}
+
+func TestBuildDestinationRequest_AzureSASToken(t *testing.T) {
+	req := azureRequest(t, azureSASTokenModel())
+
+	if req.AuthMethod != authMethodSASToken {
+		t.Errorf("auth_method = %q, want %q", req.AuthMethod, authMethodSASToken)
+	}
+	if req.SASToken != "sv=2024-01-01&sig=abc" {
+		t.Errorf("sas_token not propagated: %q", req.SASToken)
+	}
+	if req.AccountKey != "" {
+		t.Errorf("account_key = %q, want empty for sas_token auth", req.AccountKey)
+	}
+}
+
+// TestBuildDestinationRequest_AzureJSONKeys is the load-bearing guard for the
+// Azure body: it asserts on the marshalled JSON, not the Go struct. The API
+// rejects an Azure destination that carries region/use_ssl/use_path_style/
+// iam_role_arn/access_key_id/secret_access_key, and `use_ssl` has a schema
+// Default of true — so a regression that serialized the shared S3 struct would
+// put "use_ssl": true on the wire and 400 on every apply, while every
+// field-level assertion above still passed.
+func TestBuildDestinationRequest_AzureJSONKeys(t *testing.T) {
+	for name, d := range map[string]*destinationModel{
+		"account_key": azureAccountKeyModel(),
+		"sas_token":   azureSASTokenModel(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			// The model deliberately carries the S3 attributes at their schema
+			// defaults, exactly as a plan would.
+			raw, err := json.Marshal(buildDestinationRequest(d))
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var got map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+
+			for _, forbidden := range []string{
+				"region", "use_ssl", "use_path_style", "iam_role_arn", "access_key_id", "secret_access_key",
+			} {
+				if _, present := got[forbidden]; present {
+					t.Errorf("azure request body must not carry %q (the API rejects it); body = %s", forbidden, raw)
+				}
+			}
+			for _, required := range []string{"provider", "endpoint", "bucket", "auth_method"} {
+				if _, present := got[required]; !present {
+					t.Errorf("azure request body is missing %q; body = %s", required, raw)
+				}
+			}
+			// Exactly one secret, matching the declared auth method.
+			_, hasAccountKey := got["account_key"]
+			_, hasSAS := got["sas_token"]
+			if hasAccountKey == hasSAS {
+				t.Errorf("azure body must carry exactly one of account_key/sas_token; body = %s", raw)
+			}
+			if name == "account_key" && !hasAccountKey {
+				t.Errorf("account_key auth must send account_key; body = %s", raw)
+			}
+			if name == "sas_token" && !hasSAS {
+				t.Errorf("sas_token auth must send sas_token; body = %s", raw)
+			}
+		})
+	}
+}
+
+// azureAccountKeyModel is a plan-shaped Azure destination: the S3-only
+// attributes sit at the values the schema's defaults would give them, which is
+// what the request builder and the state mapper must both cope with.
+func azureAccountKeyModel() *destinationModel {
+	return &destinationModel{
+		Provider:        types.StringValue(storageProviderAzureBlob),
+		Endpoint:        types.StringValue("https://acmeaudit.blob.core.windows.net"),
+		Bucket:          types.StringValue("barndoor-audit"),
+		PathPrefix:      types.StringValue("acme/"),
+		AuthMethod:      types.StringValue(authMethodAccountKey),
+		AccountKey:      types.StringValue("azure-account-key"),
+		SASToken:        types.StringNull(),
+		Region:          types.StringNull(),
+		IAMRoleArn:      types.StringNull(),
+		AccessKeyID:     types.StringNull(),
+		SecretAccessKey: types.StringNull(),
+		UseSSL:          types.BoolValue(true),  // schema Default
+		UsePathStyle:    types.BoolValue(false), // schema Default
+	}
+}
+
+func azureSASTokenModel() *destinationModel {
+	d := azureAccountKeyModel()
+	d.AuthMethod = types.StringValue(authMethodSASToken)
+	d.AccountKey = types.StringNull()
+	d.SASToken = types.StringValue("sv=2024-01-01&sig=abc")
+	return d
+}
+
+// s3ConfigModel is a *config*-shaped S3 destination: every attribute the
+// practitioner did not write is null, including the ones carrying a schema
+// Default. ValidateConfig sees the config, not the plan, and the null-vs-set
+// distinction is exactly what the Azure branch keys on.
+func s3ConfigModel() *destinationModel {
+	return &destinationModel{
+		Provider:        types.StringNull(),
+		Endpoint:        types.StringValue("https://s3.us-east-1.amazonaws.com"),
+		Bucket:          types.StringValue("audit-logs"),
+		Region:          types.StringValue("us-east-1"),
+		PathPrefix:      types.StringNull(),
+		UseSSL:          types.BoolNull(),
+		UsePathStyle:    types.BoolNull(),
+		AuthMethod:      types.StringValue(authMethodAccessKeys),
+		IAMRoleArn:      types.StringNull(),
+		AccessKeyID:     types.StringValue("AKIA..."),
+		SecretAccessKey: types.StringValue("secret"),
+		AccountKey:      types.StringNull(),
+		SASToken:        types.StringNull(),
+	}
+}
+
+// azureConfigModel is a config-shaped, valid azure_blob destination using the
+// given auth method.
+func azureConfigModel(authMethod string) *destinationModel {
+	d := &destinationModel{
+		Provider:        types.StringValue(storageProviderAzureBlob),
+		Endpoint:        types.StringValue("https://acmeaudit.blob.core.windows.net"),
+		Bucket:          types.StringValue("barndoor-audit"),
+		Region:          types.StringNull(),
+		PathPrefix:      types.StringNull(),
+		UseSSL:          types.BoolNull(),
+		UsePathStyle:    types.BoolNull(),
+		AuthMethod:      types.StringValue(authMethod),
+		IAMRoleArn:      types.StringNull(),
+		AccessKeyID:     types.StringNull(),
+		SecretAccessKey: types.StringNull(),
+		AccountKey:      types.StringNull(),
+		SASToken:        types.StringNull(),
+	}
+	if authMethod == authMethodSASToken {
+		d.SASToken = types.StringValue("sv=2024-01-01&sig=abc")
+	} else {
+		d.AccountKey = types.StringValue("azure-account-key")
+	}
+	return d
+}
+
+// withProvider overrides a model's provider and applies an optional mutation,
+// so a table entry can express "this valid config, but with X" in one line.
+func withProvider(d *destinationModel, provider string, mutate func(*destinationModel)) *destinationModel {
+	d.Provider = types.StringValue(provider)
+	if mutate != nil {
+		mutate(d)
+	}
+	return d
 }
 
 func TestValidateDestinationConfig(t *testing.T) {
@@ -234,6 +469,139 @@ func TestValidateDestinationConfig(t *testing.T) {
 				SecretAccessKey: types.StringNull(),
 				IAMRoleArn:      types.StringNull(),
 			},
+			wantError: true,
+		},
+		"s3 rejects an azure account_key": {
+			dest: withProvider(s3ConfigModel(), storageProviderS3, func(d *destinationModel) {
+				d.AccountKey = types.StringValue("azure-account-key")
+			}),
+			wantError: true,
+		},
+		"s3 rejects an azure sas_token": {
+			dest: withProvider(s3ConfigModel(), storageProviderS3, func(d *destinationModel) {
+				d.SASToken = types.StringValue("sv=2024-01-01&sig=abc")
+			}),
+			wantError: true,
+		},
+		"azure with account_key": {
+			dest: azureConfigModel(authMethodAccountKey),
+		},
+		"azure with sas_token": {
+			dest: azureConfigModel(authMethodSASToken),
+		},
+		"azure missing auth_method": {
+			// auth_method's `access_keys` default does not apply to Azure, so an
+			// omitted (null in config) value must be rejected at plan time
+			// rather than defaulted into an API 400.
+			dest: withProvider(azureConfigModel(authMethodAccountKey), storageProviderAzureBlob, func(d *destinationModel) {
+				d.AuthMethod = types.StringNull()
+			}),
+			wantError: true,
+		},
+		"azure with an s3 auth_method": {
+			dest: withProvider(azureConfigModel(authMethodAccountKey), storageProviderAzureBlob, func(d *destinationModel) {
+				d.AuthMethod = types.StringValue(authMethodAccessKeys)
+			}),
+			wantError: true,
+		},
+		"azure account_key auth missing the account key": {
+			dest: withProvider(azureConfigModel(authMethodAccountKey), storageProviderAzureBlob, func(d *destinationModel) {
+				d.AccountKey = types.StringNull()
+			}),
+			wantError: true,
+		},
+		"azure account_key auth with a stray sas_token": {
+			dest: withProvider(azureConfigModel(authMethodAccountKey), storageProviderAzureBlob, func(d *destinationModel) {
+				d.SASToken = types.StringValue("sv=2024-01-01&sig=abc")
+			}),
+			wantError: true,
+		},
+		"azure sas_token auth missing the token": {
+			dest: withProvider(azureConfigModel(authMethodSASToken), storageProviderAzureBlob, func(d *destinationModel) {
+				d.SASToken = types.StringNull()
+			}),
+			wantError: true,
+		},
+		"azure sas_token auth with a stray account_key": {
+			dest: withProvider(azureConfigModel(authMethodSASToken), storageProviderAzureBlob, func(d *destinationModel) {
+				d.AccountKey = types.StringValue("azure-account-key")
+			}),
+			wantError: true,
+		},
+		"azure rejects region": {
+			dest: withProvider(azureConfigModel(authMethodAccountKey), storageProviderAzureBlob, func(d *destinationModel) {
+				d.Region = types.StringValue("us-east-1")
+			}),
+			wantError: true,
+		},
+		"azure rejects iam_role_arn": {
+			dest: withProvider(azureConfigModel(authMethodAccountKey), storageProviderAzureBlob, func(d *destinationModel) {
+				d.IAMRoleArn = types.StringValue("arn:aws:iam::123:role/x")
+			}),
+			wantError: true,
+		},
+		"azure rejects access_key_id": {
+			dest: withProvider(azureConfigModel(authMethodAccountKey), storageProviderAzureBlob, func(d *destinationModel) {
+				d.AccessKeyID = types.StringValue("AKIA...")
+			}),
+			wantError: true,
+		},
+		"azure rejects secret_access_key": {
+			dest: withProvider(azureConfigModel(authMethodAccountKey), storageProviderAzureBlob, func(d *destinationModel) {
+				d.SecretAccessKey = types.StringValue("secret")
+			}),
+			wantError: true,
+		},
+		"azure rejects an explicit use_ssl = true": {
+			// The schema default is also true, but a *config* value means the
+			// practitioner set it, and Azure takes its scheme from `endpoint`.
+			dest: withProvider(azureConfigModel(authMethodAccountKey), storageProviderAzureBlob, func(d *destinationModel) {
+				d.UseSSL = types.BoolValue(true)
+			}),
+			wantError: true,
+		},
+		"azure rejects an explicit use_ssl = false": {
+			dest: withProvider(azureConfigModel(authMethodAccountKey), storageProviderAzureBlob, func(d *destinationModel) {
+				d.UseSSL = types.BoolValue(false)
+			}),
+			wantError: true,
+		},
+		"azure rejects an explicit use_path_style": {
+			dest: withProvider(azureConfigModel(authMethodAccountKey), storageProviderAzureBlob, func(d *destinationModel) {
+				d.UsePathStyle = types.BoolValue(false)
+			}),
+			wantError: true,
+		},
+		"s3 with an unknown auth_method is deferred, not rejected": {
+			// auth_method comes from an unresolved expression and is paired with
+			// iam_role_arn. Folding the unknown into the `access_keys` default
+			// would reject this at validate time even though it is a valid
+			// iam_role configuration once the variable resolves.
+			dest: withProvider(s3ConfigModel(), storageProviderS3, func(d *destinationModel) {
+				d.AuthMethod = types.StringUnknown()
+				d.IAMRoleArn = types.StringValue("arn:aws:iam::123:role/x")
+				d.AccessKeyID = types.StringNull()
+				d.SecretAccessKey = types.StringNull()
+			}),
+		},
+		"s3 with an unknown auth_method still rejects an azure secret": {
+			// The provider-level checks run before the auth_method deferral, so
+			// a cross-provider attribute is still caught.
+			dest: withProvider(s3ConfigModel(), storageProviderS3, func(d *destinationModel) {
+				d.AuthMethod = types.StringUnknown()
+				d.AccountKey = types.StringValue("azure-account-key")
+			}),
+			wantError: true,
+		},
+		"unknown provider is deferred, not rejected": {
+			// provider comes from an unresolved expression: neither branch can be
+			// checked yet, and erroring here would fail a legitimate plan.
+			dest: withProvider(azureConfigModel(authMethodAccountKey), storageProviderAzureBlob, func(d *destinationModel) {
+				d.Provider = types.StringUnknown()
+			}),
+		},
+		"invalid provider": {
+			dest:      withProvider(azureConfigModel(authMethodAccountKey), "gcs", nil),
 			wantError: true,
 		},
 	}
@@ -402,6 +770,236 @@ func TestMapServerToState_IAMRole(t *testing.T) {
 	}
 	if d.IAMRoleArn.ValueString() != "arn:aws:iam::123:role/x" {
 		t.Errorf("iam_role_arn = %q", d.IAMRoleArn.ValueString())
+	}
+}
+
+// azureDTO is the destination the API reports for the model built by
+// azureAccountKeyModel: the Azure attributes echoed back, every S3 attribute at
+// its zero value (Azure rows simply do not have them).
+func azureDTO() destinationDTO {
+	return destinationDTO{
+		Provider:       storageProviderAzureBlob,
+		Endpoint:       "https://acmeaudit.blob.core.windows.net",
+		Bucket:         "barndoor-audit",
+		PathPrefix:     "acme/",
+		AuthMethod:     authMethodAccountKey,
+		HasCredentials: true,
+		Region:         "",
+		UseSSL:         false,
+		UsePathStyle:   false,
+		IAMRoleArn:     "",
+		ExternalID:     "",
+	}
+}
+
+// destinationFieldValues reflects over every tfsdk-tagged field of a
+// destinationModel. Reflection rather than a hand-written field list means a
+// destination attribute added later is covered by the round-trip assertions
+// automatically, instead of silently escaping them.
+func destinationFieldValues(t *testing.T, d *destinationModel) map[string]attr.Value {
+	t.Helper()
+	out := map[string]attr.Value{}
+	v := reflect.ValueOf(*d)
+	typ := v.Type()
+	for i := range typ.NumField() {
+		name := typ.Field(i).Tag.Get("tfsdk")
+		if name == "" {
+			t.Fatalf("destinationModel field %s has no tfsdk tag", typ.Field(i).Name)
+		}
+		val, ok := v.Field(i).Interface().(attr.Value)
+		if !ok {
+			t.Fatalf("destinationModel field %s is %T, not an attr.Value", typ.Field(i).Name, v.Field(i).Interface())
+		}
+		out[name] = val
+	}
+	if len(out) == 0 {
+		t.Fatal("destinationModel has no tfsdk-tagged fields; the round-trip assertions would prove nothing")
+	}
+	return out
+}
+
+// TestAzureDestination_PlanRoundTrip is the plan-stability guard. It pairs the
+// real request builder with the real state mapper against a realistic API
+// response and asserts every model field lands back on the value the plan held.
+// Any field that does not is a perpetual diff (or, right after apply, a
+// "provider produced an inconsistent result" error): use_ssl is the one that
+// actually bites, since its schema Default is true while the API reports false
+// for every Azure row.
+func TestAzureDestination_PlanRoundTrip(t *testing.T) {
+	ctx := context.Background()
+
+	// The plan: Azure attributes from config, S3-only attributes at their
+	// schema defaults, Computed attributes still unknown.
+	plan := azureAccountKeyModel()
+	plan.ExternalID = types.StringUnknown()
+	plan.HasCredentials = types.BoolUnknown()
+
+	// Sanity-check that the response really is derived from what we would send,
+	// so the fixture cannot drift away from the builder.
+	req := azureRequest(t, plan)
+	dto := azureDTO()
+	if req.Endpoint != dto.Endpoint || req.Bucket != dto.Bucket || req.AuthMethod != dto.AuthMethod || req.PathPrefix != dto.PathPrefix {
+		t.Fatalf("fixture drift: request %+v does not match the response fixture %+v", req, dto)
+	}
+
+	state := &logExportResourceModel{Destination: plan}
+	if err := mapServerToState(ctx, state, "org-123", &exportResponse{Destination: dto}, &destinationResponse{Destination: dto}); err != nil {
+		t.Fatalf("mapServerToState: %v", err)
+	}
+	if state.Destination == nil {
+		t.Fatal("destination should not be nil")
+		return
+	}
+
+	// Computed attributes are the only ones allowed to move off the plan: they
+	// were unknown and must settle on the server's answer.
+	wantComputed := map[string]attr.Value{
+		"external_id":     types.StringNull(), // Azure has no sts:ExternalId
+		"has_credentials": types.BoolValue(true),
+	}
+
+	got := destinationFieldValues(t, state.Destination)
+	want := destinationFieldValues(t, azureAccountKeyModel())
+	for name, wantVal := range want {
+		if computed, ok := wantComputed[name]; ok {
+			if !got[name].Equal(computed) {
+				t.Errorf("computed %s = %v, want %v", name, got[name], computed)
+			}
+			continue
+		}
+		if !got[name].Equal(wantVal) {
+			t.Errorf("%s = %v after apply, but the plan had %v — a re-plan would show a diff", name, got[name], wantVal)
+		}
+	}
+
+	// A refresh maps the same response over the state it just produced. It must
+	// be a fixed point, or every `terraform plan` after the first shows a diff.
+	refreshed := &logExportResourceModel{Destination: state.Destination}
+	if err := mapServerToState(ctx, refreshed, "org-123", &exportResponse{Destination: dto}, &destinationResponse{Destination: dto}); err != nil {
+		t.Fatalf("mapServerToState (refresh): %v", err)
+	}
+	after := destinationFieldValues(t, refreshed.Destination)
+	for name, before := range got {
+		if !after[name].Equal(before) {
+			t.Errorf("refresh moved %s from %v to %v; mapping is not idempotent", name, before, after[name])
+		}
+	}
+}
+
+// TestMapServerToState_AzureImport covers the no-prior-model path (terraform
+// import): each S3-only attribute must settle on its schema default so a config
+// that omits them plans empty.
+func TestMapServerToState_AzureImport(t *testing.T) {
+	ctx := context.Background()
+	dto := azureDTO()
+
+	// ImportState seeds no destination, so mapServerToState builds one from
+	// nothing.
+	state := &logExportResourceModel{}
+	if err := mapServerToState(ctx, state, "org-123", &exportResponse{Destination: dto}, &destinationResponse{Destination: dto}); err != nil {
+		t.Fatalf("mapServerToState: %v", err)
+	}
+	d := state.Destination
+	if d == nil {
+		t.Fatal("destination should not be nil")
+		return
+	}
+
+	if d.Provider.ValueString() != storageProviderAzureBlob {
+		t.Errorf("provider = %q, want %q", d.Provider.ValueString(), storageProviderAzureBlob)
+	}
+	if !d.UseSSL.ValueBool() {
+		t.Error("use_ssl = false, want the schema default true (the API reports false for every Azure row)")
+	}
+	if d.UsePathStyle.ValueBool() {
+		t.Error("use_path_style = true, want the schema default false")
+	}
+	for name, v := range map[string]types.String{
+		"region":            d.Region,
+		"iam_role_arn":      d.IAMRoleArn,
+		"external_id":       d.ExternalID,
+		"access_key_id":     d.AccessKeyID,
+		"secret_access_key": d.SecretAccessKey,
+		"account_key":       d.AccountKey,
+		"sas_token":         d.SASToken,
+	} {
+		if !v.IsNull() {
+			t.Errorf("%s = %v, want null on an imported Azure destination", name, v)
+		}
+	}
+	if d.AuthMethod.ValueString() != authMethodAccountKey {
+		t.Errorf("auth_method = %q, want %q", d.AuthMethod.ValueString(), authMethodAccountKey)
+	}
+}
+
+// TestMapServerToState_AzureSecretsAreConfigOnly pins that the Azure secrets are
+// carried from the prior model, exactly like the S3 access keys: the API never
+// returns them, so mapping would otherwise blank them out of state.
+func TestMapServerToState_AzureSecretsAreConfigOnly(t *testing.T) {
+	ctx := context.Background()
+	dto := azureDTO()
+	dto.AuthMethod = authMethodSASToken
+
+	prior := azureSASTokenModel()
+	state := &logExportResourceModel{Destination: prior}
+	if err := mapServerToState(ctx, state, "org-123", &exportResponse{Destination: dto}, &destinationResponse{Destination: dto}); err != nil {
+		t.Fatalf("mapServerToState: %v", err)
+	}
+	if got := state.Destination.SASToken.ValueString(); got != "sv=2024-01-01&sig=abc" {
+		t.Errorf("sas_token = %q; it must be carried from the prior model (the API never returns it)", got)
+	}
+	if !state.Destination.AccountKey.IsNull() {
+		t.Errorf("account_key = %v, want null", state.Destination.AccountKey)
+	}
+}
+
+// TestMapServerToState_LegacyRowIsS3 covers a destination configured before the
+// API had a provider field: the field is absent, and the row is S3.
+func TestMapServerToState_LegacyRowIsS3(t *testing.T) {
+	ctx := context.Background()
+	dto := destinationDTO{
+		Endpoint: "https://s3", Bucket: "b", Region: "us-east-1",
+		AuthMethod: "access_keys", UseSSL: true, HasCredentials: true,
+		// Provider intentionally absent.
+	}
+	state := &logExportResourceModel{Destination: &destinationModel{}}
+	if err := mapServerToState(ctx, state, "org-123", &exportResponse{Destination: dto}, &destinationResponse{Destination: dto}); err != nil {
+		t.Fatalf("mapServerToState: %v", err)
+	}
+	if got := state.Destination.Provider.ValueString(); got != storageProviderS3 {
+		t.Errorf("provider = %q, want %q for a legacy row with no provider field", got, storageProviderS3)
+	}
+	// The S3 mapping must stay server-driven — the Azure preservation path must
+	// not leak into it.
+	if got := state.Destination.Region.ValueString(); got != "us-east-1" {
+		t.Errorf("region = %q, want the server's us-east-1", got)
+	}
+	if !state.Destination.UseSSL.ValueBool() {
+		t.Error("use_ssl should come from the server for an S3 destination")
+	}
+}
+
+// TestMapServerToState_S3RegionStillTracksTheServer guards the other direction:
+// an S3 destination whose region the server changed (or cleared) must follow the
+// server, since region is server-owned for S3.
+func TestMapServerToState_S3RegionStillTracksTheServer(t *testing.T) {
+	ctx := context.Background()
+	dto := destinationDTO{
+		Provider: storageProviderS3, Endpoint: "https://s3", Bucket: "b",
+		Region: "eu-west-1", AuthMethod: authMethodAccessKeys, UseSSL: false,
+	}
+	state := &logExportResourceModel{Destination: &destinationModel{
+		Region: types.StringValue("us-east-1"),
+		UseSSL: types.BoolValue(true),
+	}}
+	if err := mapServerToState(ctx, state, "o", &exportResponse{Destination: dto}, &destinationResponse{Destination: dto}); err != nil {
+		t.Fatalf("mapServerToState: %v", err)
+	}
+	if got := state.Destination.Region.ValueString(); got != "eu-west-1" {
+		t.Errorf("region = %q, want the server's eu-west-1 (drift must be visible for S3)", got)
+	}
+	if state.Destination.UseSSL.ValueBool() {
+		t.Error("use_ssl should follow the server for S3, not be pinned to the plan")
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -20,6 +21,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
@@ -31,9 +33,21 @@ import (
 // currently provisions per organization.
 const defaultExportType = "datadog-json"
 
+// Storage providers a destination can be backed by. The API treats an
+// absent/empty provider as s3, so legacy destinations (configured before the
+// field existed) read back as s3.
+const (
+	storageProviderS3        = "s3"
+	storageProviderAzureBlob = "azure_blob"
+)
+
+// Auth methods, grouped by the storage provider they belong to. The API rejects
+// an auth method that does not match the destination's provider.
 const (
 	authMethodAccessKeys = "access_keys"
 	authMethodIAMRole    = "iam_role"
+	authMethodAccountKey = "account_key"
+	authMethodSASToken   = "sas_token"
 )
 
 // Ensure the resource satisfies the framework interfaces it relies on.
@@ -66,6 +80,13 @@ type logExportResourceModel struct {
 }
 
 type destinationModel struct {
+	// Provider selects the storage backend. The attribute is named `provider`
+	// inside the `destination` object, which is legal: Terraform's reserved
+	// meta-argument names (provider, count, lifecycle, ...) only apply to
+	// root-level attributes, and the framework's schema validation enforces
+	// exactly that (see fwschema.IsReservedResourceAttributeName, which skips
+	// any path deeper than one step). newLogExportSchema runs that validation.
+	Provider        types.String `tfsdk:"provider"`
 	Endpoint        types.String `tfsdk:"endpoint"`
 	Region          types.String `tfsdk:"region"`
 	Bucket          types.String `tfsdk:"bucket"`
@@ -76,6 +97,8 @@ type destinationModel struct {
 	IAMRoleArn      types.String `tfsdk:"iam_role_arn"`
 	AccessKeyID     types.String `tfsdk:"access_key_id"`
 	SecretAccessKey types.String `tfsdk:"secret_access_key"`
+	AccountKey      types.String `tfsdk:"account_key"`
+	SASToken        types.String `tfsdk:"sas_token"`
 	ExternalID      types.String `tfsdk:"external_id"`
 	HasCredentials  types.Bool   `tfsdk:"has_credentials"`
 }
@@ -94,8 +117,9 @@ func (r *logExportResource) Metadata(_ context.Context, req resource.MetadataReq
 func (r *logExportResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "Manages a Barndoor organization's audit-log export: the customer-owned " +
-			"S3-compatible destination, delivery settings, and whether streaming is enabled. The export " +
-			"row itself is provisioned per organization by the platform; this resource configures it.",
+			"destination (an S3-compatible bucket or an Azure Blob Storage container), delivery settings, " +
+			"and whether streaming is enabled. The export row itself is provisioned per organization by " +
+			"the platform; this resource configures it.",
 		Attributes: map[string]schema.Attribute{
 			"organization_id": schema.StringAttribute{
 				MarkdownDescription: "Organization ID (Keycloak organization UUID) that owns the export. " +
@@ -126,9 +150,12 @@ func (r *logExportResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				Default:  booldefault.StaticBool(false),
 			},
 			"destination": schema.SingleNestedAttribute{
-				MarkdownDescription: "Customer-owned S3-compatible bucket that exported audit logs are " +
-					"written to. Identifier values must not have surrounding whitespace; omit optional " +
-					"fields rather than setting them to an empty string.",
+				MarkdownDescription: "Customer-owned bucket or container that exported audit logs are " +
+					"written to — an S3-compatible bucket (`provider = \"s3\"`, the default) or an Azure " +
+					"Blob Storage container (`provider = \"azure_blob\"`). The two providers accept " +
+					"disjoint attribute sets; the API rejects an attribute belonging to the other one. " +
+					"Identifier values must not have surrounding whitespace; omit optional fields rather " +
+					"than setting them to an empty string.",
 				Required:   true,
 				Attributes: destinationSchemaAttributes(),
 			},
@@ -144,68 +171,112 @@ func (r *logExportResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 
 func destinationSchemaAttributes() map[string]schema.Attribute {
 	return map[string]schema.Attribute{
+		"provider": schema.StringAttribute{
+			MarkdownDescription: "Storage provider backing the destination: `s3` (default — Amazon S3 or " +
+				"any S3-compatible store) or `azure_blob` (Azure Blob Storage). `azure_blob` requires the " +
+				"feature to be enabled for the organization; the API answers 403 with an explanatory " +
+				"message when it is not.",
+			Optional: true,
+			Computed: true,
+			Default:  stringdefault.StaticString(storageProviderS3),
+			Validators: []validator.String{
+				stringvalidator.OneOf(storageProviderS3, storageProviderAzureBlob),
+			},
+		},
 		"endpoint": schema.StringAttribute{
-			MarkdownDescription: "S3 endpoint URL, e.g. `https://s3.us-east-1.amazonaws.com` or an " +
-				"S3-compatible endpoint.",
+			MarkdownDescription: "Destination endpoint URL. For `provider = \"s3\"`, the S3 endpoint — " +
+				"e.g. `https://s3.us-east-1.amazonaws.com` — or an S3-compatible endpoint. For " +
+				"`provider = \"azure_blob\"`, the blob service **root** URL, e.g. " +
+				"`https://myaccount.blob.core.windows.net`: `https` is required and the URL must carry no " +
+				"path (a path-style emulator endpoint such as `http://127.0.0.1:10000/devstoreaccount1` " +
+				"is the one exception).",
 			Required: true,
 		},
 		"bucket": schema.StringAttribute{
-			MarkdownDescription: "Destination bucket name.",
-			Required:            true,
+			MarkdownDescription: "Destination bucket name — the **container** name when `provider` is " +
+				"`azure_blob`.",
+			Required: true,
 		},
 		"region": schema.StringAttribute{
-			MarkdownDescription: "Bucket region (e.g. `us-east-1`).",
-			Optional:            true,
+			MarkdownDescription: "Bucket region (e.g. `us-east-1`). S3 only; must be omitted when " +
+				"`provider` is `azure_blob`.",
+			Optional: true,
 		},
 		"path_prefix": schema.StringAttribute{
 			MarkdownDescription: "Optional key prefix that exported objects are written under.",
 			Optional:            true,
 		},
 		"use_ssl": schema.BoolAttribute{
-			MarkdownDescription: "Whether to connect to the endpoint over TLS. Defaults to `true`.",
-			Optional:            true,
-			Computed:            true,
-			Default:             booldefault.StaticBool(true),
+			MarkdownDescription: "Whether to connect to the endpoint over TLS. Defaults to `true`. S3 " +
+				"only; must be omitted when `provider` is `azure_blob`, where the scheme comes from " +
+				"`endpoint`.",
+			Optional: true,
+			Computed: true,
+			Default:  booldefault.StaticBool(true),
 		},
 		"use_path_style": schema.BoolAttribute{
 			MarkdownDescription: "Whether to use path-style bucket addressing (required by some " +
-				"S3-compatible stores). Defaults to `false`.",
+				"S3-compatible stores). Defaults to `false`. S3 only; must be omitted when `provider` " +
+				"is `azure_blob`.",
 			Optional: true,
 			Computed: true,
 			Default:  booldefault.StaticBool(false),
 		},
 		"auth_method": schema.StringAttribute{
-			MarkdownDescription: "How Barndoor authenticates to the bucket: `access_keys` (default) or " +
-				"`iam_role`. `iam_role` requires the feature to be enabled for the organization.",
+			MarkdownDescription: "How Barndoor authenticates to the destination. For `provider = \"s3\"`: " +
+				"`access_keys` (default) or `iam_role` — `iam_role` requires the feature to be enabled " +
+				"for the organization. For `provider = \"azure_blob\"`: `account_key` or `sas_token`, " +
+				"which is **required** (the `access_keys` default does not apply to Azure destinations).",
 			Optional: true,
 			Computed: true,
 			Default:  stringdefault.StaticString(authMethodAccessKeys),
+			Validators: []validator.String{
+				stringvalidator.OneOf(authMethodAccessKeys, authMethodIAMRole, authMethodAccountKey, authMethodSASToken),
+			},
 		},
 		"iam_role_arn": schema.StringAttribute{
 			MarkdownDescription: "ARN of the IAM role Barndoor assumes to write to the bucket. Required " +
-				"when `auth_method` is `iam_role`; must be omitted otherwise.",
+				"when `auth_method` is `iam_role`; must be omitted otherwise (including for every " +
+				"`azure_blob` destination).",
 			Optional: true,
 		},
 		"access_key_id": schema.StringAttribute{
 			MarkdownDescription: "Access key ID for the bucket. Required when `auth_method` is " +
-				"`access_keys`; must be omitted otherwise. Not returned by the API, so it is tracked " +
-				"only from configuration.",
+				"`access_keys`; must be omitted otherwise (including for every `azure_blob` " +
+				"destination). Not returned by the API, so it is tracked only from configuration.",
 			Optional: true,
 		},
 		"secret_access_key": schema.StringAttribute{
 			MarkdownDescription: "Secret access key for the bucket. Required when `auth_method` is " +
-				"`access_keys`; must be omitted otherwise. Never returned by the API.",
+				"`access_keys`; must be omitted otherwise (including for every `azure_blob` " +
+				"destination). Never returned by the API.",
+			Optional:  true,
+			Sensitive: true,
+		},
+		"account_key": schema.StringAttribute{
+			MarkdownDescription: "Azure storage account access key for the container's storage account. " +
+				"Required when `provider` is `azure_blob` and `auth_method` is `account_key`; must be " +
+				"omitted otherwise. Never returned by the API, so it is tracked only from configuration.",
+			Optional:  true,
+			Sensitive: true,
+		},
+		"sas_token": schema.StringAttribute{
+			MarkdownDescription: "Azure shared access signature (SAS) token granting write access to the " +
+				"container. Required when `provider` is `azure_blob` and `auth_method` is `sas_token`; " +
+				"must be omitted otherwise. A leading `?` is accepted and normalized away by the API. " +
+				"Never returned by the API, so it is tracked only from configuration.",
 			Optional:  true,
 			Sensitive: true,
 		},
 		"external_id": schema.StringAttribute{
 			MarkdownDescription: "Computed `sts:ExternalId` minted for the destination's IAM trust policy. " +
-				"Populated only when `auth_method` is `iam_role`.",
+				"Populated only for S3 destinations whose `auth_method` is `iam_role`; always null for " +
+				"`azure_blob`.",
 			Computed: true,
 		},
 		"has_credentials": schema.BoolAttribute{
-			MarkdownDescription: "Computed flag indicating whether the API has stored access-key " +
-				"credentials for this destination.",
+			MarkdownDescription: "Computed flag indicating whether the API has stored credentials for " +
+				"this destination.",
 			Computed: true,
 		},
 	}
@@ -297,11 +368,58 @@ func (r *logExportResource) ValidateConfig(ctx context.Context, req resource.Val
 	}
 }
 
+// validateDestinationConfig dispatches on the configured storage provider. The
+// two providers accept disjoint attribute sets, so each branch checks both that
+// its own required attributes are present and that none of the other provider's
+// attributes leaked in — mirroring the API, which rejects both mistakes.
 func validateDestinationConfig(d *destinationModel, diags *diag.Diagnostics) {
 	base := path.Root("destination")
 
+	if d.Provider.IsUnknown() {
+		// The provider decides which branch applies; nothing can be checked
+		// until it is known. The apply-time API response is the backstop.
+		return
+	}
+
+	switch provider := configuredStorageProvider(d.Provider); provider {
+	case storageProviderS3:
+		validateS3DestinationConfig(d, base, diags)
+	case storageProviderAzureBlob:
+		validateAzureDestinationConfig(d, base, diags)
+	default:
+		diags.AddAttributeError(base.AtName("provider"),
+			"Invalid provider",
+			fmt.Sprintf("`provider` must be %q or %q, got %q.", storageProviderS3, storageProviderAzureBlob, provider))
+	}
+}
+
+func validateS3DestinationConfig(d *destinationModel, base path.Path, diags *diag.Diagnostics) {
+	// Azure-only secrets never belong on an S3 destination; the API rejects them.
+	for _, f := range []struct {
+		name string
+		v    types.String
+	}{
+		{"account_key", d.AccountKey},
+		{"sas_token", d.SASToken},
+	} {
+		if isSetKnown(f.v) {
+			diags.AddAttributeError(base.AtName(f.name),
+				fmt.Sprintf("Unexpected %s", f.name),
+				fmt.Sprintf("`%s` is only valid when `provider` is %q.", f.name, storageProviderAzureBlob))
+		}
+	}
+
+	if d.AuthMethod.IsUnknown() {
+		// The auth method decides which credential shape applies, so nothing
+		// below can be checked until it resolves. Treating an unknown as the
+		// `access_keys` default would wrongly reject a valid configuration that
+		// sets auth_method from a variable and pairs it with iam_role_arn.
+		// Mirrors the deferral in validateAzureDestinationConfig.
+		return
+	}
+
 	authMethod := authMethodAccessKeys
-	if !d.AuthMethod.IsNull() && !d.AuthMethod.IsUnknown() {
+	if isSetKnown(d.AuthMethod) {
 		authMethod = d.AuthMethod.ValueString()
 	}
 
@@ -341,7 +459,88 @@ func validateDestinationConfig(d *destinationModel, diags *diag.Diagnostics) {
 	default:
 		diags.AddAttributeError(base.AtName("auth_method"),
 			"Invalid auth_method",
-			fmt.Sprintf("`auth_method` must be %q or %q, got %q.", authMethodAccessKeys, authMethodIAMRole, authMethod))
+			fmt.Sprintf("`auth_method` must be %q or %q when `provider` is %q, got %q.",
+				authMethodAccessKeys, authMethodIAMRole, storageProviderS3, authMethod))
+	}
+}
+
+// validateAzureDestinationConfig enforces the azure_blob contract. Note the
+// use of config nullness (not the planned value) for use_ssl and use_path_style:
+// both carry a schema Default, so by plan time they always hold a value. Only
+// the config can tell "the practitioner set this" from "the default filled it
+// in", and only the former is an error — Azure derives the scheme from
+// `endpoint` and the API rejects either flag outright.
+func validateAzureDestinationConfig(d *destinationModel, base path.Path, diags *diag.Diagnostics) {
+	for _, f := range []struct {
+		name string
+		v    types.String
+	}{
+		{"region", d.Region},
+		{"iam_role_arn", d.IAMRoleArn},
+		{"access_key_id", d.AccessKeyID},
+		{"secret_access_key", d.SecretAccessKey},
+	} {
+		if isSetKnown(f.v) {
+			diags.AddAttributeError(base.AtName(f.name),
+				fmt.Sprintf("Unexpected %s", f.name),
+				fmt.Sprintf("`%s` is an S3-only attribute and must not be set when `provider` is %q.",
+					f.name, storageProviderAzureBlob))
+		}
+	}
+	for _, f := range []struct {
+		name string
+		v    types.Bool
+	}{
+		{"use_ssl", d.UseSSL},
+		{"use_path_style", d.UsePathStyle},
+	} {
+		if isSetKnownBool(f.v) {
+			diags.AddAttributeError(base.AtName(f.name),
+				fmt.Sprintf("Unexpected %s", f.name),
+				fmt.Sprintf("`%s` is an S3-only attribute and must not be set when `provider` is %q; "+
+					"Azure Blob Storage takes its transport from the `endpoint` URL scheme. Remove the "+
+					"attribute (the provider does not send it for Azure destinations).",
+					f.name, storageProviderAzureBlob))
+		}
+	}
+
+	if d.AuthMethod.IsUnknown() {
+		return
+	}
+	if d.AuthMethod.IsNull() {
+		diags.AddAttributeError(base.AtName("auth_method"),
+			"Missing auth_method",
+			fmt.Sprintf("`auth_method` is required when `provider` is %q and must be %q or %q. The "+
+				"`access_keys` default only applies to S3 destinations.",
+				storageProviderAzureBlob, authMethodAccountKey, authMethodSASToken))
+		return
+	}
+
+	switch authMethod := d.AuthMethod.ValueString(); authMethod {
+	case authMethodAccountKey:
+		requireAzureSecret(base, "account_key", d.AccountKey, "sas_token", d.SASToken, authMethodAccountKey, diags)
+	case authMethodSASToken:
+		requireAzureSecret(base, "sas_token", d.SASToken, "account_key", d.AccountKey, authMethodSASToken, diags)
+	default:
+		diags.AddAttributeError(base.AtName("auth_method"),
+			"Invalid auth_method",
+			fmt.Sprintf("`auth_method` must be %q or %q when `provider` is %q, got %q.",
+				authMethodAccountKey, authMethodSASToken, storageProviderAzureBlob, authMethod))
+	}
+}
+
+// requireAzureSecret checks that exactly the secret matching the declared Azure
+// auth method is set: the wanted one present, the other one absent.
+func requireAzureSecret(base path.Path, wantName string, want types.String, otherName string, other types.String, authMethod string, diags *diag.Diagnostics) {
+	if isNullKnown(want) {
+		diags.AddAttributeError(base.AtName(wantName),
+			fmt.Sprintf("Missing %s", wantName),
+			fmt.Sprintf("`%s` is required when `auth_method` is `%s`.", wantName, authMethod))
+	}
+	if isSetKnown(other) {
+		diags.AddAttributeError(base.AtName(otherName),
+			fmt.Sprintf("Unexpected %s", otherName),
+			fmt.Sprintf("`%s` must not be set when `auth_method` is `%s`.", otherName, authMethod))
 	}
 }
 
@@ -364,6 +563,8 @@ func validateDestinationStrings(d *destinationModel, diags *diag.Diagnostics) {
 		{"iam_role_arn", d.IAMRoleArn},
 		{"access_key_id", d.AccessKeyID},
 		{"secret_access_key", d.SecretAccessKey},
+		{"account_key", d.AccountKey},
+		{"sas_token", d.SASToken},
 	}
 	for _, f := range fields {
 		if f.v.IsNull() || f.v.IsUnknown() {
@@ -711,8 +912,10 @@ func (r *logExportResource) saveErrorState(ctx context.Context, dst *tfsdk.State
 
 // --- request/response DTOs ---------------------------------------------------
 
-// configureDestinationRequest mirrors the SMS PUT .../destination body.
+// configureDestinationRequest mirrors the SMS PUT .../destination body for an
+// S3 destination.
 type configureDestinationRequest struct {
+	Provider        string `json:"provider"`
 	Endpoint        string `json:"endpoint"`
 	Region          string `json:"region"`
 	Bucket          string `json:"bucket"`
@@ -725,6 +928,26 @@ type configureDestinationRequest struct {
 	IAMRoleArn      string `json:"iam_role_arn,omitempty"`
 }
 
+// configureAzureDestinationRequest mirrors the SMS PUT .../destination body for
+// an azure_blob destination.
+//
+// This is a separate struct rather than a widened configureDestinationRequest
+// on purpose: the API rejects `region`, `use_ssl: true`, `use_path_style: true`,
+// `iam_role_arn`, `access_key_id`, and `secret_access_key` on an Azure
+// destination, and `use_ssl` carries a schema Default of true — so serializing
+// the shared struct would put `"use_ssl": true` on the wire and earn a 400 on
+// every apply. Keeping the Azure body a distinct type makes that impossible to
+// reintroduce by accident.
+type configureAzureDestinationRequest struct {
+	Provider   string `json:"provider"`
+	Endpoint   string `json:"endpoint"`
+	Bucket     string `json:"bucket"`
+	PathPrefix string `json:"path_prefix,omitempty"`
+	AuthMethod string `json:"auth_method"`
+	AccountKey string `json:"account_key,omitempty"`
+	SASToken   string `json:"sas_token,omitempty"`
+}
+
 // updateSettingsRequest mirrors the SMS PATCH .../settings body. Only the
 // fields this resource manages are sent; unset pointers are left untouched.
 type updateSettingsRequest struct {
@@ -734,8 +957,11 @@ type updateSettingsRequest struct {
 	IncludedEventTypes   *[]string `json:"included_event_types,omitempty"`
 }
 
-// destinationDTO mirrors the SMS state.ExportDestination JSON.
+// destinationDTO mirrors the SMS state.ExportDestination JSON. Fields the API
+// adds but this resource does not model (e.g. credentials_rotated_at, bumped
+// server-side on every credential write) are ignored by the decoder.
 type destinationDTO struct {
+	Provider       string `json:"provider,omitempty"`
 	Endpoint       string `json:"endpoint,omitempty"`
 	Region         string `json:"region,omitempty"`
 	Bucket         string `json:"bucket,omitempty"`
@@ -774,11 +1000,29 @@ type destinationResponse struct {
 	Destination    destinationDTO `json:"destination"`
 }
 
-// buildDestinationRequest converts the model to the PUT body. Access keys are
-// sent only for access_keys auth; the role ARN only for iam_role auth.
-func buildDestinationRequest(d *destinationModel) configureDestinationRequest {
+// buildDestinationRequest converts the model to the PUT body for its storage
+// provider. The two providers serialize to different types (see
+// configureAzureDestinationRequest) so an S3-only field can never ride along on
+// an Azure request.
+//
+// The secret is always sent. The API allows omitting it on a reconfigure that
+// keeps the same provider and auth method, but Terraform always holds it in
+// configuration, so sending it keeps the stored credential in step with config.
+// Each send bumps the API's credentials_rotated_at, which this resource does
+// not model.
+func buildDestinationRequest(d *destinationModel) any {
+	if configuredStorageProvider(d.Provider) == storageProviderAzureBlob {
+		return buildAzureDestinationRequest(d)
+	}
+	return buildS3DestinationRequest(d)
+}
+
+// buildS3DestinationRequest builds the S3 body. Access keys are sent only for
+// access_keys auth; the role ARN only for iam_role auth.
+func buildS3DestinationRequest(d *destinationModel) configureDestinationRequest {
 	authMethod := valueOr(d.AuthMethod, authMethodAccessKeys)
 	req := configureDestinationRequest{
+		Provider:     storageProviderS3,
 		Endpoint:     d.Endpoint.ValueString(),
 		Region:       d.Region.ValueString(),
 		Bucket:       d.Bucket.ValueString(),
@@ -792,6 +1036,25 @@ func buildDestinationRequest(d *destinationModel) configureDestinationRequest {
 	} else {
 		req.AccessKeyID = d.AccessKeyID.ValueString()
 		req.SecretAccessKey = d.SecretAccessKey.ValueString()
+	}
+	return req
+}
+
+// buildAzureDestinationRequest builds the azure_blob body: only the attributes
+// the API accepts for Azure, with the secret matching the declared auth method.
+func buildAzureDestinationRequest(d *destinationModel) configureAzureDestinationRequest {
+	authMethod := d.AuthMethod.ValueString()
+	req := configureAzureDestinationRequest{
+		Provider:   storageProviderAzureBlob,
+		Endpoint:   d.Endpoint.ValueString(),
+		Bucket:     d.Bucket.ValueString(),
+		PathPrefix: d.PathPrefix.ValueString(),
+		AuthMethod: authMethod,
+	}
+	if authMethod == authMethodSASToken {
+		req.SASToken = d.SASToken.ValueString()
+	} else {
+		req.AccountKey = d.AccountKey.ValueString()
 	}
 	return req
 }
@@ -820,9 +1083,10 @@ func buildSettingsRequest(ctx context.Context, s *settingsModel) (updateSettings
 }
 
 // mapServerToState overlays the server's view onto state. Config-only fields
-// (access_key_id, secret_access_key) are preserved from the prior model since
-// the API never returns them. included_event_types is left untouched when the
-// server reports none, so an empty-vs-null distinction in config is preserved.
+// (access_key_id, secret_access_key, account_key, sas_token) are preserved from
+// the prior model since the API never returns them. included_event_types is
+// left untouched when the server reports none, so an empty-vs-null distinction
+// in config is preserved.
 func mapServerToState(ctx context.Context, state *logExportResourceModel, orgID string, exp *exportResponse, dest *destinationResponse) error {
 	state.OrganizationID = types.StringValue(orgID)
 	state.ExportType = types.StringValue(valueOrString(exp.ExportType, valueOr(state.ExportType, defaultExportType)))
@@ -834,7 +1098,9 @@ func mapServerToState(ctx context.Context, state *logExportResourceModel, orgID 
 		state.Destination = nil
 	} else {
 		prev := state.Destination
+		provider := resolvedStorageProvider(d.Provider)
 		next := &destinationModel{
+			Provider:       types.StringValue(provider),
 			Endpoint:       types.StringValue(d.Endpoint),
 			Region:         stringOrNull(d.Region),
 			Bucket:         types.StringValue(d.Bucket),
@@ -848,10 +1114,17 @@ func mapServerToState(ctx context.Context, state *logExportResourceModel, orgID 
 			// Carried from config/prior state — never returned by the API.
 			AccessKeyID:     types.StringNull(),
 			SecretAccessKey: types.StringNull(),
+			AccountKey:      types.StringNull(),
+			SASToken:        types.StringNull(),
+		}
+		if provider == storageProviderAzureBlob {
+			applyAzureDestinationDefaults(next, prev, d)
 		}
 		if prev != nil {
 			next.AccessKeyID = prev.AccessKeyID
 			next.SecretAccessKey = prev.SecretAccessKey
+			next.AccountKey = prev.AccountKey
+			next.SASToken = prev.SASToken
 		}
 		state.Destination = next
 	}
@@ -876,13 +1149,60 @@ func mapServerToState(ctx context.Context, state *logExportResourceModel, orgID 
 	return nil
 }
 
+// applyAzureDestinationDefaults keeps an azure_blob destination's S3-only
+// attributes on the values Terraform planned, instead of the empty values the
+// API echoes back for them.
+//
+// This is what makes a re-plan of an Azure destination empty. An Azure row
+// carries no region, transport flags, or role ARN, so the API returns
+// region="", use_ssl=false, use_path_style=false, iam_role_arn="". Two of those
+// contradict the schema: use_ssl defaults to true, so mapping the server's false
+// onto state produces "provider produced an inconsistent result" right after
+// apply, and a permanent `use_ssl: false -> true` diff on every plan after
+// that. The values are not server-owned for Azure, so the plan/prior-state
+// values are the authoritative ones and are simply kept.
+//
+// With no prior model (import), each field settles on its schema default, which
+// is also what a config that omits them plans to.
+func applyAzureDestinationDefaults(next, prev *destinationModel, d destinationDTO) {
+	next.Region = types.StringNull()
+	next.IAMRoleArn = types.StringNull()
+	next.ExternalID = types.StringNull()
+	next.UseSSL = types.BoolValue(true)        // schema Default
+	next.UsePathStyle = types.BoolValue(false) // schema Default
+	if d.AuthMethod == "" {
+		// resolvedAuthMethod would have fallen back to the S3 default; for
+		// Azure there is no default, so keep what was planned.
+		next.AuthMethod = types.StringNull()
+	}
+	if prev == nil {
+		return
+	}
+	if !prev.Region.IsUnknown() {
+		next.Region = prev.Region
+	}
+	if !prev.IAMRoleArn.IsUnknown() {
+		next.IAMRoleArn = prev.IAMRoleArn
+	}
+	if isSetKnownBool(prev.UseSSL) {
+		next.UseSSL = prev.UseSSL
+	}
+	if isSetKnownBool(prev.UsePathStyle) {
+		next.UsePathStyle = prev.UsePathStyle
+	}
+	if d.AuthMethod == "" && !prev.AuthMethod.IsUnknown() {
+		next.AuthMethod = prev.AuthMethod
+	}
+}
+
 // --- model comparison --------------------------------------------------------
 
 func destinationEqual(a, b *destinationModel) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
 	}
-	return a.Endpoint.Equal(b.Endpoint) &&
+	return a.Provider.Equal(b.Provider) &&
+		a.Endpoint.Equal(b.Endpoint) &&
 		a.Region.Equal(b.Region) &&
 		a.Bucket.Equal(b.Bucket) &&
 		a.PathPrefix.Equal(b.PathPrefix) &&
@@ -891,7 +1211,9 @@ func destinationEqual(a, b *destinationModel) bool {
 		a.AuthMethod.Equal(b.AuthMethod) &&
 		a.IAMRoleArn.Equal(b.IAMRoleArn) &&
 		a.AccessKeyID.Equal(b.AccessKeyID) &&
-		a.SecretAccessKey.Equal(b.SecretAccessKey)
+		a.SecretAccessKey.Equal(b.SecretAccessKey) &&
+		a.AccountKey.Equal(b.AccountKey) &&
+		a.SASToken.Equal(b.SASToken)
 }
 
 func settingsEqual(a, b *settingsModel) bool {
@@ -923,7 +1245,12 @@ func nullifyUnknownComputed(m *logExportResourceModel) {
 		nullUnknownString(&d.IAMRoleArn)
 		nullUnknownString(&d.AccessKeyID)
 		nullUnknownString(&d.SecretAccessKey)
+		nullUnknownString(&d.AccountKey)
+		nullUnknownString(&d.SASToken)
 		nullUnknownString(&d.ExternalID)
+		if d.Provider.IsUnknown() {
+			d.Provider = types.StringValue(storageProviderS3)
+		}
 		if d.UseSSL.IsUnknown() {
 			d.UseSSL = types.BoolValue(true)
 		}
@@ -978,6 +1305,23 @@ func resolvedAuthMethod(s string) string {
 	return s
 }
 
+// resolvedStorageProvider maps a server-reported provider onto the schema's
+// value. The API omits the field on destinations configured before it existed,
+// and those are all S3.
+func resolvedStorageProvider(s string) string {
+	if s == "" {
+		return storageProviderS3
+	}
+	return s
+}
+
+// configuredStorageProvider reads the provider out of a config or plan value,
+// falling back to the schema default for a null/unknown/empty value (config
+// nulls are what ValidateConfig sees for an omitted attribute).
+func configuredStorageProvider(v types.String) string {
+	return valueOr(v, storageProviderS3)
+}
+
 func knownInt64(v types.Int64) (int64, bool) {
 	if v.IsNull() || v.IsUnknown() {
 		return 0, false
@@ -985,8 +1329,9 @@ func knownInt64(v types.Int64) (int64, bool) {
 	return v.ValueInt64(), true
 }
 
-func isNullKnown(v types.String) bool { return v.IsNull() && !v.IsUnknown() }
-func isSetKnown(v types.String) bool  { return !v.IsNull() && !v.IsUnknown() }
+func isNullKnown(v types.String) bool  { return v.IsNull() && !v.IsUnknown() }
+func isSetKnown(v types.String) bool   { return !v.IsNull() && !v.IsUnknown() }
+func isSetKnownBool(v types.Bool) bool { return !v.IsNull() && !v.IsUnknown() }
 func nullUnknownString(v *types.String) {
 	if v.IsUnknown() {
 		*v = types.StringNull()
