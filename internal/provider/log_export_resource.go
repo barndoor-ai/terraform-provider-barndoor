@@ -409,6 +409,15 @@ func validateS3DestinationConfig(d *destinationModel, base path.Path, diags *dia
 		}
 	}
 
+	if d.AuthMethod.IsUnknown() {
+		// The auth method decides which credential shape applies, so nothing
+		// below can be checked until it resolves. Treating an unknown as the
+		// `access_keys` default would wrongly reject a valid configuration that
+		// sets auth_method from a variable and pairs it with iam_role_arn.
+		// Mirrors the deferral in validateAzureDestinationConfig.
+		return
+	}
+
 	authMethod := authMethodAccessKeys
 	if isSetKnown(d.AuthMethod) {
 		authMethod = d.AuthMethod.ValueString()

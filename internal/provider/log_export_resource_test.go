@@ -572,6 +572,27 @@ func TestValidateDestinationConfig(t *testing.T) {
 			}),
 			wantError: true,
 		},
+		"s3 with an unknown auth_method is deferred, not rejected": {
+			// auth_method comes from an unresolved expression and is paired with
+			// iam_role_arn. Folding the unknown into the `access_keys` default
+			// would reject this at validate time even though it is a valid
+			// iam_role configuration once the variable resolves.
+			dest: withProvider(s3ConfigModel(), storageProviderS3, func(d *destinationModel) {
+				d.AuthMethod = types.StringUnknown()
+				d.IAMRoleArn = types.StringValue("arn:aws:iam::123:role/x")
+				d.AccessKeyID = types.StringNull()
+				d.SecretAccessKey = types.StringNull()
+			}),
+		},
+		"s3 with an unknown auth_method still rejects an azure secret": {
+			// The provider-level checks run before the auth_method deferral, so
+			// a cross-provider attribute is still caught.
+			dest: withProvider(s3ConfigModel(), storageProviderS3, func(d *destinationModel) {
+				d.AuthMethod = types.StringUnknown()
+				d.AccountKey = types.StringValue("azure-account-key")
+			}),
+			wantError: true,
+		},
 		"unknown provider is deferred, not rejected": {
 			// provider comes from an unresolved expression: neither branch can be
 			// checked yet, and erroring here would fail a legitimate plan.
