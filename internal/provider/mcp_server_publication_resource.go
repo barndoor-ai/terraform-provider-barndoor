@@ -61,8 +61,13 @@ func (r *mcpServerPublicationResource) Schema(_ context.Context, _ resource.Sche
 		MarkdownDescription: "Publishes an MCP server, making it discoverable to end users. Publishing is " +
 			"**one-way and deliberate**: there is no unpublish, and later operational-state changes never " +
 			"hide a published server (taking a server out of service means deactivating its policies).\n\n" +
-			"The platform refuses to publish a server without an ACTIVE policy, so order this resource " +
-			"after the server's policies with `depends_on` (see the example).\n\n" +
+			"Publishing has two preconditions, and the platform refuses with a 422 until both hold. " +
+			"First, the server must be **operationally available**: supplying credentials at create " +
+			"activates it, whereas a server created without them stays `pending` and cannot be published " +
+			"until someone connects it (servers from `embedded`/`local` directory entries need no " +
+			"credentials). Second, it must have at least one **ACTIVE policy** — and since policies " +
+			"reference the server's id, order this resource after them with `depends_on` (see the " +
+			"example).\n\n" +
 			"**Removing this resource from configuration does NOT unpublish the server** — unpublishing " +
 			"does not exist. `terraform destroy` simply stops tracking the publication; the server stays " +
 			"published and is untouched (its connections and credentials are never affected by this " +
@@ -237,6 +242,20 @@ func addPublishAPIError(diags *diag.Diagnostics, serverID string, err error) {
 				"servers), so there is nothing to publish.", serverID),
 		)
 	case http.StatusUnprocessableEntity:
+		// 422 covers two unrelated things: the publish preconditions (a string
+		// `detail`) and FastAPI request validation, e.g. an mcp_server_id that
+		// is not a UUID (a `detail` ARRAY, which displayBody cannot reduce to a
+		// message). Only claim the precondition story for the former —
+		// otherwise a malformed id is reported as a missing ACTIVE policy.
+		if !apiErr.hasMessage() {
+			diags.AddError(
+				"MCP server publish request rejected",
+				fmt.Sprintf("The registry rejected the publish request for server %s as invalid. Check "+
+					"that mcp_server_id is a well-formed server id.\n\nServer response: %s",
+					serverID, apiErr.displayBody()),
+			)
+			return
+		}
 		// The API distinguishes "not operationally available" from "no ACTIVE
 		// policy"; surface its message and the fix for each.
 		diags.AddError(
@@ -247,11 +266,17 @@ func addPublishAPIError(diags *diag.Diagnostics, serverID string, err error) {
 				"`depends_on = [barndoor_policy.<name>]`.", serverID, apiErr.displayBody()),
 		)
 	case http.StatusForbidden:
+		// The admin authorization check on the server runs BEFORE the
+		// ACTIVE-policy verification, and both require the same admin role —
+		// so in practice this is "the credential is not an org admin", with an
+		// opaque "Forbidden" body. Don't attribute it to a policy check the
+		// caller almost certainly never reached.
 		diags.AddError(
 			"Permission denied by the registry API",
 			fmt.Sprintf("Failed to publish server %s: the configured credential is not authorized to "+
-				"verify the server's ACTIVE policies. Confirm the service-account credential carries the "+
-				"organization admin role.\n\nServer message: %s", serverID, apiErr.displayBody()),
+				"publish it. Confirm the service-account credential carries the organization admin "+
+				"role — publishing needs it both to modify the server and to verify its ACTIVE "+
+				"policies.\n\nServer message: %s", serverID, apiErr.displayBody()),
 		)
 	case http.StatusServiceUnavailable:
 		diags.AddError(

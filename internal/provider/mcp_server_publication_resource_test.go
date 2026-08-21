@@ -90,7 +90,7 @@ func TestMcpServerPublicationResource_lifecycle(t *testing.T) {
 				// read before the publication applies within this step.)
 				Config: activeServerConfig(publicationBlock),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAt),
+					resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAtFor(1)),
 					resource.TestCheckResourceAttrPair(pubName, "mcp_server_id", serverName, "id"),
 				),
 			},
@@ -103,8 +103,8 @@ data "barndoor_mcp_server" "test" {
 }
 `),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(serverName, "published_at", fakePublishedAt),
-					resource.TestCheckResourceAttr("data.barndoor_mcp_server.test", "published_at", fakePublishedAt),
+					resource.TestCheckResourceAttr(serverName, "published_at", fakePublishedAtFor(1)),
+					resource.TestCheckResourceAttr("data.barndoor_mcp_server.test", "published_at", fakePublishedAtFor(1)),
 				),
 			},
 			{
@@ -122,7 +122,7 @@ data "barndoor_mcp_server" "test" {
 				// must never delete it, which would tear down its connections.
 				Config: activeServerConfig(""),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(serverName, "published_at", fakePublishedAt),
+					resource.TestCheckResourceAttr(serverName, "published_at", fakePublishedAtFor(1)),
 					func(*terraform.State) error {
 						if fake.serverPublishedAt(t, serverID) == nil {
 							return fmt.Errorf("destroying the publication unpublished server %s", serverID)
@@ -136,10 +136,13 @@ data "barndoor_mcp_server" "test" {
 			},
 			{
 				// Re-adding the declaration adopts the existing publication
-				// (idempotent re-publish), keeping the original stamp.
+				// (idempotent re-publish), keeping the ORIGINAL stamp. Stamps
+				// are per-publish, so a second publish would read
+				// fakePublishedAtFor(2) — this assertion fails if the API call
+				// is not idempotent.
 				Config: activeServerConfig(publicationBlock),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAt),
+					resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAtFor(1)),
 				),
 			},
 		},
@@ -226,7 +229,7 @@ resource "barndoor_mcp_server_publication" "test" {
 			},
 			{
 				Config: twoServers + pubFor("a"),
-				Check:  resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAt),
+				Check:  resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAtFor(1)),
 			},
 			{
 				// Repointing must replace, which publishes server B. If this
@@ -235,6 +238,10 @@ resource "barndoor_mcp_server_publication" "test" {
 				Config: twoServers + pubFor("b"),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrPair(pubName, "mcp_server_id", "barndoor_mcp_server.b", "id"),
+					// B's own stamp (the 2nd publish), not A's carried forward:
+					// this is what fails if the replacement never called
+					// /publish for B and merely copied prior state.
+					resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAtFor(2)),
 					func(*terraform.State) error {
 						if fake.serverPublishedAt(t, idB) == nil {
 							return fmt.Errorf("repointing did not publish server B (%s)", idB)
@@ -272,7 +279,7 @@ func TestMcpServerPublicationResource_unpublishedOutOfBandRepublishes(t *testing
 			},
 			{
 				Config: activeServerConfig(publicationBlock),
-				Check:  resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAt),
+				Check:  resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAtFor(1)),
 			},
 			{
 				// The row reads back unpublished (replaced/restored
@@ -283,10 +290,11 @@ func TestMcpServerPublicationResource_unpublishedOutOfBandRepublishes(t *testing
 				Check:              checkResourceAbsent(pubName),
 			},
 			{
-				// …and the next apply republishes it.
+				// …and the next apply republishes it. A genuinely new publish,
+				// so the stamp is the 2nd one — not the dropped state's.
 				Config: activeServerConfig(publicationBlock),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAt),
+					resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAtFor(2)),
 					func(*terraform.State) error {
 						if fake.serverPublishedAt(t, serverID) == nil {
 							return fmt.Errorf("server %s was not republished", serverID)

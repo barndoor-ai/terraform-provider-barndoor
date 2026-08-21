@@ -4,7 +4,7 @@ page_title: "barndoor_mcp_server_publication Resource - Barndoor"
 subcategory: ""
 description: |-
   Publishes an MCP server, making it discoverable to end users. Publishing is one-way and deliberate: there is no unpublish, and later operational-state changes never hide a published server (taking a server out of service means deactivating its policies).
-  The platform refuses to publish a server without an ACTIVE policy, so order this resource after the server's policies with depends_on (see the example).
+  Publishing has two preconditions, and the platform refuses with a 422 until both hold. First, the server must be operationally available: supplying credentials at create activates it, whereas a server created without them stays pending and cannot be published until someone connects it (servers from embedded/local directory entries need no credentials). Second, it must have at least one ACTIVE policy — and since policies reference the server's id, order this resource after them with depends_on (see the example).
   Removing this resource from configuration does NOT unpublish the server — unpublishing does not exist. terraform destroy simply stops tracking the publication; the server stays published and is untouched (its connections and credentials are never affected by this resource). Publishing an already-published server is an idempotent no-op, so re-creating the declaration later is always safe.
 ---
 
@@ -12,7 +12,7 @@ description: |-
 
 Publishes an MCP server, making it discoverable to end users. Publishing is **one-way and deliberate**: there is no unpublish, and later operational-state changes never hide a published server (taking a server out of service means deactivating its policies).
 
-The platform refuses to publish a server without an ACTIVE policy, so order this resource after the server's policies with `depends_on` (see the example).
+Publishing has two preconditions, and the platform refuses with a 422 until both hold. First, the server must be **operationally available**: supplying credentials at create activates it, whereas a server created without them stays `pending` and cannot be published until someone connects it (servers from `embedded`/`local` directory entries need no credentials). Second, it must have at least one **ACTIVE policy** — and since policies reference the server's id, order this resource after them with `depends_on` (see the example).
 
 **Removing this resource from configuration does NOT unpublish the server** — unpublishing does not exist. `terraform destroy` simply stops tracking the publication; the server stays published and is untouched (its connections and credentials are never affected by this resource). Publishing an already-published server is an idempotent no-op, so re-creating the declaration later is always safe.
 
@@ -20,15 +20,30 @@ The platform refuses to publish a server without an ACTIVE policy, so order this
 
 ```terraform
 # Publishing is a deliberate, one-way step: the server exists and is
-# configurable before it, but end users only discover it after it. The
-# platform refuses to publish a server without an ACTIVE policy, and policies
-# reference the server's id — so the publication is its own resource, ordered
-# after the policies with depends_on.
+# configurable before it, but end users only discover it after it.
+#
+# There are two preconditions, and the publish fails with a 422 until both
+# hold:
+#
+#   1. The server is operationally available. Supplying credentials at create
+#      (as below) activates it immediately; a server created without them
+#      stays `pending` until someone connects it, and cannot be published.
+#      Servers from `embedded`/`local` directory entries need no credentials.
+#   2. It has at least one ACTIVE policy. Policies reference the server's id,
+#      so they necessarily come after it — which is why publishing is its own
+#      resource, ordered after the policies with depends_on, rather than a
+#      flag on the server.
 resource "barndoor_mcp_server" "github" {
   name                    = "GitHub"
   mcp_server_directory_id = "11111111-1111-1111-1111-111111111111"
+
+  # Precondition 1: credentials activate the server, making it operationally
+  # available and therefore publishable.
+  client_id     = var.github_oauth_client_id
+  client_secret = var.github_oauth_client_secret
 }
 
+# Precondition 2.
 resource "barndoor_policy" "github" {
   name          = "github-default-access"
   mcp_server_id = barndoor_mcp_server.github.id
@@ -45,6 +60,15 @@ resource "barndoor_policy" "github" {
 resource "barndoor_mcp_server_publication" "github" {
   mcp_server_id = barndoor_mcp_server.github.id
   depends_on    = [barndoor_policy.github] # publishing needs an ACTIVE policy
+}
+
+variable "github_oauth_client_id" {
+  type = string
+}
+
+variable "github_oauth_client_secret" {
+  type      = string
+  sensitive = true
 }
 ```
 

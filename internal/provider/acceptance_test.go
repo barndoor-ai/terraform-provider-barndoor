@@ -60,7 +60,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -112,12 +111,20 @@ const (
 
 	// envTestPublishableMCPServerDirectoryID opts in to the
 	// barndoor_mcp_server_publication acceptance test by naming a directory
-	// entry whose fresh servers become operationally available WITHOUT an
-	// OAuth connection (publishing requires operational availability, and a
-	// server instantiated from an ordinary OAuth directory entry stays
-	// `pending` until someone connects it out-of-band). The test only touches
-	// servers and policies it creates itself; publishing is one-way, but the
-	// published server is soft-deleted on destroy, so runs are self-cleaning.
+	// entry with **`source = embedded` or `source = local`**.
+	//
+	// That is the only kind that works, and `requires_auth = false` is NOT
+	// sufficient. Publishing requires operational availability, which is
+	// `status = "active"` AND manageable-policies; registry sets a fresh
+	// server `active` at create only for embedded/local source, managed
+	// credentials, or a supplied client_id. This test supplies no
+	// credentials, so any other entry — a `requires_auth = false` remote one
+	// included — is created `pending` and the publish returns 422 "not
+	// operationally available".
+	//
+	// The test only touches servers and policies it creates itself;
+	// publishing is one-way, but the published server is soft-deleted on
+	// destroy, so runs are self-cleaning.
 	envTestPublishableMCPServerDirectoryID = "BARNDOOR_TEST_PUBLISHABLE_MCP_SERVER_DIRECTORY_ID"
 )
 
@@ -661,21 +668,21 @@ data "barndoor_agent" "by_id" {
 }
 
 // TestAccMcpServerPublication_lifecycle exercises publish end to end against a
-// real environment: an unpublished server is absent from the published listing,
-// publishing (ordered after an ACTIVE policy via depends_on, exactly like the
-// documented flow) makes it appear there, and removing the publication from
-// configuration does not unpublish it. Destroy soft-deletes the server, which
-// removes it from listings, so runs are self-cleaning despite publish being
-// one-way.
+// real environment: the server's listing row starts unpublished, publishing
+// (ordered after an ACTIVE policy via depends_on, exactly like the documented
+// flow) stamps it, and removing the publication from configuration does not
+// unpublish it. Destroy soft-deletes the server, which removes it from
+// listings, so runs are self-cleaning despite publish being one-way.
 //
-// Discoverability limitation: end users see published servers through the
-// audience-scoped listing (`audience_scoped=true`), which resolves the CALLER's
-// per-user allow rules — the provider's machine credential has no user record,
-// so sending that filter would always return nothing and it must never be used
-// here. The closest published-state listing this credential can read is
-// `availability_status=true` (published servers, no audience filter); it is
-// what these checks assert. Per-user audience resolution is covered by the
-// platform's own e2e suite.
+// What this does and does not prove. The checks read the registry listing —
+// the endpoint end users' discovery goes through — and assert `published_at`
+// on the server's row (see accCheckServerPublishedInListing for why the
+// `availability_status` filter cannot carry this assertion). What they do NOT
+// cover is per-user audience resolution: end users see published servers
+// through `audience_scoped=true`, which resolves the CALLER's own allow rules,
+// and the provider's machine credential has no user record — sending that
+// filter would always return an empty page, so it must never be used here.
+// Audience resolution is covered by the platform's own e2e suite.
 func TestAccMcpServerPublication_lifecycle(t *testing.T) {
 	if os.Getenv("TF_ACC") == "" {
 		t.Skip("TF_ACC not set; skipping acceptance test")
@@ -686,9 +693,10 @@ func TestAccMcpServerPublication_lifecycle(t *testing.T) {
 	if directoryID == "" {
 		t.Skipf("PUBLISH COVERAGE ABSENT: %s is not set, so nothing verifies that publishing makes a "+
 			"server discoverable. This is not a passing test — it is no test. Set the variable (as a `dev` "+
-			"environment Actions variable for the nightly workflow) to a directory entry whose servers are "+
-			"operationally available WITHOUT an OAuth connection; publishing requires operational "+
-			"availability, and a server from an ordinary OAuth entry stays `pending`.",
+			"environment Actions variable for the nightly workflow) to the id of a directory entry with "+
+			"`source = embedded` or `source = local`. Those are the only entries whose servers are created "+
+			"`active` without credentials, and publishing requires that; `requires_auth = false` alone is "+
+			"not enough — such a server is created `pending` and the publish 422s.",
 			envTestPublishableMCPServerDirectoryID)
 	}
 
@@ -728,23 +736,23 @@ resource "barndoor_mcp_server_publication" "test" {
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
-				// Unpublished: published_at is null and the server must NOT be
-				// discoverable through the published listing.
+				// Unpublished: published_at is null on the resource and on the
+				// server's listing row.
 				Config: serverAndPolicy,
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckNoResourceAttr(serverName, "published_at"),
-					accCheckServerInPublishedListing(accClient, serverName, false),
+					accCheckServerPublishedInListing(accClient, serverName, false),
 				),
 			},
 			{
-				// Publish: the stamp appears on the publication and the server
-				// becomes discoverable through the published listing. (The
-				// server resource reflects published_at from its next refresh
-				// — asserted in the final step.)
+				// Publish: the stamp appears on the publication and on the
+				// server's listing row. (The server resource reflects
+				// published_at from its next refresh — asserted in the final
+				// step.)
 				Config: serverAndPolicy + publication,
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrSet(pubName, "published_at"),
-					accCheckServerInPublishedListing(accClient, serverName, true),
+					accCheckServerPublishedInListing(accClient, serverName, true),
 				),
 			},
 			{
@@ -757,12 +765,12 @@ resource "barndoor_mcp_server_publication" "test" {
 				ImportStateVerifyIdentifierAttribute: "mcp_server_id",
 			},
 			{
-				// Removing the publication must not unpublish, must not touch
-				// the server, and the server stays discoverable.
+				// Removing the publication must not unpublish and must not
+				// touch the server: its listing row stays stamped.
 				Config: serverAndPolicy,
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttrSet(serverName, "published_at"),
-					accCheckServerInPublishedListing(accClient, serverName, true),
+					accCheckServerPublishedInListing(accClient, serverName, true),
 				),
 			},
 		},
@@ -781,11 +789,22 @@ func accServerIDFromState(serverName string) func(*terraform.State) (string, err
 	}
 }
 
-// accCheckServerInPublishedListing asserts (via a direct API read with the
-// test credential — no audience filter, see the test comment) whether the
-// server appears in the published listing (`availability_status=true`). The
-// client is shared across checks so each one does not mint a fresh token.
-func accCheckServerInPublishedListing(c *client.Client, serverName string, want bool) resource.TestCheckFunc {
+// accCheckServerPublishedInListing asserts, via a direct API read with the
+// test credential, whether the server's row in the registry listing carries a
+// published_at stamp. The client is shared across checks so each one does not
+// mint a fresh token.
+//
+// Deliberately NOT filtered with `availability_status=true`. That filter's
+// meaning is switched by the `mcp-server-publishing` org feature flag and
+// fails closed to operational availability (registry's
+// `availability_filter_expr`), so an assertion built on it is unsound in both
+// directions with the flag off: an unpublished embedded/local server — exactly
+// what this test requires — is operationally available the moment it is
+// created and so reads as "published", while a genuinely published server
+// would satisfy the filter even if the publish endpoint were never called.
+// `published_at` on the row is the signal that filter keys on when the flag is
+// on, and it needs no flag.
+func accCheckServerPublishedInListing(c *client.Client, serverName string, want bool) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
 		rs, ok := s.RootModule().Resources[serverName]
 		if !ok {
@@ -794,17 +813,22 @@ func accCheckServerInPublishedListing(c *client.Client, serverName string, want 
 		serverID := rs.Primary.ID
 
 		matches, err := searchRegistry(context.Background(), c, registryAPIPrefix+"/servers",
-			url.Values{"availability_status": []string{"true"}},
-			func(row mcpServerListRow) bool { return row.ID == serverID })
+			nil, func(row mcpServerListRow) bool { return row.ID == serverID })
 		if err != nil {
-			return fmt.Errorf("published listing read failed: %w", err)
+			return fmt.Errorf("server listing read failed: %w", err)
+		}
+		if len(matches) == 0 {
+			return fmt.Errorf("server %s is absent from the registry listing entirely", serverID)
 		}
 
-		if got := len(matches) > 0; got != want {
+		published := matches[0].PublishedAt
+		if got := published != nil; got != want {
 			if want {
-				return fmt.Errorf("published server %s is not discoverable in the published listing", serverID)
+				return fmt.Errorf("published server %s reads back unpublished in the listing "+
+					"(published_at is null)", serverID)
 			}
-			return fmt.Errorf("unpublished server %s is discoverable in the published listing", serverID)
+			return fmt.Errorf("unpublished server %s reads back published in the listing "+
+				"(published_at = %s)", serverID, *published)
 		}
 		return nil
 	}

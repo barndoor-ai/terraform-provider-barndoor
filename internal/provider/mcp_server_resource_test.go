@@ -58,6 +58,10 @@ type fakeRegistryServer struct {
 	nextID  int
 	servers map[string]*fakeMcpServer
 
+	// publishes counts state-changing publishes, so each one gets its own
+	// timestamp (see fakePublishedAtFor).
+	publishes int
+
 	// agents backs the /agents endpoints; see agent_resource_test.go.
 	nextAgentID int
 	agents      map[string]*fakeAgent
@@ -279,13 +283,30 @@ func (f *fakeRegistryServer) updateServer(w http.ResponseWriter, r *http.Request
 	_ = json.NewEncoder(w).Encode(s)
 }
 
-// fakePublishedAt is the deterministic stamp the fake's publish endpoint sets.
-const fakePublishedAt = "2026-08-19T00:00:00Z"
+// fakePublishedAtFor is the deterministic stamp the fake's publish endpoint
+// sets on the nth state-changing publish (n is 1-based). Per-publish rather
+// than one shared constant so a state assertion can tell "republished THIS
+// server" from "carried an earlier stamp forward" — the distinction
+// TestMcpServerPublicationResource_repointForcesReplace and
+// _unpublishedOutOfBandRepublishes turn on.
+func fakePublishedAtFor(n int) string {
+	return fmt.Sprintf("2026-08-19T00:00:%02dZ", n)
+}
 
 // publishServer emulates POST /servers/{id}/publish: one-way, idempotent, and
 // gated (in production order) on operational availability then an ACTIVE
 // policy. Re-publishing an already-published server is a no-op success that
 // skips the gates, like production.
+//
+// The operational-availability gate here is deliberately LOOSER than
+// production, which requires status=active AND (requires_auth=false OR source
+// in {embedded,local} OR a connected tenant service-account connection). The
+// fake has no directory-entry model to express that second term, so a server
+// activated by a client_id publishes cleanly here while an ordinary OAuth
+// server would 422 in production. Keep that in mind before reading a green
+// unit run as "this config applies against a real environment" — it is why
+// the documented example and the acceptance-test setup both need explicit
+// credentials or an embedded/local directory entry.
 func (f *fakeRegistryServer) publishServer(w http.ResponseWriter, id string) {
 	s, ok := f.servers[id]
 	if !ok || s.deleted {
@@ -301,7 +322,8 @@ func (f *fakeRegistryServer) publishServer(w http.ResponseWriter, id string) {
 			writeJSONError(w, http.StatusUnprocessableEntity, "Cannot publish: server has no ACTIVE policy")
 			return
 		}
-		ts := fakePublishedAt
+		f.publishes++
+		ts := fakePublishedAtFor(f.publishes)
 		s.PublishedAt = &ts
 	}
 	_ = json.NewEncoder(w).Encode(s)
