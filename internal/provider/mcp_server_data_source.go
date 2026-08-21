@@ -274,9 +274,13 @@ func (d *mcpServerDataSource) resolveServerIDByName(ctx context.Context, name st
 // mcpServerListRow is the subset of the registry list-row shape the by-name
 // lookup needs.
 type mcpServerListRow struct {
-	ID        string  `json:"id"`
-	Name      string  `json:"name"`
-	DeletedAt *string `json:"deleted_at"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// PublishedAt is the flag-independent publish signal on a list row: the
+	// `availability_status` filter's meaning is switched by an org feature
+	// flag, this field is not. Used by the publication acceptance test.
+	PublishedAt *string `json:"published_at"`
+	DeletedAt   *string `json:"deleted_at"`
 }
 
 // describeMcpServerLookup renders the configured lookup key for an error

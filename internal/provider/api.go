@@ -119,6 +119,14 @@ func (e *apiError) displayBody() string {
 	return truncate(body, maxErrorBodyLen)
 }
 
+// hasMessage reports whether the body yielded a conventional string message.
+// False means the caller is looking at a raw/structured body — notably a
+// FastAPI request-validation error, whose `detail` is an array rather than a
+// string — so a diagnostic must not narrate it as a domain error message.
+func (e *apiError) hasMessage() bool {
+	return jsonErrorMessage(strings.TrimSpace(e.body)) != ""
+}
+
 // jsonErrorMessage extracts a human-readable message from a JSON error body of
 // the form {"message": "..."}, {"error": "..."}, or {"detail": "..."}. It
 // returns "" when the body is not a JSON object or carries none of those keys
