@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+FEATURES:
+
+* **New Data Source:** `barndoor_mcp_server_connections` — lists who in the organization currently holds a connection to an MCP server: the org-admin inverse of the per-user connection view, for answering "who do we need to tell" when a connector is retired or replaced. Reads current connection state, so a member who already migrated and disconnected is absent — unlike audit logs, which show who *used* a connector inside a retention window. Every owner class is returned by default (people, AI agents, and the tenant service account); `owner` and `status` narrow it, and both are validated at plan time — `status = ["available"]` is rejected rather than silently matching nothing, since the platform computes that value per-caller and never stores it. The whole roster is read, not one API page. Requires an organization-admin credential (the `list_connections` permission on `servers`), which ordinary read access does not grant, and platform release v2.30.0 or later. **Note the roster is per-member data and lands in Terraform state** (bdai-platform #6920).
+
 ## 0.5.0 (2026-08-31)
 
 FEATURES:
