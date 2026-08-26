@@ -242,6 +242,39 @@ func TestMcpServerPublicationResource_waitsForPolicyLandingLater(t *testing.T) {
 	})
 }
 
+// TestMcpServerPublicationResource_neverPublishesAfterWindow pins the bound:
+// no attempt starts once the window has closed. With a 15 ms window and a
+// 10 ms interval, the policy landing on the 3rd attempt (~20 ms) must never
+// be seen — the retry stops after the 2nd attempt and the server stays
+// unpublished. Sleeping the full interval and THEN checking the deadline
+// would publish here, one interval late.
+func TestMcpServerPublicationResource_neverPublishesAfterWindow(t *testing.T) {
+	fake := setupPublicationTest(t)
+	publishRetryWindow, publishRetryInterval = 15*time.Millisecond, 10*time.Millisecond
+	fake.grantPolicyOnAttempt = 3
+
+	var serverID string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: activeServerConfig(""),
+				Check: func(s *terraform.State) error {
+					serverID = s.RootModule().Resources["barndoor_mcp_server.test"].Primary.ID
+					return nil
+				},
+			},
+			{
+				Config:      activeServerConfig(publicationBlock),
+				ExpectError: regexp.MustCompile(`(?s)cannot be published yet.*no ACTIVE policy`),
+			},
+		},
+	})
+	if fake.serverPublishedAt(t, serverID) != nil {
+		t.Errorf("server %s was published on attempt %d, after the retry window closed", serverID, fake.publishAttemptCount())
+	}
+}
+
 // TestMcpServerPublicationResource_nonPreconditionFailsImmediately pins the
 // retry's scope: only the two precondition 422s wait. A 404 (or any other
 // error) is surfaced after a single attempt.
