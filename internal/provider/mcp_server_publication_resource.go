@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -15,8 +16,20 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 
 	"github.com/barndoor-ai/terraform-provider-barndoor/internal/client"
+)
+
+// Publish precondition retry tuning (see publishWithRetry). Package variables
+// rather than constants so tests can shrink the window; production code never
+// mutates them.
+var (
+	// publishRetryWindow bounds how long Create keeps retrying the two
+	// precondition 422s before surfacing the API's own message.
+	publishRetryWindow = 2 * time.Minute
+	// publishRetryInterval is the pause between attempts.
+	publishRetryInterval = 5 * time.Second
 )
 
 // Ensure the resource satisfies the framework interfaces it relies on.
@@ -38,8 +51,8 @@ func NewMcpServerPublicationResource() resource.Resource {
 // server to already have an ACTIVE policy, and policies are separate resources
 // that reference the server's id — a flag on the server itself would have to
 // fire before any policy could exist and would fail every time. As its own
-// resource, the publication can be ordered after the policies with
-// `depends_on`.
+// resource, the publication is ordered after the policies by referencing their
+// ids in `policy_ids` — the reference is the dependency edge.
 type mcpServerPublicationResource struct {
 	client *client.Client
 }
@@ -49,6 +62,7 @@ type mcpServerPublicationResource struct {
 // publication.
 type mcpServerPublicationResourceModel struct {
 	McpServerID types.String `tfsdk:"mcp_server_id"`
+	PolicyIDs   types.List   `tfsdk:"policy_ids"`
 	PublishedAt types.String `tfsdk:"published_at"`
 }
 
@@ -66,8 +80,10 @@ func (r *mcpServerPublicationResource) Schema(_ context.Context, _ resource.Sche
 			"activates it, whereas a server created without them stays `pending` and cannot be published " +
 			"until someone connects it (servers from `embedded`/`local` directory entries need no " +
 			"credentials). Second, it must have at least one **ACTIVE policy** — and since policies " +
-			"reference the server's id, order this resource after them with `depends_on` (see the " +
-			"example).\n\n" +
+			"reference the server's id, order this resource after them by referencing their ids in " +
+			"`policy_ids` (see the example). A configuration that expresses no ordering still " +
+			"converges when the policy lands during the same apply: creation retries the two " +
+			"precondition rejections for up to two minutes before failing.\n\n" +
 			"**Removing this resource from configuration does NOT unpublish the server** — unpublishing " +
 			"does not exist. `terraform destroy` simply stops tracking the publication; the server stays " +
 			"published and is untouched (its connections and credentials are never affected by this " +
@@ -84,6 +100,16 @@ func (r *mcpServerPublicationResource) Schema(_ context.Context, _ resource.Sche
 					// Delete is a state-only operation (there is no unpublish).
 					stringplanmodifier.RequiresReplace(),
 				},
+			},
+			"policy_ids": schema.ListAttribute{
+				MarkdownDescription: "IDs of the ACTIVE policies this publication is ordered after. " +
+					"Referencing them (`policy_ids = [barndoor_policy.x.id]`) is what makes Terraform create " +
+					"the policies first — no `depends_on` needed (`depends_on` remains the fallback for a " +
+					"policy that is not managed alongside). Ordering-only: the list is not validated against " +
+					"the server's policies, changing it later is an in-place state update with no API call " +
+					"(never a replacement), and it reads back null after `terraform import`.",
+				ElementType: types.StringType,
+				Optional:    true,
 			},
 			"published_at": schema.StringAttribute{
 				MarkdownDescription: "RFC 3339 timestamp of when the server was published. For a server " +
@@ -132,8 +158,8 @@ func (r *mcpServerPublicationResource) Create(ctx context.Context, req resource.
 	}
 
 	serverID := plan.McpServerID.ValueString()
-	var server mcpServerResponse
-	if err := doJSON(ctx, r.client, http.MethodPost, registryAPIPrefix+"/servers/"+serverID+"/publish", nil, &server); err != nil {
+	server, err := publishWithRetry(ctx, r.client, serverID)
+	if err != nil {
 		addPublishAPIError(&resp.Diagnostics, serverID, err)
 		return
 	}
@@ -185,16 +211,22 @@ func (r *mcpServerPublicationResource) Read(ctx context.Context, req resource.Re
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-// Update is unreachable: mcp_server_id is the only configurable attribute and
-// it forces replacement. Failing loudly matters here — an in-place update
-// would copy the plan into state WITHOUT calling the publish endpoint, so
-// Terraform would report a published server that was never published.
-func (r *mcpServerPublicationResource) Update(_ context.Context, _ resource.UpdateRequest, resp *resource.UpdateResponse) {
-	resp.Diagnostics.AddError(
-		"Unexpected update of barndoor_mcp_server_publication",
-		"Every configurable attribute of barndoor_mcp_server_publication forces replacement, so an "+
-			"in-place update should be impossible. This is a bug in the provider.",
-	)
+// Update handles a policy_ids edit — the only in-place change the schema
+// allows (mcp_server_id forces replacement). policy_ids is ordering-only and
+// means nothing to the API once the server is published, so this is a pure
+// state write with no API call. published_at is carried forward from state by
+// UseStateForUnknown, so the plan already is the complete new state.
+func (r *mcpServerPublicationResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
+	var plan, state mcpServerPublicationResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if plan.PublishedAt.IsUnknown() {
+		plan.PublishedAt = state.PublishedAt
+	}
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
 // Delete removes the publication from state WITHOUT unpublishing — there is no
@@ -222,6 +254,49 @@ func (r *mcpServerPublicationResource) requireClient(diags *diag.Diagnostics) bo
 		return false
 	}
 	return true
+}
+
+// publishWithRetry calls the publish endpoint, retrying ONLY the two
+// precondition 422s ("not operationally available" / "no ACTIVE policy") for
+// a bounded window. When a configuration expresses no ordering between the
+// policy and the publication, Terraform may create them concurrently and the
+// policy lands seconds after the first publish attempt; waiting it out lets
+// such a configuration converge instead of failing the first apply (the same
+// pattern the AWS provider uses for IAM eventual consistency). A precondition
+// that never comes true fails after the window with the API's own message.
+// Every other error — 403, 404, 503, a validation 422 — is returned at once.
+func publishWithRetry(ctx context.Context, c *client.Client, serverID string) (*mcpServerResponse, error) {
+	path := registryAPIPrefix + "/servers/" + serverID + "/publish"
+	deadline := time.Now().Add(publishRetryWindow)
+	for attempt := 1; ; attempt++ {
+		var server mcpServerResponse
+		err := doJSON(ctx, c, http.MethodPost, path, nil, &server)
+		if err == nil {
+			return &server, nil
+		}
+		if !isPublishPrecondition(err) || time.Now().Add(publishRetryInterval).After(deadline) {
+			return nil, err
+		}
+		tflog.Debug(ctx, "Publish precondition not met yet; retrying", map[string]any{
+			"server_id": serverID,
+			"attempt":   attempt,
+			"error":     err.Error(),
+		})
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(publishRetryInterval):
+		}
+	}
+}
+
+// isPublishPrecondition reports whether err is one of the publish
+// preconditions: a 422 carrying a message. A 422 WITHOUT a message is FastAPI
+// request validation (a `detail` array, e.g. a malformed mcp_server_id), which
+// no amount of waiting fixes.
+func isPublishPrecondition(err error) bool {
+	apiErr, ok := asAPIError(err)
+	return ok && apiErr.status == http.StatusUnprocessableEntity && apiErr.hasMessage()
 }
 
 // addPublishAPIError turns a publish-endpoint error into an actionable
@@ -263,7 +338,7 @@ func addPublishAPIError(diags *diag.Diagnostics, serverID string, err error) {
 			fmt.Sprintf("The registry refused to publish server %s: %s\n\nPublishing requires the server "+
 				"to be operationally available AND to have at least one ACTIVE policy. If the policy is "+
 				"managed in this configuration, order the publication after it with "+
-				"`depends_on = [barndoor_policy.<name>]`.", serverID, apiErr.displayBody()),
+				"`policy_ids = [barndoor_policy.<name>.id]`.", serverID, apiErr.displayBody()),
 		)
 	case http.StatusForbidden:
 		// The admin authorization check on the server runs BEFORE the

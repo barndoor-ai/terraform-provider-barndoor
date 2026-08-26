@@ -4,7 +4,7 @@ page_title: "barndoor_mcp_server_publication Resource - Barndoor"
 subcategory: ""
 description: |-
   Publishes an MCP server, making it discoverable to end users. Publishing is one-way and deliberate: there is no unpublish, and later operational-state changes never hide a published server (taking a server out of service means deactivating its policies).
-  Publishing has two preconditions, and the platform refuses with a 422 until both hold. First, the server must be operationally available: supplying credentials at create activates it, whereas a server created without them stays pending and cannot be published until someone connects it (servers from embedded/local directory entries need no credentials). Second, it must have at least one ACTIVE policy — and since policies reference the server's id, order this resource after them with depends_on (see the example).
+  Publishing has two preconditions, and the platform refuses with a 422 until both hold. First, the server must be operationally available: supplying credentials at create activates it, whereas a server created without them stays pending and cannot be published until someone connects it (servers from embedded/local directory entries need no credentials). Second, it must have at least one ACTIVE policy — and since policies reference the server's id, order this resource after them by referencing their ids in policy_ids (see the example). A configuration that expresses no ordering still converges when the policy lands during the same apply: creation retries the two precondition rejections for up to two minutes before failing.
   Removing this resource from configuration does NOT unpublish the server — unpublishing does not exist. terraform destroy simply stops tracking the publication; the server stays published and is untouched (its connections and credentials are never affected by this resource). Publishing an already-published server is an idempotent no-op, so re-creating the declaration later is always safe.
 ---
 
@@ -12,7 +12,7 @@ description: |-
 
 Publishes an MCP server, making it discoverable to end users. Publishing is **one-way and deliberate**: there is no unpublish, and later operational-state changes never hide a published server (taking a server out of service means deactivating its policies).
 
-Publishing has two preconditions, and the platform refuses with a 422 until both hold. First, the server must be **operationally available**: supplying credentials at create activates it, whereas a server created without them stays `pending` and cannot be published until someone connects it (servers from `embedded`/`local` directory entries need no credentials). Second, it must have at least one **ACTIVE policy** — and since policies reference the server's id, order this resource after them with `depends_on` (see the example).
+Publishing has two preconditions, and the platform refuses with a 422 until both hold. First, the server must be **operationally available**: supplying credentials at create activates it, whereas a server created without them stays `pending` and cannot be published until someone connects it (servers from `embedded`/`local` directory entries need no credentials). Second, it must have at least one **ACTIVE policy** — and since policies reference the server's id, order this resource after them by referencing their ids in `policy_ids` (see the example). A configuration that expresses no ordering still converges when the policy lands during the same apply: creation retries the two precondition rejections for up to two minutes before failing.
 
 **Removing this resource from configuration does NOT unpublish the server** — unpublishing does not exist. `terraform destroy` simply stops tracking the publication; the server stays published and is untouched (its connections and credentials are never affected by this resource). Publishing an already-published server is an idempotent no-op, so re-creating the declaration later is always safe.
 
@@ -22,8 +22,7 @@ Publishing has two preconditions, and the platform refuses with a 422 until both
 # Publishing is a deliberate, one-way step: the server exists and is
 # configurable before it, but end users only discover it after it.
 #
-# There are two preconditions, and the publish fails with a 422 until both
-# hold:
+# There are two preconditions, and the publish fails until both hold:
 #
 #   1. The server is operationally available. Supplying credentials at create
 #      (as below) activates it immediately; a server created without them
@@ -31,8 +30,9 @@ Publishing has two preconditions, and the platform refuses with a 422 until both
 #      Servers from `embedded`/`local` directory entries need no credentials.
 #   2. It has at least one ACTIVE policy. Policies reference the server's id,
 #      so they necessarily come after it — which is why publishing is its own
-#      resource, ordered after the policies with depends_on, rather than a
-#      flag on the server.
+#      resource rather than a flag on the server. Listing the policies in
+#      `policy_ids` orders the publication after them: the reference itself
+#      is the dependency.
 resource "barndoor_mcp_server" "github" {
   name                    = "GitHub"
   mcp_server_directory_id = "11111111-1111-1111-1111-111111111111"
@@ -59,7 +59,7 @@ resource "barndoor_policy" "github" {
 
 resource "barndoor_mcp_server_publication" "github" {
   mcp_server_id = barndoor_mcp_server.github.id
-  depends_on    = [barndoor_policy.github] # publishing needs an ACTIVE policy
+  policy_ids    = [barndoor_policy.github.id] # the reference orders the publish after the policy
 }
 
 variable "github_oauth_client_id" {
@@ -78,6 +78,10 @@ variable "github_oauth_client_secret" {
 ### Required
 
 - `mcp_server_id` (String) ID of the MCP server to publish; also the `terraform import` key. A server has at most one publication. Importing a server that is not published yet fails (there is no publication to import) — apply this resource to publish it instead.
+
+### Optional
+
+- `policy_ids` (List of String) IDs of the ACTIVE policies this publication is ordered after. Referencing them (`policy_ids = [barndoor_policy.x.id]`) is what makes Terraform create the policies first — no `depends_on` needed (`depends_on` remains the fallback for a policy that is not managed alongside). Ordering-only: the list is not validated against the server's policies, changing it later is an in-place state update with no API call (never a replacement), and it reads back null after `terraform import`.
 
 ### Read-Only
 

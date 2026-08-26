@@ -669,10 +669,10 @@ data "barndoor_agent" "by_id" {
 
 // TestAccMcpServerPublication_lifecycle exercises publish end to end against a
 // real environment: the server's listing row starts unpublished, publishing
-// (ordered after an ACTIVE policy via depends_on, exactly like the documented
-// flow) stamps it, and removing the publication from configuration does not
-// unpublish it. Destroy soft-deletes the server, which removes it from
-// listings, so runs are self-cleaning despite publish being one-way.
+// (ordered after an ACTIVE policy via a policy_ids reference, exactly like the
+// documented flow) stamps it, and removing the publication from configuration
+// does not unpublish it. Destroy soft-deletes the server, which removes it
+// from listings, so runs are self-cleaning despite publish being one-way.
 //
 // What this does and does not prove. The checks read the registry listing —
 // the endpoint end users' discovery goes through — and assert `published_at`
@@ -727,7 +727,7 @@ resource "barndoor_policy" "test" {
 	publication := `
 resource "barndoor_mcp_server_publication" "test" {
   mcp_server_id = barndoor_mcp_server.test.id
-  depends_on    = [barndoor_policy.test] # publishing needs an ACTIVE policy
+  policy_ids    = [barndoor_policy.test.id] # the reference orders the publish after the policy
 }
 `
 
