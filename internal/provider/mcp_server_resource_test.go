@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-jsontypes/jsontypes"
 	frameworkresource "github.com/hashicorp/terraform-plugin-framework/resource"
@@ -62,9 +61,13 @@ type fakeRegistryServer struct {
 	// publishes counts state-changing publishes, so each one gets its own
 	// timestamp (see fakePublishedAtFor). publishAttempts counts every call to
 	// the publish endpoint, rejected or not — the observable that tells a
-	// retried publish from a single attempt.
-	publishes       int
-	publishAttempts int
+	// retried publish from a single attempt. grantPolicyOnAttempt, when
+	// non-zero, grants every server an ACTIVE policy once that many attempts
+	// have been made — a deterministic stand-in for "the policy lands during
+	// the same apply".
+	publishes            int
+	publishAttempts      int
+	grantPolicyOnAttempt int
 
 	// agents backs the /agents endpoints; see agent_resource_test.go.
 	nextAgentID int
@@ -318,6 +321,9 @@ func (f *fakeRegistryServer) publishServer(w http.ResponseWriter, id string) {
 		writeJSONError(w, http.StatusNotFound, "MCP server not found")
 		return
 	}
+	if f.grantPolicyOnAttempt > 0 && f.publishAttempts >= f.grantPolicyOnAttempt {
+		s.hasActivePolicy = true
+	}
 	if s.PublishedAt == nil {
 		if s.Status != "active" {
 			writeJSONError(w, http.StatusUnprocessableEntity, "Cannot publish: server is not operationally available")
@@ -414,13 +420,6 @@ func setupRegistryTest(t *testing.T) *fakeRegistryServer {
 	fake := newFakeRegistryServer()
 	srv := httptest.NewServer(fake.handler())
 	t.Cleanup(srv.Close)
-
-	// Shrink the publish precondition retry so a rejected publish fails in
-	// well under a second instead of the production two minutes. Tests that
-	// need the policy to "land later" grant it inside this window.
-	window, interval := publishRetryWindow, publishRetryInterval
-	publishRetryWindow, publishRetryInterval = 400*time.Millisecond, 25*time.Millisecond
-	t.Cleanup(func() { publishRetryWindow, publishRetryInterval = window, interval })
 
 	t.Setenv("BARNDOOR_BASE_URL", srv.URL)
 	t.Setenv("BARNDOOR_TOKEN_URL", srv.URL+"/token")

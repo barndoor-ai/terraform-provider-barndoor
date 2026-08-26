@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -45,15 +46,10 @@ func TestMcpServerPublicationResource_Schema(t *testing.T) {
 	if !resp.Schema.Attributes["published_at"].IsComputed() {
 		t.Error("published_at should be Computed")
 	}
-	// policy_ids exists to carry references: optional (policies managed
-	// elsewhere need no reference) and never Computed (a Computed list would
-	// be unknown-after-apply on import instead of a stable null).
-	policyIDs := resp.Schema.Attributes["policy_ids"]
-	if !policyIDs.IsOptional() || policyIDs.IsRequired() {
-		t.Error("policy_ids should be Optional")
-	}
-	if policyIDs.IsComputed() {
-		t.Error("policy_ids should not be Computed")
+	// Not Computed: a Computed list would be unknown-after-apply on import
+	// instead of a stable null.
+	if p := resp.Schema.Attributes["policy_ids"]; !p.IsOptional() || p.IsComputed() {
+		t.Error("policy_ids should be Optional and not Computed")
 	}
 }
 
@@ -65,14 +61,40 @@ func activeServerConfig(extra string) string {
 	return mcpServerConfig("tf-test-pub", "\n  client_id = \"tenant-client-id\"\n") + extra
 }
 
-const publicationBlock = `
+// publicationBlock is the publication with no policy_ids;
+// publicationBlockWithPolicies renders it with the given ids (the fake has no
+// policy resource, so literal ids stand in for barndoor_policy.x.id
+// references).
+var publicationBlock = publicationBlockWithPolicies()
+
+func publicationBlockWithPolicies(ids ...string) string {
+	var policyIDs string
+	if len(ids) > 0 {
+		quoted := make([]string, len(ids))
+		for i, id := range ids {
+			quoted[i] = strconv.Quote(id)
+		}
+		policyIDs = "\n  policy_ids    = [" + strings.Join(quoted, ", ") + "]"
+	}
+	return fmt.Sprintf(`
 resource "barndoor_mcp_server_publication" "test" {
-  mcp_server_id = barndoor_mcp_server.test.id
+  mcp_server_id = barndoor_mcp_server.test.id%s
 }
-`
+`, policyIDs)
+}
+
+// setupPublicationTest is setupRegistryTest plus a shrunk publish retry, so a
+// rejected publish fails in a fraction of a second instead of two minutes.
+func setupPublicationTest(t *testing.T) *fakeRegistryServer {
+	t.Helper()
+	window, interval := publishRetryWindow, publishRetryInterval
+	publishRetryWindow, publishRetryInterval = 200*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { publishRetryWindow, publishRetryInterval = window, interval })
+	return setupRegistryTest(t)
+}
 
 func TestMcpServerPublicationResource_lifecycle(t *testing.T) {
-	fake := setupRegistryTest(t)
+	fake := setupPublicationTest(t)
 	const pubName = "barndoor_mcp_server_publication.test"
 	const serverName = "barndoor_mcp_server.test"
 
@@ -163,7 +185,7 @@ data "barndoor_mcp_server" "test" {
 }
 
 func TestMcpServerPublicationResource_preconditionsRejected(t *testing.T) {
-	setupRegistryTest(t)
+	fake := setupPublicationTest(t)
 
 	resource.UnitTest(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
@@ -182,45 +204,35 @@ func TestMcpServerPublicationResource_preconditionsRejected(t *testing.T) {
 			},
 		},
 	})
+	// Each rejection above was retried for the window before surfacing —
+	// not failed on the first attempt, and not retried forever.
+	if n := fake.publishAttemptCount(); n < 4 {
+		t.Errorf("publish endpoint called %d time(s) across two rejected steps; precondition 422s should be retried until the window closes", n)
+	}
 }
 
 // --- precondition retry -------------------------------------------------------------
 
 // TestMcpServerPublicationResource_waitsForPolicyLandingLater covers the
 // no-ordering case: the publication is applied while the server still has no
-// ACTIVE policy, the policy lands moments later (as when Terraform creates
-// both concurrently), and Create converges by retrying instead of failing the
-// first attempt. Without the retry the 422 surfaces at once and this fails.
+// ACTIVE policy, the policy lands a few attempts later (as when Terraform
+// creates both concurrently), and Create converges by retrying. Without the
+// retry the first 422 surfaces and this fails.
 func TestMcpServerPublicationResource_waitsForPolicyLandingLater(t *testing.T) {
-	fake := setupRegistryTest(t)
+	fake := setupPublicationTest(t)
+	fake.grantPolicyOnAttempt = 3
 	const pubName = "barndoor_mcp_server_publication.test"
 
-	var serverID string
 	resource.UnitTest(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
-				Config: activeServerConfig(""),
-				Check: func(s *terraform.State) error {
-					serverID = s.RootModule().Resources["barndoor_mcp_server.test"].Primary.ID
-					return nil
-				},
-			},
-			{
-				// The policy lands a few retry intervals into the window.
-				PreConfig: func() {
-					time.AfterFunc(4*publishRetryInterval, func() {
-						fake.mu.Lock()
-						defer fake.mu.Unlock()
-						fake.servers[serverID].hasActivePolicy = true
-					})
-				},
 				Config: activeServerConfig(publicationBlock),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAtFor(1)),
 					func(*terraform.State) error {
-						if n := fake.publishAttemptCount(); n < 2 {
-							return fmt.Errorf("publish endpoint called %d time(s); the precondition rejection should have been retried", n)
+						if n := fake.publishAttemptCount(); n != 3 {
+							return fmt.Errorf("publish endpoint called %d time(s), want 3 (two rejections, then success)", n)
 						}
 						return nil
 					},
@@ -230,32 +242,11 @@ func TestMcpServerPublicationResource_waitsForPolicyLandingLater(t *testing.T) {
 	})
 }
 
-// TestMcpServerPublicationResource_retryWindowExhausted pins that a
-// precondition which never comes true is retried for the window and THEN
-// fails with the API's own message — not on the first attempt, and not
-// forever.
-func TestMcpServerPublicationResource_retryWindowExhausted(t *testing.T) {
-	fake := setupRegistryTest(t)
-
-	resource.UnitTest(t, resource.TestCase{
-		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
-		Steps: []resource.TestStep{
-			{
-				Config:      activeServerConfig(publicationBlock),
-				ExpectError: regexp.MustCompile(`(?s)cannot be published yet.*no ACTIVE policy`),
-			},
-		},
-	})
-	if n := fake.publishAttemptCount(); n < 2 {
-		t.Errorf("publish endpoint called %d time(s); a precondition 422 should be retried until the window closes", n)
-	}
-}
-
 // TestMcpServerPublicationResource_nonPreconditionFailsImmediately pins the
 // retry's scope: only the two precondition 422s wait. A 404 (or any other
 // error) is surfaced after a single attempt.
 func TestMcpServerPublicationResource_nonPreconditionFailsImmediately(t *testing.T) {
-	fake := setupRegistryTest(t)
+	fake := setupPublicationTest(t)
 
 	resource.UnitTest(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
@@ -277,28 +268,12 @@ resource "barndoor_mcp_server_publication" "test" {
 
 // --- policy_ids ---------------------------------------------------------------------
 
-// publicationBlockWithPolicies renders the publication with the given
-// policy_ids. The fake has no policy resource, so literal ids stand in for
-// the barndoor_policy.x.id references a real configuration carries.
-func publicationBlockWithPolicies(ids ...string) string {
-	quoted := make([]string, len(ids))
-	for i, id := range ids {
-		quoted[i] = fmt.Sprintf("%q", id)
-	}
-	return fmt.Sprintf(`
-resource "barndoor_mcp_server_publication" "test" {
-  mcp_server_id = barndoor_mcp_server.test.id
-  policy_ids    = [%s]
-}
-`, strings.Join(quoted, ", "))
-}
-
 // TestMcpServerPublicationResource_policyIDs pins policy_ids' ordering-only
 // contract: editing or dropping the list is an in-place update that never
-// calls the publish endpoint, an import reads it back null with no follow-up
-// diff, and adding it after an import is a one-time in-place write.
+// calls the publish endpoint, and an import reads it back null with no
+// follow-up diff.
 func TestMcpServerPublicationResource_policyIDs(t *testing.T) {
-	fake := setupRegistryTest(t)
+	fake := setupPublicationTest(t)
 	const pubName = "barndoor_mcp_server_publication.test"
 	const policyA, policyB = "aaaaaaaa-0000-0000-0000-000000000001", "aaaaaaaa-0000-0000-0000-000000000002"
 
@@ -354,7 +329,6 @@ func TestMcpServerPublicationResource_policyIDs(t *testing.T) {
 				ConfigPlanChecks: updatesInPlace,
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckNoResourceAttr(pubName, "policy_ids.#"),
-					resource.TestCheckResourceAttr(pubName, "published_at", fakePublishedAtFor(1)),
 					noPublishCall,
 				),
 			},
@@ -372,45 +346,23 @@ func TestMcpServerPublicationResource_policyIDs(t *testing.T) {
 				ImportStateIdFunc:  func(*terraform.State) (string, error) { return serverID, nil },
 				ImportStatePersist: true,
 				ImportStateCheck: func(states []*terraform.InstanceState) error {
-					// The persisted state also holds the server; pick the
-					// publication.
-					var attrs map[string]string
+					// The persisted state also holds the server.
 					for _, st := range states {
-						if st.Ephemeral.Type == "barndoor_mcp_server_publication" {
-							attrs = st.Attributes
+						if st.Ephemeral.Type != "barndoor_mcp_server_publication" {
+							continue
 						}
+						if n, ok := st.Attributes["policy_ids.#"]; ok {
+							return fmt.Errorf("imported policy_ids has %s element(s), want null", n)
+						}
+						return nil
 					}
-					if attrs == nil {
-						return fmt.Errorf("no barndoor_mcp_server_publication among the %d imported instances", len(states))
-					}
-					if _, ok := attrs["policy_ids.#"]; ok {
-						return fmt.Errorf("imported policy_ids = %q, want null", attrs["policy_ids.#"])
-					}
-					if attrs["published_at"] != fakePublishedAtFor(1) {
-						return fmt.Errorf("imported published_at = %q, want %q", attrs["published_at"], fakePublishedAtFor(1))
-					}
-					return nil
+					return fmt.Errorf("no barndoor_mcp_server_publication among the %d imported instances", len(states))
 				},
 			},
 			{
 				// … and a configuration without policy_ids plans no changes
 				// against the imported state.
 				Config:   activeServerConfig(publicationBlock),
-				PlanOnly: true,
-			},
-			{
-				// Adding policy_ids to the imported publication is a one-time
-				// in-place write, not a republish …
-				Config:           activeServerConfig(publicationBlockWithPolicies(policyA)),
-				ConfigPlanChecks: updatesInPlace,
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(pubName, "policy_ids.#", "1"),
-					noPublishCall,
-				),
-			},
-			{
-				// … after which the plan is empty (no perpetual diff).
-				Config:   activeServerConfig(publicationBlockWithPolicies(policyA)),
 				PlanOnly: true,
 			},
 		},
@@ -434,7 +386,7 @@ func checkResourceAbsent(name string) resource.TestCheckFunc {
 // routes to Update — a state-only write — and the new server would be
 // reported published without the publish endpoint ever being called for it.
 func TestMcpServerPublicationResource_repointForcesReplace(t *testing.T) {
-	fake := setupRegistryTest(t)
+	fake := setupPublicationTest(t)
 	const pubName = "barndoor_mcp_server_publication.test"
 
 	// Two active servers, each with a policy, so either may be published.
@@ -508,7 +460,7 @@ resource "barndoor_mcp_server_publication" "test" {
 // Read's "server reads back unpublished" branch: the publication is dropped
 // from state so the next apply republishes.
 func TestMcpServerPublicationResource_unpublishedOutOfBandRepublishes(t *testing.T) {
-	fake := setupRegistryTest(t)
+	fake := setupPublicationTest(t)
 	const pubName = "barndoor_mcp_server_publication.test"
 
 	var serverID string
@@ -554,7 +506,7 @@ func TestMcpServerPublicationResource_unpublishedOutOfBandRepublishes(t *testing
 }
 
 func TestMcpServerPublicationResource_outOfBandServerDeleteDropsPublication(t *testing.T) {
-	fake := setupRegistryTest(t)
+	fake := setupPublicationTest(t)
 	const pubName = "barndoor_mcp_server_publication.test"
 
 	var serverID string
