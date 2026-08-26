@@ -255,7 +255,8 @@ func (r *mcpServerPublicationResource) requireClient(diags *diag.Diagnostics) bo
 // ordering between policy and publication may create them concurrently, and
 // the policy lands seconds after the first attempt. Every other error — 403,
 // 404, 503, a validation 422 — is returned at once; a precondition that never
-// comes true is returned after the window.
+// comes true is returned after the window. No attempt starts after the window
+// closes — the retry is skipped when the next attempt would fall outside it.
 func publishWithRetry(ctx context.Context, c *client.Client, serverID string) (*mcpServerResponse, error) {
 	path := serverPath(serverID, "publish")
 	deadline := time.Now().Add(publishRetryWindow)
@@ -267,7 +268,7 @@ func publishWithRetry(ctx context.Context, c *client.Client, serverID string) (*
 		if err == nil {
 			return &server, nil
 		}
-		if !isPublishPrecondition(err) || !time.Now().Before(deadline) {
+		if !isPublishPrecondition(err) || time.Now().Add(publishRetryInterval).After(deadline) {
 			return nil, err
 		}
 		tflog.Debug(ctx, "Publish precondition not met yet; retrying", map[string]any{
