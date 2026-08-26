@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-jsontypes/jsontypes"
 	frameworkresource "github.com/hashicorp/terraform-plugin-framework/resource"
@@ -59,8 +60,11 @@ type fakeRegistryServer struct {
 	servers map[string]*fakeMcpServer
 
 	// publishes counts state-changing publishes, so each one gets its own
-	// timestamp (see fakePublishedAtFor).
-	publishes int
+	// timestamp (see fakePublishedAtFor). publishAttempts counts every call to
+	// the publish endpoint, rejected or not — the observable that tells a
+	// retried publish from a single attempt.
+	publishes       int
+	publishAttempts int
 
 	// agents backs the /agents endpoints; see agent_resource_test.go.
 	nextAgentID int
@@ -308,6 +312,7 @@ func fakePublishedAtFor(n int) string {
 // the documented example and the acceptance-test setup both need explicit
 // credentials or an embedded/local directory entry.
 func (f *fakeRegistryServer) publishServer(w http.ResponseWriter, id string) {
+	f.publishAttempts++
 	s, ok := f.servers[id]
 	if !ok || s.deleted {
 		writeJSONError(w, http.StatusNotFound, "MCP server not found")
@@ -329,8 +334,15 @@ func (f *fakeRegistryServer) publishServer(w http.ResponseWriter, id string) {
 	_ = json.NewEncoder(w).Encode(s)
 }
 
+// publishAttemptCount returns how many times the publish endpoint was called.
+func (f *fakeRegistryServer) publishAttemptCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.publishAttempts
+}
+
 // grantActivePolicy marks a stored server as having an ACTIVE policy, standing
-// in for the barndoor_policy resource the real depends_on ordering waits on.
+// in for the barndoor_policy resource a real policy_ids reference waits on.
 func (f *fakeRegistryServer) grantActivePolicy(t *testing.T, id string) {
 	t.Helper()
 	f.mu.Lock()
@@ -402,6 +414,13 @@ func setupRegistryTest(t *testing.T) *fakeRegistryServer {
 	fake := newFakeRegistryServer()
 	srv := httptest.NewServer(fake.handler())
 	t.Cleanup(srv.Close)
+
+	// Shrink the publish precondition retry so a rejected publish fails in
+	// well under a second instead of the production two minutes. Tests that
+	// need the policy to "land later" grant it inside this window.
+	window, interval := publishRetryWindow, publishRetryInterval
+	publishRetryWindow, publishRetryInterval = 400*time.Millisecond, 25*time.Millisecond
+	t.Cleanup(func() { publishRetryWindow, publishRetryInterval = window, interval })
 
 	t.Setenv("BARNDOOR_BASE_URL", srv.URL)
 	t.Setenv("BARNDOOR_TOKEN_URL", srv.URL+"/token")
