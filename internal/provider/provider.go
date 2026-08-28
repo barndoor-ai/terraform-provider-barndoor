@@ -154,6 +154,7 @@ func (p *BarndoorProvider) Resources(ctx context.Context) []func() resource.Reso
 		NewLlmTokenBudgetResource,
 		NewLogExportResource,
 		NewMcpServerResource,
+		NewNotificationChannelResource,
 		NewPolicyResource,
 	}
 }
