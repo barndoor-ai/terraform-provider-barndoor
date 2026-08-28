@@ -77,7 +77,7 @@ func applyChannelResponse(
 	subsValue := types.SetNull(types.StringType)
 	// An absent config set and an empty server set are both "delivers nothing";
 	// echoing an empty set where the config said nothing would be perpetual drift.
-	if len(subs) > 0 || !(prior.Subscriptions.IsNull() || prior.Subscriptions.IsUnknown()) {
+	if len(subs) > 0 || (!prior.Subscriptions.IsNull() && !prior.Subscriptions.IsUnknown()) {
 		set, _ := types.SetValueFrom(context.Background(), types.StringType, subs)
 		subsValue = set
 	}
