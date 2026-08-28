@@ -1,0 +1,282 @@
+// Copyright Barndoor AI, Inc. 2026
+// SPDX-License-Identifier: MIT
+
+package provider
+
+import (
+	"context"
+	"fmt"
+	"sort"
+
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+
+	"github.com/barndoor-ai/terraform-provider-barndoor/internal/client"
+)
+
+// notificationAPIPrefix is the notification-service public API mount point
+// under the platform host root (routed by the edge to notification-service's
+// `/public/v1` remount, BCP-3758). Requests are scoped to the credential's
+// organization by its Keycloak token claims; there are no org path parameters
+// on this surface.
+const notificationAPIPrefix = "api/notification/public/v1"
+
+// Channel types. The type discriminates the whole model: it decides which
+// destination attribute is required and which natural-identity key the API
+// dedupes an upsert on.
+const (
+	channelTypeInApp     = "in_app"
+	channelTypeUserEmail = "user_email"
+	channelTypeEmail     = "email"
+	channelTypeWebhook   = "webhook"
+	channelTypeSlack     = "slack"
+	channelTypeTeams     = "teams"
+)
+
+var (
+	_ resource.Resource                = &notificationChannelResource{}
+	_ resource.ResourceWithConfigure   = &notificationChannelResource{}
+	_ resource.ResourceWithImportState = &notificationChannelResource{}
+	_ resource.ResourceWithModifyPlan  = &notificationChannelResource{}
+)
+
+// NewNotificationChannelResource returns a new barndoor_notification_channel resource.
+func NewNotificationChannelResource() resource.Resource {
+	return &notificationChannelResource{}
+}
+
+// notificationChannelResource manages an organization notification delivery
+// destination through the notification-service public REST API (BCP-3758).
+//
+// Only the organization-wide channel types are manageable here — `email`,
+// `webhook`, `slack`, `teams`. The personal types (`in_app`, `user_email`) are
+// per-user preferences owned by the signed-in user rather than infrastructure,
+// and the API derives their owner from the caller's token, so a Terraform
+// credential could only ever manage its own. They are rejected at plan time.
+//
+// The API's write path is an idempotent upsert keyed on each type's natural
+// identity (`email` by address, `webhook` by URL, `slack` by channel id). This
+// resource nonetheless tracks the server-assigned id and edits by id, so a
+// change to the destination is an authoritative update of THIS channel rather
+// than a silent create of a second one — except where the API cannot express
+// that, noted per-attribute below.
+type notificationChannelResource struct {
+	client *client.Client
+}
+
+type notificationChannelResourceModel struct {
+	ID                types.String `tfsdk:"id"`
+	Type              types.String `tfsdk:"type"`
+	Enabled           types.Bool   `tfsdk:"enabled"`
+	EmailAddress      types.String `tfsdk:"email_address"`
+	URL               types.String `tfsdk:"url"`
+	Label             types.String `tfsdk:"label"`
+	SlackChannelID    types.String `tfsdk:"slack_channel_id"`
+	TeamsWorkflowURL  types.String `tfsdk:"teams_workflow_url"`
+	Subscriptions     types.Set    `tfsdk:"subscriptions"`
+	RotateWhenChanged types.Map    `tfsdk:"rotate_when_changed"`
+	SigningSecret     types.String `tfsdk:"signing_secret"`
+	HasSigningSecret  types.Bool   `tfsdk:"has_signing_secret"`
+	HasWorkflowURL    types.Bool   `tfsdk:"has_workflow_url"`
+	CreatedAt         types.String `tfsdk:"created_at"`
+	UpdatedAt         types.String `tfsdk:"updated_at"`
+}
+
+func (r *notificationChannelResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
+	resp.TypeName = req.ProviderTypeName + "_notification_channel"
+}
+
+func (r *notificationChannelResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
+	resp.Schema = schema.Schema{
+		MarkdownDescription: "Manages an organization notification channel — a destination that Barndoor " +
+			"admin alerts are delivered to (`email`, `webhook`, `slack`, `teams`).\n\n" +
+			"The personal channel types (`in_app`, `user_email`) are deliberately not manageable: they are " +
+			"per-user preferences whose owner the API derives from the caller's token, so a Terraform " +
+			"credential could only ever manage its own.\n\n" +
+			"~> **Webhook signing secrets are stored in Terraform state.** A `webhook` channel's signing " +
+			"secret is generated by the platform and revealed exactly once, on creation or rotation; it " +
+			"cannot be read back afterwards. This resource persists it in state so it can be consumed by " +
+			"other resources and outputs. Protect your remote state accordingly.",
+		Attributes: map[string]schema.Attribute{
+			"id": schema.StringAttribute{
+				MarkdownDescription: "Server-assigned channel id.",
+				Computed:            true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"type": schema.StringAttribute{
+				MarkdownDescription: "Channel type: `email`, `webhook`, `slack` or `teams`. Changing it " +
+					"forces a new channel — the type determines the channel's natural identity, so the API " +
+					"has no in-place transition between types.",
+				Required: true,
+				Validators: []validator.String{
+					stringvalidator.OneOf(channelTypeEmail, channelTypeWebhook, channelTypeSlack, channelTypeTeams),
+				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"enabled": schema.BoolAttribute{
+				MarkdownDescription: "Whether the channel delivers. Setting it to `false` suspends delivery " +
+					"while keeping the channel and its subscriptions — the reversible alternative to " +
+					"destroying it. Defaults to `true`.",
+				Optional: true,
+				Computed: true,
+				Default:  booldefault.StaticBool(true),
+			},
+			"email_address": schema.StringAttribute{
+				MarkdownDescription: "Destination address. **Required for `type = \"email\"`**, and forbidden " +
+					"on every other type. Any deliverable address — a team alias or ticketing inbox, not " +
+					"necessarily a platform user.",
+				Optional: true,
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+				},
+			},
+			"url": schema.StringAttribute{
+				MarkdownDescription: "Destination endpoint. **Required for `type = \"webhook\"`**, and " +
+					"forbidden on every other type. Must be `https` and must resolve to a public address — " +
+					"the platform rejects private, loopback, link-local and cloud-metadata targets.",
+				Optional: true,
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+				},
+			},
+			"label": schema.StringAttribute{
+				MarkdownDescription: "Human-readable name. **Required for `slack` and `teams`**, and " +
+					"forbidden on `email` and `webhook`. For `teams` it is the only non-secret identifier " +
+					"the API returns.",
+				Optional: true,
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+				},
+			},
+			"slack_channel_id": schema.StringAttribute{
+				MarkdownDescription: "Slack channel id (not its name). **Required for `type = \"slack\"`**, " +
+					"and forbidden on every other type. The organization's Slack app must already be " +
+					"installed — that is an interactive consent flow and is not manageable through this API.",
+				Optional: true,
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+				},
+			},
+			"teams_workflow_url": schema.StringAttribute{
+				MarkdownDescription: "Microsoft Teams Workflows incoming-webhook URL. **Required on create " +
+					"for `type = \"teams\"`**, and forbidden on every other type. Must be `https`, resolve " +
+					"to a public address, and sit on the Power Automate host allowlist.\n\n" +
+					"**Write-only:** the API stores it as a secret and never returns it, so Terraform " +
+					"tracks the configured value and never refreshes it (out-of-band changes are not " +
+					"detected). Whether one is stored is observable via `has_workflow_url`.",
+				Optional:  true,
+				Sensitive: true,
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+				},
+			},
+			"subscriptions": schema.SetAttribute{
+				MarkdownDescription: "Alert types delivered to this channel, e.g. `break_glass_used`. The " +
+					"API **replaces** rather than merges this set, so it is the complete desired state; an " +
+					"empty set means the channel exists but delivers nothing.\n\n" +
+					"Read the live vocabulary from the platform rather than hardcoding it — the set grows " +
+					"over time and is gated per organization, and subscribing to a type your organization " +
+					"is not admitted to is accepted but never delivers.",
+				Optional:    true,
+				ElementType: types.StringType,
+			},
+			"rotate_when_changed": schema.MapAttribute{
+				MarkdownDescription: "Arbitrary key/value pairs that, when changed, rotate a `webhook` " +
+					"channel's signing secret — enabling rotation driven by external conditions such as a " +
+					"rotating timestamp (see `time_rotating`).\n\n" +
+					"Unlike the equivalent argument on most providers, this rotates **in place**: the " +
+					"channel id, subscriptions and delivery configuration are preserved, because the API " +
+					"exposes a dedicated rotate endpoint rather than requiring the channel be recreated. " +
+					"The new secret lands in `signing_secret`.\n\n" +
+					"Only meaningful for `type = \"webhook\"`; ignored otherwise.",
+				Optional:    true,
+				ElementType: types.StringType,
+			},
+			"signing_secret": schema.StringAttribute{
+				MarkdownDescription: "The webhook signing secret (Standard Webhooks `whsec_` form), used to " +
+					"verify the signature on delivered payloads. Populated on creation and on each rotation " +
+					"via `rotate_when_changed`.\n\n" +
+					"The platform reveals this value **exactly once** and cannot return it again, so " +
+					"Terraform never refreshes it — the value in state is whatever was last issued to " +
+					"Terraform. If the secret is rotated outside Terraform, state will hold a stale value " +
+					"and the drift is undetectable; rotate through `rotate_when_changed` instead. Empty for " +
+					"non-webhook channels.",
+				Computed:  true,
+				Sensitive: true,
+			},
+			"has_signing_secret": schema.BoolAttribute{
+				MarkdownDescription: "Whether the platform holds a signing secret for this channel. Always " +
+					"true for a `webhook` channel. Unlike `signing_secret` this IS refreshed on read, so it " +
+					"is the reliable signal that a secret exists.",
+				Computed: true,
+			},
+			"has_workflow_url": schema.BoolAttribute{
+				MarkdownDescription: "Whether the platform holds a Teams Workflows URL for this channel. " +
+					"The URL itself is a secret and is never returned.",
+				Computed: true,
+			},
+			"created_at": schema.StringAttribute{
+				MarkdownDescription: "When the channel was created (RFC 3339, UTC).",
+				Computed:            true,
+			},
+			"updated_at": schema.StringAttribute{
+				MarkdownDescription: "When the channel or its subscriptions last changed (RFC 3339, UTC).",
+				Computed:            true,
+			},
+		},
+	}
+}
+
+func (r *notificationChannelResource) Configure(_ context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
+	if req.ProviderData == nil {
+		return
+	}
+	c, ok := req.ProviderData.(*client.Client)
+	if !ok {
+		resp.Diagnostics.AddError(
+			"Unexpected provider data type",
+			fmt.Sprintf("Expected *client.Client, got %T. This is a bug in the provider.", req.ProviderData),
+		)
+		return
+	}
+	r.client = c
+}
+
+func (r *notificationChannelResource) requireClient(diags *diag.Diagnostics) bool {
+	if r.client == nil {
+		diags.AddError(
+			"Provider not configured",
+			"The Barndoor provider was not configured before use. This is a bug in the provider.",
+		)
+		return false
+	}
+	return true
+}
+
+// sortedSubscriptions returns the configured alert types in a stable order.
+// The API treats subscriptions as a set; sorting keeps request bodies (and
+// therefore test fixtures and debug logs) deterministic.
+func sortedSubscriptions(v types.Set) []string {
+	if v.IsNull() || v.IsUnknown() {
+		return nil
+	}
+	out := make([]string, 0, len(v.Elements()))
+	for _, e := range v.Elements() {
+		if s, ok := e.(types.String); ok && !s.IsNull() && !s.IsUnknown() {
+			out = append(out, s.ValueString())
+		}
+	}
+	sort.Strings(out)
+	return out
+}

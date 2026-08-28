@@ -68,6 +68,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
 
 	"github.com/barndoor-ai/terraform-provider-barndoor/internal/client"
 )
@@ -649,4 +650,131 @@ resource "barndoor_agent" "test" {
 %[2]s
 }
 `, directoryID, extra)
+}
+
+// TestAccNotificationChannelResource_lifecycle exercises barndoor_notification_channel
+// against a live notification-service (BCP-3760).
+//
+// Destructive, so it is gated on the disposable-org variable — but note the blast
+// radius is genuinely small compared with the log-export tests: it only ever touches
+// a channel it creates itself, on a webhook URL nothing delivers to, and destroy
+// removes it. It does not disturb any existing channel or in-flight delivery.
+//
+// What only a live run can prove, over and above the httptest fakes:
+//
+//   - the platform really does reveal the signing secret exactly once, and really
+//     does withhold it on subsequent reads (the fake asserts our understanding of
+//     the contract; this asserts the contract);
+//   - the rotate endpoint really rotates in place, preserving the channel id;
+//   - the per-type 422 rules match what the provider enforces at plan time;
+//   - import works against a real channel id.
+func TestAccNotificationChannelResource_lifecycle(t *testing.T) {
+	if os.Getenv("TF_ACC") == "" {
+		t.Skip("TF_ACC not set; skipping acceptance test")
+	}
+	testAccPreCheck(t)
+	requireDisposableTestOrg(t)
+
+	const resourceName = "barndoor_notification_channel.test"
+	// Unique per run so concurrent or repeated runs cannot collide on the
+	// webhook URL's natural identity (which would hit the upsert-dedup path and
+	// surface as the import-instead error).
+	url := fmt.Sprintf("https://example.com/tf-acc-channel-%d", time.Now().UnixNano())
+
+	var createdID, createdSecret string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccNotificationChannelConfig(url, `["break_glass_used"]`, ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet(resourceName, "id"),
+					resource.TestCheckResourceAttr(resourceName, "type", channelTypeWebhook),
+					resource.TestCheckResourceAttr(resourceName, "url", url),
+					resource.TestCheckResourceAttr(resourceName, "has_signing_secret", "true"),
+					resource.TestCheckResourceAttrSet(resourceName, "signing_secret"),
+					func(st *terraform.State) error {
+						rs := st.RootModule().Resources[resourceName]
+						createdID = rs.Primary.Attributes["id"]
+						createdSecret = rs.Primary.Attributes["signing_secret"]
+						if createdSecret == "" {
+							return fmt.Errorf("the platform revealed no signing secret on create")
+						}
+						if !strings.HasPrefix(createdSecret, "whsec_") {
+							return fmt.Errorf("signing_secret = %q, want a whsec_ prefix", createdSecret)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				// The secret is NOT re-returned by a read, so a refresh must not
+				// disturb it and the plan must be empty.
+				Config:   testAccNotificationChannelConfig(url, `["break_glass_used"]`, ""),
+				PlanOnly: true,
+			},
+			{
+				// Replace the subscription set in place; the secret must survive.
+				Config: testAccNotificationChannelConfig(url, `["break_glass_used", "policy_changed"]`, ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "subscriptions.#", "2"),
+					func(st *terraform.State) error {
+						rs := st.RootModule().Resources[resourceName]
+						if got := rs.Primary.Attributes["signing_secret"]; got != createdSecret {
+							return fmt.Errorf("signing_secret changed on a non-rotating update")
+						}
+						if got := rs.Primary.Attributes["id"]; got != createdID {
+							return fmt.Errorf("channel was replaced on a subscription edit: %q -> %q", createdID, got)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				// Rotate in place against the real rotate endpoint.
+				Config: testAccNotificationChannelConfig(url, `["break_glass_used", "policy_changed"]`, "rotation-1"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					func(st *terraform.State) error {
+						rs := st.RootModule().Resources[resourceName]
+						if got := rs.Primary.Attributes["id"]; got != createdID {
+							return fmt.Errorf("rotation replaced the channel: %q -> %q", createdID, got)
+						}
+						got := rs.Primary.Attributes["signing_secret"]
+						if got == createdSecret {
+							return fmt.Errorf("rotation returned the same secret")
+						}
+						if !strings.HasPrefix(got, "whsec_") {
+							return fmt.Errorf("rotated signing_secret = %q, want a whsec_ prefix", got)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				// Import by real channel id. signing_secret cannot be recovered on
+				// import (the platform revealed it once, to the earlier apply) and
+				// rotate_when_changed is config-only, so both are ignored.
+				ResourceName:            resourceName,
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"signing_secret", "rotate_when_changed"},
+			},
+		},
+	})
+}
+
+func testAccNotificationChannelConfig(url, subs, rotate string) string {
+	rotateBlock := ""
+	if rotate != "" {
+		rotateBlock = fmt.Sprintf("\n  rotate_when_changed = { token = %q }\n", rotate)
+	}
+	return fmt.Sprintf(`
+resource "barndoor_notification_channel" "test" {
+  type          = "webhook"
+  url           = %[1]q
+  subscriptions = %[2]s
+%[3]s}
+`, url, subs, rotateBlock)
 }

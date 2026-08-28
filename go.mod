@@ -3,8 +3,12 @@ module github.com/barndoor-ai/terraform-provider-barndoor
 go 1.25.8
 
 require (
-	// tracks barndoor-go-sdk main (post-#5349 proto roll, SDK PR #30)
-	github.com/barndoor-ai/barndoor-go-sdk v1.0.2-0.20260701224750-a830741db38a
+	// Pinned to a real release (BCP-3760). This was a pseudo-version because the
+	// v1.1.0 tag was cut as `vv1.1.0` — invalid semver, so the module proxy refused
+	// it and no usable release existed between v1.0.1 and v1.3.0. Only the policy v2
+	// protobuf types are used from here; every REST surface goes through
+	// internal/client, so this does not carry the SDK's notification methods.
+	github.com/barndoor-ai/barndoor-go-sdk v1.3.0
 	github.com/hashicorp/terraform-plugin-framework v1.19.0
 	github.com/hashicorp/terraform-plugin-framework-jsontypes v0.2.0
 	github.com/hashicorp/terraform-plugin-framework-validators v0.19.0
@@ -56,13 +60,13 @@ require (
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/zclconf/go-cty v1.18.1 // indirect
-	golang.org/x/crypto v0.51.0 // indirect
-	golang.org/x/mod v0.35.0 // indirect
-	golang.org/x/net v0.55.0 // indirect
-	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
-	golang.org/x/text v0.37.0 // indirect
-	golang.org/x/tools v0.44.0 // indirect
+	golang.org/x/crypto v0.55.0 // indirect
+	golang.org/x/mod v0.38.0 // indirect
+	golang.org/x/net v0.58.0 // indirect
+	golang.org/x/sync v0.22.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/tools v0.48.0 // indirect
 	google.golang.org/appengine v1.6.8 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 )
