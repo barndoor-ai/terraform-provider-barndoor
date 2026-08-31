@@ -35,6 +35,14 @@ package provider
 //     any org: it proves a client_credentials token mints and the
 //     system-management public read path is reachable and authorized.
 //
+//   - TestAccMcpServerConnectionsDataSource is READ-ONLY: it lists the
+//     connection roster of BARNDOOR_TEST_MCP_SERVER_ID and 404s a
+//     nonexistent UUID. It never writes, so it is safe against any org, and
+//     skips without that fixture id. Do not assert an empty roster — a later
+//     connect on the fixture must not fail nightly. Row-shape mapping,
+//     pagination, and owner-class discrimination stay on the fake: the
+//     fixture roster has historically been empty.
+//
 //   - The write tests (TestAccLogExportResource_lifecycle,
 //     TestAccLogExportResource_azureLifecycle, and
 //     TestAccLogExportAWSTrustInfoDataSource — the last mints/persists an
@@ -61,6 +69,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -91,9 +100,10 @@ const (
 	// org named by envTestOrgID.
 	envTestAzureBlob = "BARNDOOR_ACC_TEST_AZURE_BLOB"
 
-	// envTestMCPServerID opts in to the barndoor_policy acceptance test by
-	// naming a real MCP server in the credential's organization for the
-	// policy's required (and immutable) mcp_server_id.
+	// envTestMCPServerID opts in to the barndoor_policy acceptance test
+	// (immutable mcp_server_id) and the read-only
+	// barndoor_mcp_server_connections data source test, by naming a real MCP
+	// server in the credential's organization.
 	envTestMCPServerID = "BARNDOOR_TEST_MCP_SERVER_ID"
 
 	// envTestMCPServerDirectoryID opts in to the barndoor_mcp_server
@@ -575,6 +585,94 @@ resource "barndoor_mcp_server" "test" {
 %[3]s
 }
 `, name, directoryID, extra)
+}
+
+// TestAccMcpServerConnectionsDataSource is a read-only smoke of the admin
+// roster data source against a real environment. It proves the IaC credential
+// clears the admin-only list_connections gate (a 403 here means the data
+// source is unusable for every practitioner), that the pagination envelope
+// parses, and that the filters the unit tests send are accepted by the live
+// endpoint. It does not pin connections.# — the fixture roster has been empty,
+// and a later connect must not fail nightly. Row-shape mapping stays on the
+// fake.
+func TestAccMcpServerConnectionsDataSource(t *testing.T) {
+	if os.Getenv("TF_ACC") == "" {
+		t.Skip("TF_ACC not set; skipping acceptance test")
+	}
+	testAccPreCheck(t)
+
+	mcpServerID := os.Getenv(envTestMCPServerID)
+	if mcpServerID == "" {
+		t.Skipf("%s not set; skipping the barndoor_mcp_server_connections acceptance test. Set it to the id "+
+			"of an MCP server in the credential's organization.", envTestMCPServerID)
+	}
+
+	const dataName = "data.barndoor_mcp_server_connections.test"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccMcpServerConnectionsConfig(mcpServerID, ""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(dataName, "server_id", mcpServerID),
+					// Set even when the roster is empty ("0"); null would mean
+					// the data source failed to materialise the list.
+					resource.TestCheckResourceAttrSet(dataName, "connections.#"),
+				),
+			},
+			{
+				// Filters the endpoint accepts. A 400 here means the
+				// comma-joined wire format drifted from _parse_filter_set.
+				Config: testAccMcpServerConnectionsConfig(mcpServerID, `
+  status = ["connected"]
+  owner  = ["user"]
+`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet(dataName, "connections.#"),
+				),
+			},
+		},
+	})
+}
+
+// TestAccMcpServerConnectionsDataSource_unknownServer pins that a
+// syntactically valid but nonexistent UUID surfaces as "not found", including
+// across Terraform's diagnostic line wrap (the id is 36 characters).
+func TestAccMcpServerConnectionsDataSource_unknownServer(t *testing.T) {
+	if os.Getenv("TF_ACC") == "" {
+		t.Skip("TF_ACC not set; skipping acceptance test")
+	}
+	testAccPreCheck(t)
+
+	if os.Getenv(envTestMCPServerID) == "" {
+		// Same fixture gate as the happy-path test, so a misconfigured nightly
+		// skips both rather than 404-testing in an org we never opted into.
+		t.Skipf("%s not set; skipping the barndoor_mcp_server_connections acceptance test.", envTestMCPServerID)
+	}
+
+	const unknownID = "00000000-0000-4000-8000-000000000001"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccMcpServerConnectionsConfig(unknownID, ""),
+				ExpectError: regexp.MustCompile(
+					`(?s)MCP server not found.*another organization is also reported as not\s+found`),
+			},
+		},
+	})
+}
+
+func testAccMcpServerConnectionsConfig(serverID, extra string) string {
+	return fmt.Sprintf(`
+data "barndoor_mcp_server_connections" "test" {
+  server_id = %q
+%s}
+`, serverID, extra)
 }
 
 // TestAccAgentResource_lifecycle exercises the barndoor_agent resource end to
