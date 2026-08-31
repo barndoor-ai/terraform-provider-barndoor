@@ -356,7 +356,10 @@ func TestMcpServerConnectionsDataSource_filtersReachTheAPI(t *testing.T) {
 }
 
 // TestMcpServerConnectionsDataSource_multiValueFilter pins the comma-joined
-// wire format for a multi-value filter, sorted so the request is stable.
+// wire format for a multi-value filter. The values are sorted so the request
+// is independent of framework set iteration order; this assertion checks the
+// joined encoding (`agent%2Cuser`), not that the sort itself is what produced
+// that order — the framework already hands this pair as agent-then-user.
 func TestMcpServerConnectionsDataSource_multiValueFilter(t *testing.T) {
 	fake := setupRegistryTest(t)
 	seedRoster(fake,
@@ -374,8 +377,6 @@ func TestMcpServerConnectionsDataSource_multiValueFilter(t *testing.T) {
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
-				// Deliberately out of order in the config to prove the request
-				// is sorted rather than iteration-order dependent.
 				Config: rosterConfig(`  owner = ["user", "agent"]
 `),
 				Check: resource.TestCheckResourceAttr(
@@ -419,6 +420,30 @@ func TestMcpServerConnectionsDataSource_rejectsUnknownOwner(t *testing.T) {
 	})
 }
 
+// TestMcpServerConnectionsDataSource_rejectsEmptyFilterSet pins SizeAtLeast(1)
+// on both filters. An empty set is not null, so without the validator csvFilter
+// would return "" and the request would go out unfiltered — every status/owner
+// class, which is the silent-widening (and privacy-exposing) direction.
+func TestMcpServerConnectionsDataSource_rejectsEmptyFilterSet(t *testing.T) {
+	setupRegistryTest(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: rosterConfig(`  status = []
+`),
+				ExpectError: regexp.MustCompile(`(?s)Invalid Attribute Value.*set must contain at least 1 elements`),
+			},
+			{
+				Config: rosterConfig(`  owner = []
+`),
+				ExpectError: regexp.MustCompile(`(?s)Invalid Attribute Value.*set must contain at least 1 elements`),
+			},
+		},
+	})
+}
+
 // TestMcpServerConnectionsDataSource_unknownServer pins that an unknown or
 // cross-organization server id surfaces as "not found", not as a permission
 // error — the endpoint answers 404 for another org's server deliberately, so it
@@ -432,7 +457,7 @@ func TestMcpServerConnectionsDataSource_unknownServer(t *testing.T) {
 			{
 				Config: rosterConfig(""),
 				ExpectError: regexp.MustCompile(
-					`(?s)MCP server not found.*another organization is also reported as not found`),
+					`(?s)MCP server not found.*another organization is also reported as not\s+found`),
 			},
 		},
 	})
@@ -463,9 +488,11 @@ func TestMcpServerConnectionsDataSource_forbidden(t *testing.T) {
 	})
 }
 
-// TestMcpServerConnectionsDataSource_softDeletedServerStillReadable pins the
-// intentional platform behaviour: the roster for a retired server is exactly
-// what an operator needs after deleting it.
+// TestMcpServerConnectionsDataSource_softDeletedServerStillReadable documents
+// the fake's fidelity choice: a soft-deleted server stays on the roster route,
+// matching the platform (the roster outlives the server row). The fake never
+// consults `deleted` — this does not observe that platform behaviour, it pins
+// that the fake's 404 path is "missing", not "deleted".
 func TestMcpServerConnectionsDataSource_softDeletedServerStillReadable(t *testing.T) {
 	fake := setupRegistryTest(t)
 	seedRoster(fake, fakeServerConnection{
