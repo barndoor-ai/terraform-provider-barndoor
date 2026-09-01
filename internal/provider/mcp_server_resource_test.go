@@ -60,6 +60,22 @@ type fakeRegistryServer struct {
 	// connection_resource_test.go.
 	nextConnID  int
 	connections map[string]*fakeConnection
+
+	// roster backs the admin GET /servers/{id}/connections endpoint, keyed by
+	// server id; see mcp_server_connections_data_source_test.go. It is separate
+	// from `connections` above, which models only the single service-account
+	// row this provider can create — a roster holds every principal's row,
+	// including people and agents the provider never creates.
+	roster map[string][]fakeServerConnection
+
+	// rosterForbidden makes the roster endpoint answer 403, standing in for a
+	// credential that is not an organization admin.
+	rosterForbidden bool
+
+	// rosterQueries records the raw query string of every roster request, so a
+	// filter test can assert the filter reached the API rather than inferring
+	// it from a response the fake could have filtered for other reasons.
+	rosterQueries []string
 }
 
 func newFakeRegistryServer() *fakeRegistryServer {
@@ -67,6 +83,7 @@ func newFakeRegistryServer() *fakeRegistryServer {
 		servers:     map[string]*fakeMcpServer{},
 		agents:      map[string]*fakeAgent{},
 		connections: map[string]*fakeConnection{},
+		roster:      map[string][]fakeServerConnection{},
 	}
 }
 
@@ -116,6 +133,8 @@ func (f *fakeRegistryServer) handleServers(w http.ResponseWriter, r *http.Reques
 		f.getServerBySlug(w, strings.TrimPrefix(id, "by-slug/"))
 	case strings.HasSuffix(id, "/connect") && r.Method == http.MethodPost:
 		f.connectServer(w, r, strings.TrimSuffix(id, "/connect"))
+	case strings.HasSuffix(id, "/connections") && r.Method == http.MethodGet:
+		f.listServerConnections(w, r, strings.TrimSuffix(id, "/connections"))
 	case strings.HasSuffix(id, "/connection"):
 		f.handleServerConnection(w, r, strings.TrimSuffix(id, "/connection"))
 	case id != "" && r.Method == http.MethodGet:
