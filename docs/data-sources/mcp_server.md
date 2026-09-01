@@ -46,6 +46,7 @@ resource "barndoor_policy" "github_readonly" {
 
 - `mcp_server_directory_id` (String) ID of the MCP server directory entry this server instantiates.
 - `oauth_base_url_override` (String) Tenant-specific OAuth base URL override for the upstream provider, when one is set.
+- `published_at` (String) RFC 3339 timestamp of when the server was published (made discoverable to end users); null while unpublished. Publishing is one-way: there is no unpublish.
 - `scopes` (List of String) Server-level OAuth scope override, when one is set (null means the directory entry's default scopes apply).
 - `status` (String) Lifecycle status computed by the platform: `pending` (awaiting credentials or an OAuth connection), `active`, or `error`.
 - `uses_managed_credentials` (Boolean) Whether the server uses Barndoor-managed OAuth credentials instead of tenant-supplied ones.

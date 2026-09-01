@@ -60,6 +60,7 @@ type mcpServerResourceModel struct {
 	Meta                    jsontypes.Normalized `tfsdk:"meta"`
 	PrepopulatedCredentials jsontypes.Normalized `tfsdk:"prepopulated_credentials"`
 	CascadedFields          types.List           `tfsdk:"cascaded_fields"`
+	PublishedAt             types.String         `tfsdk:"published_at"`
 }
 
 func (r *mcpServerResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -161,6 +162,13 @@ func (r *mcpServerResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 					listplanmodifier.RequiresReplace(),
 				},
 			},
+			"published_at": schema.StringAttribute{
+				MarkdownDescription: "RFC 3339 timestamp of when the server was published (made " +
+					"discoverable to end users); null while unpublished. **Read-only** — publish with the " +
+					"`barndoor_mcp_server_publication` resource. Publishing is one-way: there is no " +
+					"unpublish.",
+				Computed: true,
+			},
 		},
 	}
 }
@@ -258,6 +266,7 @@ func (r *mcpServerResource) Create(ctx context.Context, req resource.CreateReque
 		resp.Diagnostics.AddError("Failed to read the MCP server after create", err.Error())
 		plan.Slug = types.StringNull()
 		plan.Status = types.StringNull()
+		plan.PublishedAt = types.StringNull()
 		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		return
 	}
@@ -443,6 +452,7 @@ type mcpServerResponse struct {
 	OauthBaseURLOverride   *string  `json:"oauth_base_url_override"`
 	UsesManagedCredentials *bool    `json:"uses_managed_credentials"`
 	Scopes                 []string `json:"scopes"`
+	PublishedAt            *string  `json:"published_at"`
 }
 
 // buildMcpServerWriteRequest converts the planned model to the API body.
@@ -500,6 +510,7 @@ func applyMcpServerResponse(ctx context.Context, server *mcpServerResponse, prio
 		Slug:                 types.StringValue(server.Slug),
 		Status:               types.StringValue(server.Status),
 		OauthBaseURLOverride: optionalStringFromPtr(server.OauthBaseURLOverride, prior.OauthBaseURLOverride),
+		PublishedAt:          types.StringPointerValue(server.PublishedAt),
 
 		// Write-only: state follows configuration.
 		ClientID:                nullIfUnknownString(prior.ClientID),
