@@ -186,7 +186,7 @@ func (r *connectionResource) Create(ctx context.Context, req resource.CreateRequ
 	}
 
 	var initiated connectionInitiateResponse
-	connectPath := connectionServerPath(plan.ServerID.ValueString(), "connect") + "?as_service=true"
+	connectPath := serverPath(plan.ServerID.ValueString(), "connect") + "?as_service=true"
 	if err := doJSON(ctx, r.client, http.MethodPost, connectPath, body, &initiated); err != nil {
 		addConnectionAPIError(&resp.Diagnostics, "create the connection", err)
 		return
@@ -220,7 +220,7 @@ func (r *connectionResource) Create(ctx context.Context, req resource.CreateRequ
 
 	var conn connectionReadResponse
 	if err := doJSON(ctx, r.client, http.MethodGet,
-		connectionServerPath(plan.ServerID.ValueString(), "connection")+"?as_service=true", nil, &conn); err != nil {
+		serverPath(plan.ServerID.ValueString(), "connection")+"?as_service=true", nil, &conn); err != nil {
 		// The connection exists; track it (with unknowable computed fields
 		// nulled) so a subsequent apply reconciles instead of orphaning it.
 		resp.Diagnostics.AddError("Failed to read the connection after create", err.Error())
@@ -246,7 +246,7 @@ func (r *connectionResource) Read(ctx context.Context, req resource.ReadRequest,
 
 	var conn connectionReadResponse
 	err := doJSON(ctx, r.client, http.MethodGet,
-		connectionServerPath(state.ServerID.ValueString(), "connection")+"?as_service=true", nil, &conn)
+		serverPath(state.ServerID.ValueString(), "connection")+"?as_service=true", nil, &conn)
 	if err != nil {
 		if isNotFound(err) {
 			// Disconnected out-of-band — or the server itself is gone (both
@@ -285,7 +285,7 @@ func (r *connectionResource) Delete(ctx context.Context, req resource.DeleteRequ
 	}
 
 	err := doJSON(ctx, r.client, http.MethodDelete,
-		connectionServerPath(state.ServerID.ValueString(), "connection")+"?as_service=true", nil, nil)
+		serverPath(state.ServerID.ValueString(), "connection")+"?as_service=true", nil, nil)
 	if err != nil && !isNotFound(err) {
 		addConnectionAPIError(&resp.Diagnostics, "delete the connection", err)
 	}
@@ -309,10 +309,14 @@ func (r *connectionResource) requireClient(diags *diag.Diagnostics) bool {
 	return true
 }
 
-// connectionServerPath builds `/servers/{id}/{leaf}` with the server segment
-// path-escaped (it may be a slug).
-func connectionServerPath(serverID, leaf string) string {
-	return registryAPIPrefix + "/servers/" + url.PathEscape(serverID) + "/" + leaf
+// serverPath builds `/servers/{id}/{leaf}` (leaf may be empty) with the server
+// segment path-escaped (it may be a slug).
+func serverPath(serverID, leaf string) string {
+	p := registryAPIPrefix + "/servers/" + url.PathEscape(serverID)
+	if leaf == "" {
+		return p
+	}
+	return p + "/" + leaf
 }
 
 // addConnectionAPIError turns a registry API error into an actionable

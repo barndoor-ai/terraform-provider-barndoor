@@ -42,14 +42,32 @@ type fakeMcpServer struct {
 	// ClientID holds the obfuscated echo the real API returns; the real value
 	// is never stored, mirroring production.
 	ClientID *string `json:"client_id"`
+	// PublishedAt mirrors the one-way publish stamp (BCP-3039): set exactly
+	// once by POST /servers/{id}/publish, never cleared.
+	PublishedAt *string `json:"published_at"`
 
 	deleted bool
+	// hasActivePolicy emulates the publish route's ACTIVE-policy precondition
+	// (verified against policy-service in production). Fresh servers have no
+	// policy, so publish 422s until a test grants one via grantActivePolicy.
+	hasActivePolicy bool
 }
 
 type fakeRegistryServer struct {
 	mu      sync.Mutex
 	nextID  int
 	servers map[string]*fakeMcpServer
+
+	// publishes counts state-changing publishes, so each one gets its own
+	// timestamp (see fakePublishedAtFor). publishAttempts counts every call to
+	// the publish endpoint, rejected or not — the observable that tells a
+	// retried publish from a single attempt. grantPolicyOnAttempt, when
+	// non-zero, grants every server an ACTIVE policy once that many attempts
+	// have been made — a deterministic stand-in for "the policy lands during
+	// the same apply".
+	publishes            int
+	publishAttempts      int
+	grantPolicyOnAttempt int
 
 	// agents backs the /agents endpoints; see agent_resource_test.go.
 	nextAgentID int
@@ -116,6 +134,8 @@ func (f *fakeRegistryServer) handleServers(w http.ResponseWriter, r *http.Reques
 		f.getServerBySlug(w, strings.TrimPrefix(id, "by-slug/"))
 	case strings.HasSuffix(id, "/connect") && r.Method == http.MethodPost:
 		f.connectServer(w, r, strings.TrimSuffix(id, "/connect"))
+	case strings.HasSuffix(id, "/publish") && r.Method == http.MethodPost:
+		f.publishServer(w, strings.TrimSuffix(id, "/publish"))
 	case strings.HasSuffix(id, "/connection"):
 		f.handleServerConnection(w, r, strings.TrimSuffix(id, "/connection"))
 	case id != "" && r.Method == http.MethodGet:
@@ -270,6 +290,115 @@ func (f *fakeRegistryServer) updateServer(w http.ResponseWriter, r *http.Request
 	_ = json.NewEncoder(w).Encode(s)
 }
 
+// fakePublishedAtFor is the deterministic stamp the fake's publish endpoint
+// sets on the nth state-changing publish (n is 1-based). Per-publish rather
+// than one shared constant so a state assertion can tell "republished THIS
+// server" from "carried an earlier stamp forward" — the distinction
+// TestMcpServerPublicationResource_repointForcesReplace and
+// _unpublishedOutOfBandRepublishes turn on.
+func fakePublishedAtFor(n int) string {
+	return fmt.Sprintf("2026-08-19T00:00:%02dZ", n)
+}
+
+// publishServer emulates POST /servers/{id}/publish: one-way, idempotent, and
+// gated (in production order) on operational availability then an ACTIVE
+// policy. Re-publishing an already-published server is a no-op success that
+// skips the gates, like production.
+//
+// The operational-availability gate here is deliberately LOOSER than
+// production, which requires status=active AND (requires_auth=false OR source
+// in {embedded,local} OR a connected tenant service-account connection). The
+// fake has no directory-entry model to express that second term, so a server
+// activated by a client_id publishes cleanly here while an ordinary OAuth
+// server would 422 in production. Keep that in mind before reading a green
+// unit run as "this config applies against a real environment" — it is why
+// the documented example and the acceptance-test setup both need explicit
+// credentials or an embedded/local directory entry.
+func (f *fakeRegistryServer) publishServer(w http.ResponseWriter, id string) {
+	f.publishAttempts++
+	s, ok := f.servers[id]
+	if !ok || s.deleted {
+		writeJSONError(w, http.StatusNotFound, "MCP server not found")
+		return
+	}
+	if f.grantPolicyOnAttempt > 0 && f.publishAttempts >= f.grantPolicyOnAttempt {
+		s.hasActivePolicy = true
+	}
+	if s.PublishedAt == nil {
+		if s.Status != "active" {
+			writeJSONError(w, http.StatusUnprocessableEntity, "Cannot publish: server is not operationally available")
+			return
+		}
+		if !s.hasActivePolicy {
+			writeJSONError(w, http.StatusUnprocessableEntity, "Cannot publish: server has no ACTIVE policy")
+			return
+		}
+		f.publishes++
+		ts := fakePublishedAtFor(f.publishes)
+		s.PublishedAt = &ts
+	}
+	_ = json.NewEncoder(w).Encode(s)
+}
+
+// publishAttemptCount returns how many times the publish endpoint was called.
+func (f *fakeRegistryServer) publishAttemptCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.publishAttempts
+}
+
+// grantActivePolicy marks a stored server as having an ACTIVE policy, standing
+// in for the barndoor_policy resource a real policy_ids reference waits on.
+func (f *fakeRegistryServer) grantActivePolicy(t *testing.T, id string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.servers[id]
+	if !ok {
+		t.Fatalf("fake has no server %q to grant a policy to", id)
+	}
+	s.hasActivePolicy = true
+}
+
+// serverPublishedAt returns the stored publish stamp (nil = unpublished).
+func (f *fakeRegistryServer) serverPublishedAt(t *testing.T, id string) *string {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.servers[id]
+	if !ok {
+		t.Fatalf("fake has no server %q", id)
+	}
+	return s.PublishedAt
+}
+
+// unpublishServer clears a stored server's publish stamp out-of-band. There is
+// deliberately NO unpublish route on the fake (the real API has none) — this
+// mutates fake state directly, to exercise the provider's handling of a server
+// that reads back unpublished (a replaced/restored row).
+func (f *fakeRegistryServer) unpublishServer(t *testing.T, id string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.servers[id]
+	if !ok {
+		t.Fatalf("fake has no server %q to unpublish", id)
+	}
+	s.PublishedAt = nil
+}
+
+// serverDeleted reports whether the stored server is soft-deleted.
+func (f *fakeRegistryServer) serverDeleted(t *testing.T, id string) bool {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.servers[id]
+	if !ok {
+		t.Fatalf("fake has no server %q", id)
+	}
+	return s.deleted
+}
+
 // markServerDeleted soft-deletes a stored server out-of-band.
 func (f *fakeRegistryServer) markServerDeleted(t *testing.T, id string) {
 	t.Helper()
@@ -352,7 +481,7 @@ func TestMcpServerResource_Schema(t *testing.T) {
 	for _, attr := range []string{
 		"id", "name", "mcp_server_directory_id", "slug", "status", "oauth_base_url_override",
 		"uses_managed_credentials", "client_id", "client_secret", "scopes", "meta",
-		"prepopulated_credentials", "cascaded_fields",
+		"prepopulated_credentials", "cascaded_fields", "published_at",
 	} {
 		if _, ok := s.Attributes[attr]; !ok {
 			t.Errorf("schema missing attribute %q", attr)
@@ -364,7 +493,7 @@ func TestMcpServerResource_Schema(t *testing.T) {
 			t.Errorf("%s must be Sensitive", sensitive)
 		}
 	}
-	for _, computed := range []string{"id", "slug", "status"} {
+	for _, computed := range []string{"id", "slug", "status", "published_at"} {
 		if !s.Attributes[computed].IsComputed() {
 			t.Errorf("%s should be Computed", computed)
 		}

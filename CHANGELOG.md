@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+FEATURES:
+
+* **New Resource:** `barndoor_mcp_server_publication` — publishes an MCP server, the one-way, admin-initiated step that makes it discoverable to end users. It is a separate resource (not a flag on `barndoor_mcp_server`) because publishing requires an ACTIVE policy, and policies reference the server's id — so the publication is ordered after them by referencing their ids in the optional, ordering-only `policy_ids` attribute (no `depends_on`; editing the list later is an in-place state write, and it imports as null). Creation retries the two precondition rejections (server not operationally available / no ACTIVE policy) for up to two minutes, so a configuration expressing no ordering still converges when the policy lands during the same apply; every other error fails at once. Re-applying is an idempotent no-op; removing the declaration does **not** unpublish (unpublishing does not exist) and never touches the server; import by server id. Requires platform support for the server publish endpoint (bdai-platform BCP-3659 / #6611) (BCP-3734).
+
+ENHANCEMENTS:
+
+* resource/`barndoor_mcp_server`, data-source/`barndoor_mcp_server`: new read-only `published_at` attribute (RFC 3339; null while unpublished), so operators can see and assert whether a server is published. Requires platform support for `published_at` on the server response (bdai-platform BCP-3659 / #6611) (BCP-3734).
+* Nightly acceptance coverage now asserts publish-driven discoverability: a server's row in the registry listing carries `published_at` after publishing and not before. It deliberately avoids the `availability_status` filter, whose meaning is switched by an org feature flag and falls back to operational availability — an assertion built on it would be unsound in both directions. The end-user audience-scoped listing cannot be asserted by the provider's machine credential (it has no user record) and is covered by the platform's own e2e suite (BCP-3734).
+
 ## 0.5.0 (2026-08-31)
 
 FEATURES:

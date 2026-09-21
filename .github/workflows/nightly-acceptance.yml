@@ -60,6 +60,10 @@ jobs:
       BARNDOOR_TEST_MCP_SERVER_ID: ${{ vars.BARNDOOR_TEST_MCP_SERVER_ID }}
       BARNDOOR_TEST_MCP_SERVER_DIRECTORY_ID: ${{ vars.BARNDOOR_TEST_MCP_SERVER_DIRECTORY_ID }}
       BARNDOOR_TEST_APPLICATION_DIRECTORY_ID: ${{ vars.BARNDOOR_TEST_APPLICATION_DIRECTORY_ID }}
+      # A directory entry whose servers are operationally available without an
+      # OAuth connection — required by the publish preconditions (see
+      # TestAccMcpServerPublication_lifecycle).
+      BARNDOOR_TEST_PUBLISHABLE_MCP_SERVER_DIRECTORY_ID: ${{ vars.BARNDOOR_TEST_PUBLISHABLE_MCP_SERVER_DIRECTORY_ID }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
