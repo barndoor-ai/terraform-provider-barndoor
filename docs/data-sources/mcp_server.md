@@ -44,8 +44,10 @@ resource "barndoor_policy" "github_readonly" {
 
 ### Read-Only
 
+- `attention_tier` (String) What the server needs from an administrator next, as one value: `pending_publish`, `connection_error`, `pending_credentials`, `pending_connection`, or `available` (nothing outstanding). **Read-only**, and computed by the registry rather than stored: it is resolved against the organization's `mcp-server-publishing` feature flag, so with that flag off a server that is otherwise ready but unpublished reads `available` rather than `pending_publish`. Treat it as a reporting signal, not a publish precondition — assert on `publish_blockers` for that.
 - `mcp_server_directory_id` (String) ID of the MCP server directory entry this server instantiates.
 - `oauth_base_url_override` (String) Tenant-specific OAuth base URL override for the upstream provider, when one is set.
+- `publish_blockers` (List of String) Why a publish would be rejected right now, in the order the registry's publish gate evaluates them: `not_operationally_available` (the server has no working connection or credentials) and/or `no_active_policy` (no ACTIVE `barndoor_policy` targets it). **Read-only.** An empty list means a publish would be accepted; **null means undetermined** — the registry could not evaluate the gate (the `mcp-server-publishing` feature flag is off for the organization, or policy-service did not answer) — so null is not evidence that publishing will succeed.
 - `published_at` (String) RFC 3339 timestamp of when the server was published (made discoverable to end users); null while unpublished. Publishing is one-way: there is no unpublish.
 - `scopes` (List of String) Server-level OAuth scope override, when one is set (null means the directory entry's default scopes apply).
 - `status` (String) Lifecycle status computed by the platform: `pending` (awaiting credentials or an OAuth connection), `active`, or `error`.

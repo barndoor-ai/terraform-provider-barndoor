@@ -61,7 +61,31 @@ type mcpServerResourceModel struct {
 	PrepopulatedCredentials jsontypes.Normalized `tfsdk:"prepopulated_credentials"`
 	CascadedFields          types.List           `tfsdk:"cascaded_fields"`
 	PublishedAt             types.String         `tfsdk:"published_at"`
+	AttentionTier           types.String         `tfsdk:"attention_tier"`
+	PublishBlockers         types.List           `tfsdk:"publish_blockers"`
 }
+
+// The two read-only publish-gate attributes are exposed identically by this
+// resource and by the barndoor_mcp_server data source, so their descriptions
+// live here and are shared: two copies of this wording would drift, and the
+// published docs are generated from it.
+const (
+	attentionTierDescription = "What the server needs from an administrator next, as one value: " +
+		"`pending_publish`, `connection_error`, `pending_credentials`, `pending_connection`, or " +
+		"`available` (nothing outstanding). **Read-only**, and computed by the registry rather " +
+		"than stored: it is resolved against the organization's `mcp-server-publishing` feature " +
+		"flag, so with that flag off a server that is otherwise ready but unpublished reads " +
+		"`available` rather than `pending_publish`. Treat it as a reporting signal, not a " +
+		"publish precondition — assert on `publish_blockers` for that."
+
+	publishBlockersDescription = "Why a publish would be rejected right now, in the order the " +
+		"registry's publish gate evaluates them: `not_operationally_available` (the server has " +
+		"no working connection or credentials) and/or `no_active_policy` (no ACTIVE " +
+		"`barndoor_policy` targets it). **Read-only.** An empty list means a publish would be " +
+		"accepted; **null means undetermined** — the registry could not evaluate the gate " +
+		"(the `mcp-server-publishing` feature flag is off for the organization, or " +
+		"policy-service did not answer) — so null is not evidence that publishing will succeed."
+)
 
 func (r *mcpServerResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
 	resp.TypeName = req.ProviderTypeName + "_mcp_server"
@@ -169,6 +193,15 @@ func (r *mcpServerResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 					"unpublish.",
 				Computed: true,
 			},
+			"attention_tier": schema.StringAttribute{
+				MarkdownDescription: attentionTierDescription,
+				Computed:            true,
+			},
+			"publish_blockers": schema.ListAttribute{
+				MarkdownDescription: publishBlockersDescription,
+				ElementType:         types.StringType,
+				Computed:            true,
+			},
 		},
 	}
 }
@@ -267,6 +300,8 @@ func (r *mcpServerResource) Create(ctx context.Context, req resource.CreateReque
 		plan.Slug = types.StringNull()
 		plan.Status = types.StringNull()
 		plan.PublishedAt = types.StringNull()
+		plan.AttentionTier = types.StringNull()
+		plan.PublishBlockers = types.ListNull(types.StringType)
 		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		return
 	}
@@ -453,6 +488,19 @@ type mcpServerResponse struct {
 	UsesManagedCredentials *bool    `json:"uses_managed_credentials"`
 	Scopes                 []string `json:"scopes"`
 	PublishedAt            *string  `json:"published_at"`
+	AttentionTier          *string  `json:"attention_tier"`
+	// PublishBlockers is a POINTER to a slice because the registry's null and
+	// [] carry different meanings that must both survive to state: null is
+	// "undetermined" (the publishing feature flag is off, or policy-service did
+	// not answer) while [] is the positive "a publish would be accepted". The
+	// pointer makes that distinction explicit and un-loseable. A bare []string
+	// can in principle carry it too — encoding/json leaves the field nil for
+	// null/absent and allocates an empty slice for `[]` — but nil-vs-empty on a
+	// slice is invisible to len(), survives no append or normalization step,
+	// and is preserved only by convention; a nil pointer cannot be mistaken for
+	// an empty one. The wire contract itself is pinned by
+	// TestMcpServerResponse_PublishGateFieldsUnmarshal.
+	PublishBlockers *[]string `json:"publish_blockers"`
 }
 
 // buildMcpServerWriteRequest converts the planned model to the API body.
@@ -511,6 +559,7 @@ func applyMcpServerResponse(ctx context.Context, server *mcpServerResponse, prio
 		Status:               types.StringValue(server.Status),
 		OauthBaseURLOverride: optionalStringFromPtr(server.OauthBaseURLOverride, prior.OauthBaseURLOverride),
 		PublishedAt:          types.StringPointerValue(server.PublishedAt),
+		AttentionTier:        types.StringPointerValue(server.AttentionTier),
 
 		// Write-only: state follows configuration.
 		ClientID:                nullIfUnknownString(prior.ClientID),
@@ -534,7 +583,23 @@ func applyMcpServerResponse(ctx context.Context, server *mcpServerResponse, prio
 	if m.Scopes, err = listFromStrings(ctx, server.Scopes, prior.Scopes); err != nil {
 		return mcpServerResourceModel{}, fmt.Errorf("scopes: %w", err)
 	}
+	if m.PublishBlockers, err = nullableListFromStrings(ctx, server.PublishBlockers); err != nil {
+		return mcpServerResourceModel{}, fmt.Errorf("publish_blockers: %w", err)
+	}
 	return m, nil
+}
+
+// nullableListFromStrings maps a nullable wire string list to a computed-only
+// state list, preserving the distinction the sender drew: a null pointer (JSON
+// null, or the key absent) becomes a null list and a non-nil pointer becomes a
+// concrete list — `[]` included. Unlike listFromStrings it never settles an
+// empty list to null, because for these attributes empty and null are
+// different answers, not the same absence.
+func nullableListFromStrings(ctx context.Context, vals *[]string) (types.List, error) {
+	if vals == nil {
+		return types.ListNull(types.StringType), nil
+	}
+	return computedListFromStrings(ctx, *vals)
 }
 
 // listFromStrings maps a wire string list to state, settling an empty

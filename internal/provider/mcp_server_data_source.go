@@ -54,6 +54,8 @@ type mcpServerDataSourceModel struct {
 	UsesManagedCredentials types.Bool   `tfsdk:"uses_managed_credentials"`
 	Scopes                 types.List   `tfsdk:"scopes"`
 	PublishedAt            types.String `tfsdk:"published_at"`
+	AttentionTier          types.String `tfsdk:"attention_tier"`
+	PublishBlockers        types.List   `tfsdk:"publish_blockers"`
 }
 
 func (d *mcpServerDataSource) Metadata(_ context.Context, req datasource.MetadataRequest, resp *datasource.MetadataResponse) {
@@ -116,6 +118,15 @@ func (d *mcpServerDataSource) Schema(_ context.Context, _ datasource.SchemaReque
 					"discoverable to end users); null while unpublished. Publishing is one-way: there is " +
 					"no unpublish.",
 				Computed: true,
+			},
+			"attention_tier": schema.StringAttribute{
+				MarkdownDescription: attentionTierDescription,
+				Computed:            true,
+			},
+			"publish_blockers": schema.ListAttribute{
+				MarkdownDescription: publishBlockersDescription,
+				ElementType:         types.StringType,
+				Computed:            true,
 			},
 		},
 	}
@@ -213,6 +224,7 @@ func applyMcpServerDataSource(ctx context.Context, server *mcpServerResponse, da
 	data.McpServerDirectoryID = types.StringValue(server.McpServerDirectoryID)
 	data.OauthBaseURLOverride = optionalStringFromPtr(server.OauthBaseURLOverride, types.StringNull())
 	data.PublishedAt = types.StringPointerValue(server.PublishedAt)
+	data.AttentionTier = types.StringPointerValue(server.AttentionTier)
 	if server.UsesManagedCredentials == nil {
 		data.UsesManagedCredentials = types.BoolNull()
 	} else {
@@ -224,6 +236,12 @@ func applyMcpServerDataSource(ctx context.Context, server *mcpServerResponse, da
 		return fmt.Errorf("scopes: %w", err)
 	}
 	data.Scopes = scopes
+
+	blockers, err := nullableListFromStrings(ctx, server.PublishBlockers)
+	if err != nil {
+		return fmt.Errorf("publish_blockers: %w", err)
+	}
+	data.PublishBlockers = blockers
 	return nil
 }
 

@@ -90,6 +90,19 @@ func TestMcpServerDataSource_Schema(t *testing.T) {
 			t.Errorf("schema missing attribute %q", attr)
 		}
 	}
+
+	// Both publish-gate fields are read-only on the data source too, as is
+	// published_at; only the three lookup keys are settable.
+	for _, readOnly := range []string{"published_at", "attention_tier", "publish_blockers"} {
+		a, ok := resp.Schema.Attributes[readOnly]
+		if !ok {
+			t.Errorf("schema missing attribute %q", readOnly)
+			continue
+		}
+		if !a.IsComputed() || a.IsOptional() || a.IsRequired() {
+			t.Errorf("%s must be Computed-only, never Optional or Required", readOnly)
+		}
+	}
 }
 
 // --- lifecycle (real plan/apply against the fake) ---------------------------------

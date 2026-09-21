@@ -61,6 +61,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -830,6 +832,141 @@ func accCheckServerPublishedInListing(c *client.Client, serverName string, want 
 			return fmt.Errorf("unpublished server %s reads back published in the listing "+
 				"(published_at = %s)", serverID, *published)
 		}
+		return nil
+	}
+}
+
+// mcpServerPublishBlockers is the vocabulary the provider's schema
+// documentation promises for `publish_blockers` (BCP-3815). It lives here, in
+// the tests, and NOT in the provider: the provider passes whatever the registry
+// sends straight through, so that the day registry adds a reason the provider
+// surfaces it instead of failing to map it. The cost of that choice is that
+// nothing in production catches documentation drift — which is what the
+// acceptance check below is for.
+var mcpServerPublishBlockers = []string{"not_operationally_available", "no_active_policy"}
+
+// TestAccMcpServerPublishGateFields asserts the two read-only publish-gate
+// attributes against a real registry, on both read paths (the managed resource
+// and the data source). Only a live environment can show that the API actually
+// *sends* them — the unit tests feed the response DTO directly, so a registry
+// that dropped `attention_tier` tomorrow would leave every one of them green
+// while the attribute silently read null for every practitioner.
+//
+// It uses the publishable-directory fixture rather than the ordinary
+// barndoor_mcp_server one because the tier assertion is only meaningful for an
+// operationally available server, and an embedded/local directory entry is the
+// only kind registry creates `active` without credentials (see the env var's
+// comment). The server is created and left unpublished; destroy soft-deletes
+// it, so runs are self-cleaning.
+func TestAccMcpServerPublishGateFields(t *testing.T) {
+	if os.Getenv("TF_ACC") == "" {
+		t.Skip("TF_ACC not set; skipping acceptance test")
+	}
+	testAccPreCheck(t)
+
+	directoryID := os.Getenv(envTestPublishableMCPServerDirectoryID)
+	if directoryID == "" {
+		t.Skipf("PUBLISH-GATE COVERAGE ABSENT: %s is not set, so nothing verifies that the registry "+
+			"sends attention_tier and publish_blockers at all — the unit tests cannot, they construct the "+
+			"response themselves. This is not a passing test, it is no test. Set the variable (as a `dev` "+
+			"environment Actions variable for the nightly workflow) to the id of a directory entry with "+
+			"`source = embedded` or `source = local`.", envTestPublishableMCPServerDirectoryID)
+	}
+
+	name := fmt.Sprintf("tf-acc-gate-%d", time.Now().UnixNano())
+	const serverName = "barndoor_mcp_server.test"
+	const dataSourceName = "data.barndoor_mcp_server.gate"
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccMcpServerConfig(directoryID, name, "") + `
+data "barndoor_mcp_server" "gate" {
+  id = barndoor_mcp_server.test.id
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					// The two preconditions the tier expectation rests on: the
+					// server is operationally available and not yet published.
+					resource.TestCheckResourceAttr(serverName, "status", "active"),
+					resource.TestCheckNoResourceAttr(serverName, "published_at"),
+
+					accCheckPublishGateFields(t, serverName),
+					accCheckPublishGateFields(t, dataSourceName),
+				),
+			},
+		},
+	})
+}
+
+// accCheckPublishGateFields asserts the publish-gate attributes on one address
+// (a resource or a data source) in state.
+//
+// attention_tier is required to be PRESENT — a missing field reads as null and
+// fails here, which is the only way that drift gets caught — and to be one of
+// the two tiers a ready, unpublished server can legitimately report: `available`
+// with the `mcp-server-publishing` flag off, `pending_publish` with it on.
+// Pinning it to `available` exactly would turn the nightly red the day that flag
+// is enabled for the dev organization, on a correctly behaving provider.
+//
+// publish_blockers is asserted the same way for the same reason. Null is a
+// legitimate value here (with the flag off the registry does not evaluate the
+// gate), and null is indistinguishable from an absent key, so its presence
+// cannot be required. What is asserted is that when the registry DOES send it,
+// every reason is one the schema documents. Either way the check logs which
+// shape it saw, so a green run states what it actually exercised.
+func accCheckPublishGateFields(t *testing.T, addr string) resource.TestCheckFunc {
+	t.Helper()
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources[addr]
+		if !ok {
+			return fmt.Errorf("%s not in state", addr)
+		}
+		attrs := rs.Primary.Attributes
+
+		tier, ok := attrs["attention_tier"]
+		if !ok {
+			return fmt.Errorf("%s: attention_tier is null — the registry sent no attention_tier on the "+
+				"server read payload, so the attribute is dead for every practitioner (BCP-3815)", addr)
+		}
+		switch tier {
+		case "available":
+			t.Logf("%s: attention_tier = %q — the shape for a ready, unpublished server with the "+
+				"mcp-server-publishing flag off", addr, tier)
+		case "pending_publish":
+			t.Logf("%s: attention_tier = %q — the shape for a ready, unpublished server with the "+
+				"mcp-server-publishing flag on", addr, tier)
+		default:
+			return fmt.Errorf("%s: attention_tier = %q, want \"available\" or \"pending_publish\" for a "+
+				"freshly created, unpublished, operationally available server — those are the only two "+
+				"tiers that state can report, with the mcp-server-publishing flag off and on respectively",
+				addr, tier)
+		}
+
+		count, present := attrs["publish_blockers.#"]
+		if !present {
+			t.Logf("%s: publish_blockers is null (gate undetermined), which is the expected shape "+
+				"with the mcp-server-publishing flag off", addr)
+			return nil
+		}
+		n, err := strconv.Atoi(count)
+		if err != nil {
+			return fmt.Errorf("%s: publish_blockers.# = %q, not a count: %w", addr, count, err)
+		}
+		reasons := make([]string, 0, n)
+		for i := range n {
+			reason := attrs[fmt.Sprintf("publish_blockers.%d", i)]
+			if !slices.Contains(mcpServerPublishBlockers, reason) {
+				return fmt.Errorf("%s: publish_blockers[%d] = %q, outside the vocabulary the schema "+
+					"documents (%v) — registry added a blocker reason and the provider's documentation "+
+					"is now stale", addr, i, reason, mcpServerPublishBlockers)
+			}
+			reasons = append(reasons, reason)
+		}
+		t.Logf("%s: publish_blockers = %v (gate evaluated, so the mcp-server-publishing flag is on "+
+			"for this organization)", addr, reasons)
 		return nil
 	}
 }

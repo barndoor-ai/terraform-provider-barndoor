@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+ENHANCEMENTS:
+
+* resource/`barndoor_mcp_server`, data-source/`barndoor_mcp_server`: new read-only `attention_tier` attribute — what the server needs from an administrator next, as a single value (`pending_publish`, `connection_error`, `pending_credentials`, `pending_connection`, or `available`). It is computed per read rather than stored, and resolved against the organization's `mcp-server-publishing` feature flag: with that flag off, a server that is otherwise ready but unpublished reads `available` rather than `pending_publish`. Treat it as a reporting signal, not a publish precondition — `publish_blockers` is the attribute to assert on for that. Requires platform support for `attention_tier` on the server response (bdai-platform BCP-3815) (BCP-4012).
+* resource/`barndoor_mcp_server`, data-source/`barndoor_mcp_server`: new read-only `publish_blockers` attribute — why a publish would be rejected right now, listed in the order the registry's publish gate evaluates them (`not_operationally_available` and/or `no_active_policy`, the same two preconditions `barndoor_mcp_server_publication` retries on during create). Empty and null mean different things and both round-trip: `[]` is "the gate was evaluated and nothing blocks a publish", while null is "undetermined" — the registry could not evaluate the gate, so null is not evidence that publishing will succeed. Requires platform support for `publish_blockers` on the server response (bdai-platform BCP-3815) (BCP-4012).
+* Nightly acceptance coverage now asserts that the registry actually sends both fields on a real server read, on the resource and the data source alike — the unit tests construct the response themselves, so they would stay green if the API dropped either field. `attention_tier` must be present and one of the two tiers a ready, unpublished server can report (`available` with the `mcp-server-publishing` flag off, `pending_publish` with it on); `publish_blockers` is asserted by vocabulary rather than by presence, because null is a legitimate value for it with the flag off and is indistinguishable from an absent key (BCP-4012).
+
 ## 0.6.0 (2026-09-21)
 
 FEATURES:

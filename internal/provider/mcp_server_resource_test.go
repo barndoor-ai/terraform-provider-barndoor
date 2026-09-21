@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -19,7 +20,10 @@ import (
 	frameworkschema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
+	"github.com/hashicorp/terraform-plugin-testing/statecheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
 )
 
 // --- in-process fake registry-service --------------------------------------------
@@ -45,6 +49,16 @@ type fakeMcpServer struct {
 	// PublishedAt mirrors the one-way publish stamp (BCP-3039): set exactly
 	// once by POST /servers/{id}/publish, never cleared.
 	PublishedAt *string `json:"published_at"`
+	// AttentionTier and PublishBlockers mirror the two read-only publish-gate
+	// fields the registry computes per read (BCP-3815). The fake deliberately
+	// does NOT model their derivation: it is flag-resolved and lives in
+	// registry-service, and the provider passes both through without
+	// interpreting them, so simulating it here would only encode a guess. They
+	// are seeded to the documented flag-off shape at create
+	// (fakeDefaultAttentionTier / null blockers) and driven explicitly by
+	// setServerAttention, which is the instrument the mapping tests need.
+	AttentionTier   *string   `json:"attention_tier"`
+	PublishBlockers *[]string `json:"publish_blockers"`
 
 	deleted bool
 	// hasActivePolicy emulates the publish route's ACTIVE-policy precondition
@@ -68,6 +82,11 @@ type fakeRegistryServer struct {
 	publishes            int
 	publishAttempts      int
 	grantPolicyOnAttempt int
+
+	// failNextServerGet makes the next GET /servers/{id} return a 500 and
+	// resets itself, so a test can drive the narrow window where create
+	// succeeded but the follow-up read did not.
+	failNextServerGet bool
 
 	// agents backs the /agents endpoints; see agent_resource_test.go.
 	nextAgentID int
@@ -139,6 +158,11 @@ func (f *fakeRegistryServer) handleServers(w http.ResponseWriter, r *http.Reques
 	case strings.HasSuffix(id, "/connection"):
 		f.handleServerConnection(w, r, strings.TrimSuffix(id, "/connection"))
 	case id != "" && r.Method == http.MethodGet:
+		if f.failNextServerGet {
+			f.failNextServerGet = false
+			writeJSONError(w, http.StatusInternalServerError, "registry is having a moment")
+			return
+		}
 		s, ok := f.servers[id]
 		if !ok || s.deleted {
 			writeJSONError(w, http.StatusNotFound, "MCP server not found")
@@ -197,6 +221,7 @@ func (f *fakeRegistryServer) createServer(w http.ResponseWriter, r *http.Request
 
 	f.nextID++
 	id := fmt.Sprintf("00000000-0000-0000-0000-%012d", f.nextID)
+	defaultTier := fakeDefaultAttentionTier
 	status := "pending"
 	if body.ClientID != nil || (body.UsesManagedCredentials != nil && *body.UsesManagedCredentials) ||
 		len(body.PrepopulatedCredentials) > 0 {
@@ -211,6 +236,7 @@ func (f *fakeRegistryServer) createServer(w http.ResponseWriter, r *http.Request
 		OauthBaseURLOverride:   body.OauthBaseURLOverride,
 		UsesManagedCredentials: body.UsesManagedCredentials,
 		Scopes:                 body.Scopes,
+		AttentionTier:          &defaultTier,
 	}
 	if body.ClientID != nil {
 		ob := obfuscate(*body.ClientID)
@@ -360,6 +386,36 @@ func (f *fakeRegistryServer) grantActivePolicy(t *testing.T, id string) {
 	s.hasActivePolicy = true
 }
 
+// fakeDefaultAttentionTier is the tier the fake stamps on a freshly created
+// server: a ready-but-unpublished server with the `mcp-server-publishing` flag
+// off, which is the shape of every server the fake serves.
+const fakeDefaultAttentionTier = "available"
+
+// setServerAttention overwrites a stored server's publish-gate read fields
+// out-of-band, standing in for the registry recomputing them between reads.
+// Both parameters are pointers so a test can drive the three distinct wire
+// shapes the provider must keep apart: nil blockers (JSON null — the gate was
+// not evaluated), a pointer to an empty slice (`[]` — a publish would be
+// accepted), and a pointer to a populated slice.
+func (f *fakeRegistryServer) setServerAttention(t *testing.T, id string, tier *string, blockers *[]string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.servers[id]
+	if !ok {
+		t.Fatalf("fake has no server %q to set attention fields on", id)
+	}
+	s.AttentionTier = tier
+	s.PublishBlockers = blockers
+}
+
+// failServerGetOnce arms a one-shot 500 on the next GET /servers/{id}.
+func (f *fakeRegistryServer) failServerGetOnce() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failNextServerGet = true
+}
+
 // serverPublishedAt returns the stored publish stamp (nil = unpublished).
 func (f *fakeRegistryServer) serverPublishedAt(t *testing.T, id string) *string {
 	t.Helper()
@@ -481,7 +537,8 @@ func TestMcpServerResource_Schema(t *testing.T) {
 	for _, attr := range []string{
 		"id", "name", "mcp_server_directory_id", "slug", "status", "oauth_base_url_override",
 		"uses_managed_credentials", "client_id", "client_secret", "scopes", "meta",
-		"prepopulated_credentials", "cascaded_fields", "published_at",
+		"prepopulated_credentials", "cascaded_fields", "published_at", "attention_tier",
+		"publish_blockers",
 	} {
 		if _, ok := s.Attributes[attr]; !ok {
 			t.Errorf("schema missing attribute %q", attr)
@@ -493,9 +550,42 @@ func TestMcpServerResource_Schema(t *testing.T) {
 			t.Errorf("%s must be Sensitive", sensitive)
 		}
 	}
-	for _, computed := range []string{"id", "slug", "status", "published_at"} {
+	for _, computed := range []string{"id", "slug", "status", "published_at", "attention_tier", "publish_blockers"} {
 		if !s.Attributes[computed].IsComputed() {
 			t.Errorf("%s should be Computed", computed)
+		}
+	}
+	// The publish-gate fields are server-derived and change between reads
+	// without any configuration change. Computed-ONLY is what keeps that from
+	// ever surfacing as a plan diff: making either of them Optional would
+	// invite a practitioner to set it and turn every registry recomputation
+	// into drift.
+	//
+	// They must also carry NO plan modifiers. `id` and `slug` pin themselves
+	// with UseStateForUnknown because they are immutable for a server's whole
+	// life; these two are the opposite — the registry recomputes them per read
+	// — and pinning a volatile value to prior state is how a provider ends up
+	// reporting a stale tier, or failing an apply with "Provider produced
+	// inconsistent result after apply" when the value moves between the plan
+	// and the write. A lifecycle test cannot catch this (the refresh that
+	// precedes every plan hides it), so it is pinned here.
+	for _, readOnly := range []string{"attention_tier", "publish_blockers"} {
+		attr := s.Attributes[readOnly]
+		if attr.IsOptional() || attr.IsRequired() {
+			t.Errorf("%s must be Computed-only, never Optional or Required", readOnly)
+		}
+		var planModifiers int
+		switch a := attr.(type) {
+		case frameworkschema.StringAttribute:
+			planModifiers = len(a.PlanModifiers)
+		case frameworkschema.ListAttribute:
+			planModifiers = len(a.PlanModifiers)
+		default:
+			t.Errorf("%s has unexpected attribute type %T; extend this check", readOnly, attr)
+			continue
+		}
+		if planModifiers != 0 {
+			t.Errorf("%s must carry no plan modifiers, got %d", readOnly, planModifiers)
 		}
 	}
 	for _, required := range []string{"name", "mcp_server_directory_id"} {
@@ -606,6 +696,180 @@ func TestApplyMcpServerResponse_WriteOnlyFieldsFollowConfig(t *testing.T) {
 	}
 	if state.Status.ValueString() != "active" || state.Slug.ValueString() != "acme" {
 		t.Errorf("computed fields mismapped: %+v", state)
+	}
+}
+
+// TestMcpServerResponse_PublishGateFieldsUnmarshal pins the WIRE contract of
+// the two publish-gate fields: what the registry's JSON decodes to in
+// mcpServerResponse, before any mapping runs.
+//
+// This is where the null-vs-`[]` guarantee on publish_blockers actually lives.
+// The registry distinguishes "the gate was not evaluated" (null, or the key
+// absent) from "evaluated, nothing blocks a publish" (`[]`); collapsing them
+// would turn an unanswered gate into a green light. A *[]string keeps the two
+// apart at the decode boundary — nil pointer versus a pointer to an empty
+// slice — and this test fails if the field is ever widened back to a bare
+// slice, where the distinction would survive only by convention.
+func TestMcpServerResponse_PublishGateFieldsUnmarshal(t *testing.T) {
+	tierAvailable := "available"
+	tierPendingPublish := "pending_publish"
+
+	for _, tc := range []struct {
+		name         string
+		payload      string
+		wantNilPtr   bool
+		wantElements []string
+		wantTier     *string
+	}{
+		{
+			name:       "blockers null: gate undetermined",
+			payload:    `{"id":"srv-1","attention_tier":"available","publish_blockers":null}`,
+			wantNilPtr: true,
+			wantTier:   &tierAvailable,
+		},
+		{
+			name:       "blockers key absent: gate undetermined",
+			payload:    `{"id":"srv-1"}`,
+			wantNilPtr: true,
+			wantTier:   nil,
+		},
+		{
+			name:         "blockers []: gate evaluated, publish would be accepted",
+			payload:      `{"id":"srv-1","attention_tier":"pending_publish","publish_blockers":[]}`,
+			wantElements: []string{},
+			wantTier:     &tierPendingPublish,
+		},
+		{
+			name:         "blockers populated: reasons in gate order",
+			payload:      `{"id":"srv-1","publish_blockers":["not_operationally_available"]}`,
+			wantElements: []string{"not_operationally_available"},
+			wantTier:     nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got mcpServerResponse
+			if err := json.Unmarshal([]byte(tc.payload), &got); err != nil {
+				t.Fatalf("json.Unmarshal(%s): %v", tc.payload, err)
+			}
+
+			if (got.PublishBlockers == nil) != tc.wantNilPtr {
+				t.Fatalf("publish_blockers pointer nil = %t, want %t (null/absent and [] mean "+
+					"different things here)", got.PublishBlockers == nil, tc.wantNilPtr)
+			}
+			if !tc.wantNilPtr && !slices.Equal(*got.PublishBlockers, tc.wantElements) {
+				t.Errorf("publish_blockers = %v, want %v", *got.PublishBlockers, tc.wantElements)
+			}
+
+			switch {
+			case tc.wantTier == nil && got.AttentionTier != nil:
+				t.Errorf("attention_tier = %q, want nil for an absent key", *got.AttentionTier)
+			case tc.wantTier != nil && got.AttentionTier == nil:
+				t.Errorf("attention_tier = nil, want %q", *tc.wantTier)
+			case tc.wantTier != nil && *got.AttentionTier != *tc.wantTier:
+				t.Errorf("attention_tier = %q, want %q", *got.AttentionTier, *tc.wantTier)
+			}
+		})
+	}
+}
+
+// TestApplyMcpServerResponse_PublishGateFieldsRoundTrip pins the MAPPER's
+// wire→state handling of the two read-only publish-gate fields, for BOTH the
+// resource and the data source, so the two paths cannot drift apart. It is
+// hermetic: it builds the response struct in Go and needs no terraform binary.
+//
+// The load-bearing case is null-vs-`[]` on publish_blockers: the registry
+// distinguishes "the gate was not evaluated" (null — the publishing feature
+// flag is off, or policy-service did not answer) from "evaluated, nothing
+// blocks a publish" (`[]`). Collapsing them would turn an unanswered gate into
+// a green light. The decode side of that guarantee is pinned by
+// TestMcpServerResponse_PublishGateFieldsUnmarshal, and the end-to-end path by
+// TestMcpServerResource_publishGateFieldsTrackTheServer.
+func TestApplyMcpServerResponse_PublishGateFieldsRoundTrip(t *testing.T) {
+	tierAvailable := "available"
+	tierPendingPublish := "pending_publish"
+	noBlockers := []string{}
+	twoBlockers := []string{"not_operationally_available", "no_active_policy"}
+
+	for _, tc := range []struct {
+		name         string
+		tier         *string
+		blockers     *[]string
+		wantTier     types.String
+		wantListNull bool
+		wantElements []string
+	}{
+		{
+			name:         "undetermined gate: both null",
+			tier:         nil,
+			blockers:     nil,
+			wantTier:     types.StringNull(),
+			wantListNull: true,
+		},
+		{
+			name:         "evaluated and clear: empty list, not null",
+			tier:         &tierPendingPublish,
+			blockers:     &noBlockers,
+			wantTier:     types.StringValue("pending_publish"),
+			wantElements: []string{},
+		},
+		{
+			name:         "evaluated and blocked: reasons in gate order",
+			tier:         &tierAvailable,
+			blockers:     &twoBlockers,
+			wantTier:     types.StringValue("available"),
+			wantElements: []string{"not_operationally_available", "no_active_policy"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := &mcpServerResponse{
+				ID:              "srv-1",
+				Name:            "Acme",
+				Slug:            "acme",
+				Status:          "active",
+				AttentionTier:   tc.tier,
+				PublishBlockers: tc.blockers,
+			}
+
+			prior := &mcpServerResourceModel{Scopes: types.ListNull(types.StringType)}
+			state, err := applyMcpServerResponse(context.Background(), server, prior)
+			if err != nil {
+				t.Fatalf("applyMcpServerResponse: %v", err)
+			}
+
+			var data mcpServerDataSourceModel
+			if err := applyMcpServerDataSource(context.Background(), server, &data); err != nil {
+				t.Fatalf("applyMcpServerDataSource: %v", err)
+			}
+
+			for _, got := range []struct {
+				source   string
+				tier     types.String
+				blockers types.List
+			}{
+				{"resource", state.AttentionTier, state.PublishBlockers},
+				{"data source", data.AttentionTier, data.PublishBlockers},
+			} {
+				if !got.tier.Equal(tc.wantTier) {
+					t.Errorf("%s attention_tier = %s, want %s", got.source, got.tier, tc.wantTier)
+				}
+				if got.blockers.IsNull() != tc.wantListNull {
+					t.Errorf("%s publish_blockers IsNull() = %t, want %t (null and [] mean different "+
+						"things here)", got.source, got.blockers.IsNull(), tc.wantListNull)
+					continue
+				}
+				if tc.wantListNull {
+					continue
+				}
+				var elems []string
+				if diags := got.blockers.ElementsAs(context.Background(), &elems, false); diags.HasError() {
+					t.Fatalf("%s publish_blockers ElementsAs: %+v", got.source, diags)
+				}
+				if !slices.Equal(elems, tc.wantElements) {
+					t.Errorf("%s publish_blockers = %v, want %v (order is the gate's)",
+						got.source, elems, tc.wantElements)
+				}
+			}
+		})
 	}
 }
 
@@ -759,6 +1023,155 @@ func TestMcpServerResource_prepopulatedCredentialsCreate(t *testing.T) {
 					resource.TestCheckResourceAttr(resourceName, "status", "active"),
 					resource.TestCheckResourceAttr(resourceName, "cascaded_fields.0", "api_key"),
 				),
+			},
+		},
+	})
+}
+
+// gateStateChecks asserts attention_tier and publish_blockers on both read
+// paths — the managed resource and a data source reading the same server — so
+// the two mappings cannot drift apart.
+//
+// These are statecheck/knownvalue assertions rather than TestCheckResourceAttr
+// ones on purpose. The legacy flatmap helpers deliberately conflate an absent
+// collection with a zero-length one (testCheckNoResourceAttr returns nil for a
+// ".#" of "0", and TestCheckResourceAttrPair treats unset and "0" as equal), so
+// they are structurally incapable of telling null publish_blockers from [] —
+// precisely the distinction under test. knownvalue.Null and
+// knownvalue.ListSizeExact(0) read the JSON state and are mutually exclusive.
+func gateStateChecks(tier, blockers knownvalue.Check) []statecheck.StateCheck {
+	var checks []statecheck.StateCheck
+	for _, addr := range []string{"barndoor_mcp_server.test", "data.barndoor_mcp_server.gate"} {
+		checks = append(checks,
+			statecheck.ExpectKnownValue(addr, tfjsonpath.New("attention_tier"), tier),
+			statecheck.ExpectKnownValue(addr, tfjsonpath.New("publish_blockers"), blockers),
+		)
+	}
+	return checks
+}
+
+// TestMcpServerResource_publishGateFieldsTrackTheServer drives the two
+// read-only publish-gate fields through every wire shape the registry can
+// return, against real plan/apply cycles.
+//
+// Three properties are under test, and each step is built so that breaking one
+// of them fails the step:
+//
+//   - The values follow the server. Each step changes them out-of-band first,
+//     so a step passes only if the refresh picked the new ones up — including
+//     step 3, where the mapping runs off the PUT response rather than a GET.
+//   - null and [] stay distinct in both directions (steps 2 and 4).
+//   - They never produce a plan diff. Steps 2 and 4 change them with the
+//     configuration untouched, so the framework's post-apply empty-plan check
+//     is the assertion.
+//
+// Plan-modifier absence is pinned in TestMcpServerResource_Schema; a
+// refresh-preceded plan cannot see it.
+func TestMcpServerResource_publishGateFieldsTrackTheServer(t *testing.T) {
+	fake := setupRegistryTest(t)
+
+	withDataSource := func(name string) string {
+		return mcpServerConfig(name, "") + `
+data "barndoor_mcp_server" "gate" {
+  id = barndoor_mcp_server.test.id
+}
+`
+	}
+
+	pendingPublish := "pending_publish"
+	connectionError := "connection_error"
+	noBlockers := []string{}
+	twoBlockers := []string{"not_operationally_available", "no_active_policy"}
+
+	var serverID string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllServersDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				// Created: the fake serves the flag-off shape — a tier, and an
+				// unevaluated (null) gate.
+				Config: withDataSource("tf-test-gate"),
+				ConfigStateChecks: gateStateChecks(
+					knownvalue.StringExact(fakeDefaultAttentionTier),
+					knownvalue.Null(),
+				),
+				Check: func(s *terraform.State) error {
+					serverID = s.RootModule().Resources["barndoor_mcp_server.test"].Primary.ID
+					return nil
+				},
+			},
+			{
+				// The gate was evaluated and nothing blocks a publish: [] must
+				// read back as an empty list, NOT as null. Configuration is
+				// untouched, so the post-apply plan must still be empty.
+				PreConfig: func() {
+					fake.setServerAttention(t, serverID, &pendingPublish, &noBlockers)
+				},
+				Config: withDataSource("tf-test-gate"),
+				ConfigStateChecks: gateStateChecks(
+					knownvalue.StringExact("pending_publish"),
+					knownvalue.ListSizeExact(0),
+				),
+			},
+			{
+				// Blocked, and changing during a real Update (the rename), so
+				// the mapping is exercised off the PUT response too: the reasons
+				// arrive in the gate's order.
+				PreConfig: func() {
+					fake.setServerAttention(t, serverID, &connectionError, &twoBlockers)
+				},
+				Config: withDataSource("tf-test-gate-renamed"),
+				ConfigStateChecks: gateStateChecks(
+					knownvalue.StringExact("connection_error"),
+					knownvalue.ListExact([]knownvalue.Check{
+						knownvalue.StringExact("not_operationally_available"),
+						knownvalue.StringExact("no_active_policy"),
+					}),
+				),
+				Check: resource.TestCheckResourceAttr(
+					"barndoor_mcp_server.test", "name", "tf-test-gate-renamed"),
+			},
+			{
+				// Back to undetermined: [] -> null must round-trip too, and a
+				// null tier must settle to null rather than "".
+				PreConfig: func() {
+					fake.setServerAttention(t, serverID, nil, nil)
+				},
+				Config:            withDataSource("tf-test-gate-renamed"),
+				ConfigStateChecks: gateStateChecks(knownvalue.Null(), knownvalue.Null()),
+			},
+		},
+	})
+}
+
+// TestMcpServerResource_createReadFailureNullsUnknownComputed covers the
+// narrow window where the create POST succeeded but the follow-up GET did not.
+// The server exists, so the provider still writes it to state — and that means
+// every computed attribute it could not learn has to be explicitly nulled
+// first, because Terraform rejects an apply result that still carries an
+// unknown value.
+//
+// The regexp is deliberately ANCHORED to the start of the output, and that is
+// the whole assertion. Both the correct and the broken provider report "Failed
+// to read the MCP server after create", so an unanchored pattern matches
+// either way and proves nothing. A provider that leaves one of these
+// attributes unknown emits an EXTRA, earlier diagnostic — "Provider returned
+// invalid result object after apply ... still indicated an unknown value for
+// barndoor_mcp_server.test.<attr>" — which displaces our message from the
+// first position and fails the match. Do not relax the anchor.
+func TestMcpServerResource_createReadFailureNullsUnknownComputed(t *testing.T) {
+	fake := setupRegistryTest(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllServersDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() { fake.failServerGetOnce() },
+				Config:    mcpServerConfig("tf-test-create-read-fail", ""),
+				ExpectError: regexp.MustCompile(
+					`(?s)\AError running apply[^\n]*\n+Error: Failed to read the MCP server after create`),
 			},
 		},
 	})
