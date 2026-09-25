@@ -42,6 +42,38 @@ type fakeConnection struct {
 	creds map[string]any
 }
 
+// fakeServiceConnectionIdentity mirrors the BCP-4420 additions to the
+// registry's `mcp_server_service_connection` envelope. Both fields use
+// `omitempty`: leaving a field (or the whole struct) unset models a platform
+// that predates BCP-4420 and never sends the key at all — which decodes to a
+// nil pointer in the provider identically to an explicit JSON null.
+type fakeServiceConnectionIdentity struct {
+	ConnectedByUserID *string `json:"connected_by_user_id,omitempty"`
+	AccountEmail      *string `json:"account_email,omitempty"`
+}
+
+// setServerConnectionIdentity stamps the connected_by_user_id/account_email
+// pair GET /servers/{id} reports for s's service connection, as if a
+// connect/reconnect had just completed. Passing nil for a value stamps the
+// field null rather than omitting it — use omitConnectionIdentityEnvelope (the
+// default, pre-connect state) to model an older platform that omits the keys
+// entirely.
+func (f *fakeRegistryServer) setServerConnectionIdentity(t *testing.T, serverID string, connectedByUserID, accountEmail *string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.servers[serverID]
+	if !ok {
+		t.Fatalf("fake has no server %q", serverID)
+	}
+	s.ServiceConnectionIdentity = &fakeServiceConnectionIdentity{
+		ConnectedByUserID: connectedByUserID,
+		AccountEmail:      accountEmail,
+	}
+}
+
+func strPtr(s string) *string { return &s }
+
 // resolveServerRef finds a non-deleted server by id or slug. Callers hold f.mu.
 func (f *fakeRegistryServer) resolveServerRef(ref string) *fakeMcpServer {
 	if s, ok := f.servers[ref]; ok && !s.deleted {
@@ -228,6 +260,25 @@ func TestConnectionResource_Schema(t *testing.T) {
 			t.Errorf("%s attribute should be marked Sensitive", attr)
 		}
 	}
+
+	// BCP-4420: connected_by_user_id/account_email are Computed-only and, per
+	// repo precedent (no email attribute anywhere in the provider is marked
+	// Sensitive), not Sensitive either.
+	for _, attr := range []string{"connected_by_user_id", "account_email"} {
+		a, ok := resp.Schema.Attributes[attr]
+		if !ok {
+			t.Fatalf("schema missing %s attribute", attr)
+		}
+		if !a.IsComputed() {
+			t.Errorf("%s attribute should be Computed", attr)
+		}
+		if a.IsRequired() || a.IsOptional() {
+			t.Errorf("%s attribute should be Computed-only", attr)
+		}
+		if a.IsSensitive() {
+			t.Errorf("%s attribute should not be marked Sensitive", attr)
+		}
+	}
 }
 
 // --- test configurations ----------------------------------------------------------
@@ -264,6 +315,11 @@ func TestConnectionResource_apiKeyLifecycle(t *testing.T) {
 					resource.TestCheckResourceAttrPair(
 						resourceName, "mcp_server_id", "barndoor_mcp_server.seed", "id"),
 					resource.TestCheckResourceAttr(resourceName, "api_key", "sk-test-123"),
+					// BCP-4420: the fake never stamped connection identity for this
+					// server, modeling a platform that omits the keys entirely — both
+					// attributes must read null, not error.
+					resource.TestCheckNoResourceAttr(resourceName, "connected_by_user_id"),
+					resource.TestCheckNoResourceAttr(resourceName, "account_email"),
 				),
 			},
 			{
@@ -296,6 +352,68 @@ func TestConnectionResource_apiKeyLifecycle(t *testing.T) {
 				ImportStateVerifyIgnore: []string{
 					"api_key", "bearer_token", "username", "password", "additional_fields",
 				},
+			},
+		},
+	})
+}
+
+// TestConnectionResource_connectionIdentity pins the BCP-4420
+// connected_by_user_id/account_email mapping end to end: absent on the fake's
+// default (unstamped) connection, populated once the platform reports them,
+// and re-read (not pinned to the old value) on the next refresh when they
+// change again — proving there is no UseStateForUnknown on these attributes,
+// which would be wrong for a pair that can legitimately change on reconnect.
+func TestConnectionResource_connectionIdentity(t *testing.T) {
+	fake := setupRegistryTest(t)
+	const resourceName = "barndoor_connection.test"
+
+	var serverID string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllConnectionsDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				// Freshly connected, no identity stamped yet: both attributes must
+				// read null, exactly like a platform that predates BCP-4420 and
+				// omits the keys entirely — never an error.
+				Config: connectionConfig("dir-api-key", "\n  api_key = \"sk-test-123\"\n"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(resourceName, "connected_by_user_id"),
+					resource.TestCheckNoResourceAttr(resourceName, "account_email"),
+					func(s *terraform.State) error {
+						rs, ok := s.RootModule().Resources[resourceName]
+						if !ok {
+							return fmt.Errorf("%s not in state", resourceName)
+						}
+						serverID = rs.Primary.Attributes["mcp_server_id"]
+						return nil
+					},
+				),
+			},
+			{
+				// The platform now reports who connected it and the upstream
+				// account email (e.g. a Slack connector). Configuration is
+				// untouched, so the post-apply plan must still be empty.
+				PreConfig: func() {
+					fake.setServerConnectionIdentity(t, serverID, strPtr("user-abc123"), strPtr("svc@example.com"))
+				},
+				Config: connectionConfig("dir-api-key", "\n  api_key = \"sk-test-123\"\n"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "connected_by_user_id", "user-abc123"),
+					resource.TestCheckResourceAttr(resourceName, "account_email", "svc@example.com"),
+				),
+			},
+			{
+				// A reconnect by someone else must not be pinned to the prior
+				// value — this attribute is Computed with no UseStateForUnknown.
+				PreConfig: func() {
+					fake.setServerConnectionIdentity(t, serverID, strPtr("user-def456"), nil)
+				},
+				Config: connectionConfig("dir-api-key", "\n  api_key = \"sk-test-123\"\n"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "connected_by_user_id", "user-def456"),
+					resource.TestCheckNoResourceAttr(resourceName, "account_email"),
+				),
 			},
 		},
 	})

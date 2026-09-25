@@ -59,6 +59,15 @@ type fakeMcpServer struct {
 	// setServerAttention, which is the instrument the mapping tests need.
 	AttentionTier   *string   `json:"attention_tier"`
 	PublishBlockers *[]string `json:"publish_blockers"`
+	// ServiceConnectionIdentity mirrors the `mcp_server_service_connection`
+	// envelope's BCP-4420 connected_by_user_id/account_email fields, as seen by
+	// GET /servers/{id} — the endpoint barndoor_connection falls back to for
+	// them (its own connection-scoped read does not carry them). Nil until a
+	// connect() succeeds; see connection_resource_test.go for the setter that
+	// drives its two identity fields, which themselves use `omitempty` so a
+	// test can model "the platform predates BCP-4420 and omits these keys" by
+	// simply not calling the setter.
+	ServiceConnectionIdentity *fakeServiceConnectionIdentity `json:"mcp_server_service_connection,omitempty"`
 
 	deleted bool
 	// hasActivePolicy emulates the publish route's ACTIVE-policy precondition

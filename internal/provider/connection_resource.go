@@ -45,15 +45,17 @@ type connectionResource struct {
 
 // connectionResourceModel maps the resource schema to Go types.
 type connectionResourceModel struct {
-	ID               types.String `tfsdk:"id"`
-	ServerID         types.String `tfsdk:"server_id"`
-	McpServerID      types.String `tfsdk:"mcp_server_id"`
-	Status           types.String `tfsdk:"status"`
-	APIKey           types.String `tfsdk:"api_key"`
-	BearerToken      types.String `tfsdk:"bearer_token"`
-	Username         types.String `tfsdk:"username"`
-	Password         types.String `tfsdk:"password"`
-	AdditionalFields types.Map    `tfsdk:"additional_fields"`
+	ID                types.String `tfsdk:"id"`
+	ServerID          types.String `tfsdk:"server_id"`
+	McpServerID       types.String `tfsdk:"mcp_server_id"`
+	Status            types.String `tfsdk:"status"`
+	ConnectedByUserID types.String `tfsdk:"connected_by_user_id"`
+	AccountEmail      types.String `tfsdk:"account_email"`
+	APIKey            types.String `tfsdk:"api_key"`
+	BearerToken       types.String `tfsdk:"bearer_token"`
+	Username          types.String `tfsdk:"username"`
+	Password          types.String `tfsdk:"password"`
+	AdditionalFields  types.Map    `tfsdk:"additional_fields"`
 }
 
 func (r *connectionResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -99,6 +101,22 @@ func (r *connectionResource) Schema(_ context.Context, _ resource.SchemaRequest,
 			"status": schema.StringAttribute{
 				MarkdownDescription: "Connection status computed by the platform: `connected`, `pending`, or " +
 					"`error`.",
+				Computed: true,
+			},
+			"connected_by_user_id": schema.StringAttribute{
+				MarkdownDescription: "Internal Barndoor user id of whoever completed the most recent " +
+					"successful connect/reconnect of this service connection. **Read-only** and best-effort: " +
+					"null for a pre-existing connection from before the platform tracked this, and null on a " +
+					"platform older than the release that added it. Not pinned across refresh — it can change " +
+					"if the connection is reconnected out-of-band.",
+				Computed: true,
+			},
+			"account_email": schema.StringAttribute{
+				MarkdownDescription: "Best-effort email address of the upstream account this connection " +
+					"authorized. Populated only for Slack and PKCE connectors; **null** for plugin-managed " +
+					"OAuth, for a pre-existing connection, and on a platform older than the release that added " +
+					"it — null when the provider does not expose it. **Read-only**, and not pinned across " +
+					"refresh since it can change on reconnect.",
 				Computed: true,
 			},
 			"api_key": schema.StringAttribute{
@@ -205,6 +223,8 @@ func (r *connectionResource) Create(ctx context.Context, req resource.CreateRequ
 	if initiated.AuthURL != nil && *initiated.AuthURL != "" {
 		plan.McpServerID = types.StringNull()
 		plan.Status = types.StringValue("pending")
+		plan.ConnectedByUserID = types.StringNull()
+		plan.AccountEmail = types.StringNull()
 		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		resp.Diagnostics.AddError(
 			"OAuth MCP servers cannot be connected by Terraform",
@@ -226,11 +246,15 @@ func (r *connectionResource) Create(ctx context.Context, req resource.CreateRequ
 		resp.Diagnostics.AddError("Failed to read the connection after create", err.Error())
 		plan.McpServerID = types.StringNull()
 		plan.Status = types.StringNull()
+		plan.ConnectedByUserID = types.StringNull()
+		plan.AccountEmail = types.StringNull()
 		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 		return
 	}
 
-	resp.Diagnostics.Append(resp.State.Set(ctx, applyConnectionResponse(&conn, &plan))...)
+	connectedByUserID, accountEmail := r.fetchConnectionIdentityOrWarn(ctx, &resp.Diagnostics, conn.McpServerID)
+	resp.Diagnostics.Append(resp.State.Set(ctx,
+		applyConnectionResponse(&conn, &plan, connectedByUserID, accountEmail))...)
 }
 
 func (r *connectionResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
@@ -258,7 +282,9 @@ func (r *connectionResource) Read(ctx context.Context, req resource.ReadRequest,
 		return
 	}
 
-	resp.Diagnostics.Append(resp.State.Set(ctx, applyConnectionResponse(&conn, &state))...)
+	connectedByUserID, accountEmail := r.fetchConnectionIdentityOrWarn(ctx, &resp.Diagnostics, conn.McpServerID)
+	resp.Diagnostics.Append(resp.State.Set(ctx,
+		applyConnectionResponse(&conn, &state, connectedByUserID, accountEmail))...)
 }
 
 // Update never runs: every configurable attribute forces replacement. The
@@ -412,13 +438,19 @@ func buildConnectionCredentials(ctx context.Context, plan *connectionResourceMod
 
 // applyConnectionResponse maps the server's view onto a state model. The
 // write-only credential attributes are carried from prior verbatim because
-// the API never returns them.
-func applyConnectionResponse(conn *connectionReadResponse, prior *connectionResourceModel) *connectionResourceModel {
+// the API never returns them. connectedByUserID/accountEmail come from a
+// separate fetch (see fetchConnectionIdentity) — the connection-scoped read
+// this resource otherwise uses does not carry them.
+func applyConnectionResponse(
+	conn *connectionReadResponse, prior *connectionResourceModel, connectedByUserID, accountEmail types.String,
+) *connectionResourceModel {
 	return &connectionResourceModel{
-		ID:          types.StringValue(conn.ID),
-		ServerID:    prior.ServerID,
-		McpServerID: types.StringValue(conn.McpServerID),
-		Status:      types.StringValue(conn.Status),
+		ID:                types.StringValue(conn.ID),
+		ServerID:          prior.ServerID,
+		McpServerID:       types.StringValue(conn.McpServerID),
+		Status:            types.StringValue(conn.Status),
+		ConnectedByUserID: connectedByUserID,
+		AccountEmail:      accountEmail,
 
 		// Write-only: state follows configuration.
 		APIKey:           nullIfUnknownString(prior.APIKey),
@@ -427,6 +459,60 @@ func applyConnectionResponse(conn *connectionReadResponse, prior *connectionReso
 		Password:         nullIfUnknownString(prior.Password),
 		AdditionalFields: nullIfUnknownMap(prior.AdditionalFields),
 	}
+}
+
+// connectionIdentityResponse decodes only the two BCP-4420 identity fields off
+// the `mcp_server_service_connection` envelope of the general server-read
+// response (GET /servers/{id}, no `as_service` query param, distinct from the
+// connection-scoped `/servers/{id}/connection` endpoint this resource
+// otherwise uses). registry-service's connection-scoped ConnectionRead model
+// does not carry these fields; only the ServerConnectionResponse embedded on
+// the server does. Both fields are best-effort and commonly null; a platform
+// older than the release that added them (BCP-4420) simply omits the JSON
+// keys, which decodes to nil pointers here — not an error.
+type connectionIdentityResponse struct {
+	McpServerServiceConnection *struct {
+		ConnectedByUserID *string `json:"connected_by_user_id"`
+		AccountEmail      *string `json:"account_email"`
+	} `json:"mcp_server_service_connection"`
+}
+
+// fetchConnectionIdentity retrieves connected_by_user_id/account_email for the
+// service connection on mcpServerID (the already-resolved UUID, never a
+// slug). Both return values are types.StringNull() when the envelope itself
+// is absent (defensive only — Create/Read only call this once a connection is
+// known to exist) or when the platform predates BCP-4420.
+func fetchConnectionIdentity(ctx context.Context, c *client.Client, mcpServerID string) (
+	connectedByUserID, accountEmail types.String, err error,
+) {
+	var out connectionIdentityResponse
+	if err := doJSON(ctx, c, http.MethodGet, serverPath(mcpServerID, ""), nil, &out); err != nil {
+		return types.StringNull(), types.StringNull(), err
+	}
+	if out.McpServerServiceConnection == nil {
+		return types.StringNull(), types.StringNull(), nil
+	}
+	return types.StringPointerValue(out.McpServerServiceConnection.ConnectedByUserID),
+		types.StringPointerValue(out.McpServerServiceConnection.AccountEmail), nil
+}
+
+// fetchConnectionIdentityOrWarn wraps fetchConnectionIdentity for Create/Read:
+// a failure here is a warning, not a hard error — the connection itself was
+// already confirmed to exist, and these two attributes are best-effort
+// observability, not load-bearing for the resource's lifecycle.
+func (r *connectionResource) fetchConnectionIdentityOrWarn(
+	ctx context.Context, diags *diag.Diagnostics, mcpServerID string,
+) (connectedByUserID, accountEmail types.String) {
+	connectedByUserID, accountEmail, err := fetchConnectionIdentity(ctx, r.client, mcpServerID)
+	if err != nil {
+		diags.AddWarning(
+			"Could not read connection identity",
+			fmt.Sprintf("Failed to fetch connected_by_user_id/account_email for the connection: %s. "+
+				"These attributes will read null until the next refresh.", err),
+		)
+		return types.StringNull(), types.StringNull()
+	}
+	return connectedByUserID, accountEmail
 }
 
 // nullIfUnknownMap settles an unknown map to null so a config-only attribute
