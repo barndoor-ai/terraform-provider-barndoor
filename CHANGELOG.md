@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+ENHANCEMENTS:
+
+* resource/`barndoor_connection`: new read-only `connected_by_user_id` and `account_email` attributes on the tenant-wide service connection. `connected_by_user_id` is the internal Barndoor user id of whoever completed the most recent successful connect/reconnect; `account_email` is a best-effort email address of the upstream account authorized, populated only for Slack and PKCE connectors. Both are commonly null, are not pinned across refresh since either can change on an out-of-band reconnect, and read null (never an error) on a platform older than the release that added them (bdai-platform BCP-4420).
+
 ## 0.7.0 (2026-09-21)
 
 ENHANCEMENTS:
