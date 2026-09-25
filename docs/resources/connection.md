@@ -58,7 +58,7 @@ variable "search_api_key" {
 
 ### Read-Only
 
-- `account_email` (String) Best-effort email address of the upstream account this connection authorized. Populated only for Slack and PKCE connectors; **null** for plugin-managed OAuth, for a pre-existing connection, and on a platform older than the release that added it — null when the provider does not expose it. **Read-only**, and not pinned across refresh since it can change on reconnect.
+- `account_email` (String) Best-effort email address of the upstream account this connection authorized. Populated only for Slack and PKCE connectors; **null** for plugin-managed OAuth, for a pre-existing connection, and on a platform older than the release that added it. **Read-only**, and not pinned across refresh since it can change on reconnect.
 - `connected_by_user_id` (String) Internal Barndoor user id of whoever completed the most recent successful connect/reconnect of this service connection. **Read-only** and best-effort: null for a pre-existing connection from before the platform tracked this, and null on a platform older than the release that added it. Not pinned across refresh — it can change if the connection is reconnected out-of-band.
 - `id` (String) Connection UUID assigned by the API.
 - `mcp_server_id` (String) Resolved UUID of the connected MCP server (equal to `server_id` unless a slug was configured).

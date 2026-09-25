@@ -115,8 +115,7 @@ func (r *connectionResource) Schema(_ context.Context, _ resource.SchemaRequest,
 				MarkdownDescription: "Best-effort email address of the upstream account this connection " +
 					"authorized. Populated only for Slack and PKCE connectors; **null** for plugin-managed " +
 					"OAuth, for a pre-existing connection, and on a platform older than the release that added " +
-					"it — null when the provider does not expose it. **Read-only**, and not pinned across " +
-					"refresh since it can change on reconnect.",
+					"it. **Read-only**, and not pinned across refresh since it can change on reconnect.",
 				Computed: true,
 			},
 			"api_key": schema.StringAttribute{

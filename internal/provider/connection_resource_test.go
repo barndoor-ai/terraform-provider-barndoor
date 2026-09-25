@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	frameworkresource "github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
@@ -417,6 +418,126 @@ func TestConnectionResource_connectionIdentity(t *testing.T) {
 			},
 		},
 	})
+}
+
+// seededConnectionConfig configures barndoor_connection directly against a
+// pre-existing server id, with no barndoor_mcp_server resource in the
+// config. mcp_server_resource's own Read also does GET /servers/{id} for
+// refresh, so a config that includes it would race the connection's identity
+// fetch for a one-shot fault-injected 500 on that same route; seeding the
+// server straight into the fake (see identity fetch failure test below) keeps
+// the only GET /servers/{id} call in play the one under test.
+func seededConnectionConfig(serverID, credentials string) string {
+	return fmt.Sprintf(`
+resource "barndoor_connection" "test" {
+  server_id = %[1]q
+%[2]s
+}
+`, serverID, credentials)
+}
+
+// TestConnectionResource_identityFetchFailureWarnsAndNulls covers the
+// fetchConnectionIdentityOrWarn fallback: GET /servers/{id} (the identity
+// fetch) fails while the connection-scoped GET /servers/{id}/connection the
+// resource otherwise uses keeps succeeding. The refresh must still succeed —
+// no error diagnostic — and both identity attributes must read null even
+// though the fake has them stamped, because the provider could not reach them
+// this round. The narrower fetchConnectionIdentityOrWarn unit test below pins
+// the warning itself, which this framework-level check cannot observe.
+func TestConnectionResource_identityFetchFailureWarnsAndNulls(t *testing.T) {
+	fake := setupRegistryTest(t)
+	const resourceName = "barndoor_connection.test"
+
+	// Seed the server directly (no barndoor_mcp_server resource in state) so
+	// the fault-injected 500 below can only land on the connection resource's
+	// own identity fetch — see seededConnectionConfig.
+	const serverID = "00000000-0000-0000-0000-000000000001"
+	fake.mu.Lock()
+	fake.servers[serverID] = &fakeMcpServer{
+		ID:                   serverID,
+		Name:                 "Identity Fetch Failure Test Server",
+		Slug:                 "identity-fetch-failure-test-server",
+		Status:               "active",
+		McpServerDirectoryID: "dir-api-key",
+	}
+	fake.mu.Unlock()
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllConnectionsDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				// Establish the connection and stamp identity, exactly like
+				// TestConnectionResource_connectionIdentity, so the fetch
+				// failure below is a real regression from a known-good value,
+				// not a fresh-connection null it would look like anyway.
+				PreConfig: func() {
+					fake.setServerConnectionIdentity(t, serverID, strPtr("user-abc123"), strPtr("svc@example.com"))
+				},
+				Config: seededConnectionConfig(serverID, "\n  api_key = \"sk-test-123\"\n"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "connected_by_user_id", "user-abc123"),
+					resource.TestCheckResourceAttr(resourceName, "account_email", "svc@example.com"),
+				),
+			},
+			{
+				// Arm a one-shot 500 on the next GET /servers/{id} — the
+				// identity fetch — while GET /servers/{id}/connection (this
+				// resource's normal read) keeps succeeding. The refresh must
+				// not error, and the identity attributes must fall back to
+				// null rather than surface the stale, no-longer-verified
+				// values from the previous step.
+				PreConfig: func() { fake.failServerGetOnce() },
+				Config:    seededConnectionConfig(serverID, "\n  api_key = \"sk-test-123\"\n"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "status", "connected"),
+					resource.TestCheckNoResourceAttr(resourceName, "connected_by_user_id"),
+					resource.TestCheckNoResourceAttr(resourceName, "account_email"),
+				),
+			},
+		},
+	})
+}
+
+// TestConnectionResource_fetchConnectionIdentityOrWarnOnFailure pins
+// fetchConnectionIdentityOrWarn directly: resource.UnitTest's plan/apply
+// pipeline surfaces error diagnostics but gives no way to assert on a warning
+// that never blocks an apply, so this calls the method with its own
+// diag.Diagnostics to check both the returned null values and the exact
+// warning it appends.
+//
+// Mutation check: swapping the AddWarning call in
+// fetchConnectionIdentityOrWarn for AddError makes this test fail (HasError
+// becomes true) — confirms the test actually exercises that branch.
+func TestConnectionResource_fetchConnectionIdentityOrWarnOnFailure(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			writeToken(w)
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "registry is having a moment")
+	})
+
+	r := &connectionResource{client: c}
+	var diags diag.Diagnostics
+	connectedByUserID, accountEmail := r.fetchConnectionIdentityOrWarn(context.Background(), &diags, "server-1")
+
+	if diags.HasError() {
+		t.Fatalf("fetchConnectionIdentityOrWarn should not produce an error diagnostic, got: %+v", diags)
+	}
+	warnings := diags.Warnings()
+	if len(warnings) != 1 {
+		t.Fatalf("expected exactly one warning, got %d: %+v", len(warnings), diags)
+	}
+	if got, want := warnings[0].Summary(), "Could not read connection identity"; got != want {
+		t.Errorf("warning summary = %q, want %q", got, want)
+	}
+	if !connectedByUserID.IsNull() {
+		t.Errorf("connectedByUserID = %v, want null", connectedByUserID)
+	}
+	if !accountEmail.IsNull() {
+		t.Errorf("accountEmail = %v, want null", accountEmail)
+	}
 }
 
 func TestConnectionResource_basicAuthLifecycle(t *testing.T) {
