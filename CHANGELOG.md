@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+FEATURES:
+
+* **New Data Source:** `barndoor_policy_revisions` — lists the revision history of the policies that govern an MCP server (`mcp_server_id`), newest first: for each revision its id, policy, version number, when it was made (`revised_at`, RFC 3339 in UTC), who made and triggered it, its categories, one-line change summaries, and the full `changes` object as compact JSON in `changes_json`. The optional `since` (RFC 3339, inclusive) bounds a long history; the data source follows the API's cursor pagination to the end and fails rather than loop if the API repeats a cursor. Read-only, over the platform's REST API. Requires a Barndoor platform release that includes the `/api/policy/v2/policy-revisions` endpoint (bdai-platform BCP-4458 / #8152) (BCP-4516).
+
 ## 0.7.0 (2026-09-21)
 
 ENHANCEMENTS:

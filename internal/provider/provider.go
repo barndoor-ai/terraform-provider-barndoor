@@ -172,6 +172,7 @@ func (p *BarndoorProvider) DataSources(ctx context.Context) []func() datasource.
 		NewMcpServerDataSource,
 		NewMcpServerDirectoryDataSource,
 		NewPolicyDataSource,
+		NewPolicyRevisionsDataSource,
 	}
 }
 
