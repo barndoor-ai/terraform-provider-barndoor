@@ -37,6 +37,12 @@ const policyRevisionsPath = "api/policy/v2/policy-revisions"
 // maximum), so a read makes as few round trips as possible.
 const policyRevisionsPageLimit = 100
 
+// policyRevisionsMaxPages bounds how many pages a read will walk before giving
+// up (with the page limit, 100k revisions). The repeated-cursor guard catches a
+// server that recycles cursors; this catches one that issues fresh cursors
+// forever. It is a var only so tests can shrink it.
+var policyRevisionsMaxPages = 1000
+
 // NewPolicyRevisionsDataSource returns a new barndoor_policy_revisions data
 // source.
 func NewPolicyRevisionsDataSource() datasource.DataSource {
@@ -276,7 +282,7 @@ func listPolicyRevisions(ctx context.Context, c *client.Client, serverID, since 
 		cursor string
 		seen   = map[string]struct{}{}
 	)
-	for {
+	for page := 0; page < policyRevisionsMaxPages; page++ {
 		q := url.Values{}
 		q.Set("mcp_server_id", serverID)
 		q.Set("limit", strconv.Itoa(policyRevisionsPageLimit))
@@ -287,16 +293,16 @@ func listPolicyRevisions(ctx context.Context, c *client.Client, serverID, since 
 			q.Set("cursor", cursor)
 		}
 
-		var page policyRevisionsPage
-		if err := doJSON(ctx, c, http.MethodGet, policyRevisionsPath+"?"+q.Encode(), nil, &page); err != nil {
+		var body policyRevisionsPage
+		if err := doJSON(ctx, c, http.MethodGet, policyRevisionsPath+"?"+q.Encode(), nil, &body); err != nil {
 			return nil, err
 		}
-		all = append(all, page.Data...)
+		all = append(all, body.Data...)
 
-		if page.NextCursor == nil || *page.NextCursor == "" {
+		if body.NextCursor == nil || *body.NextCursor == "" {
 			return all, nil
 		}
-		next := *page.NextCursor
+		next := *body.NextCursor
 		if _, dup := seen[next]; dup {
 			return nil, fmt.Errorf("GET %s: the API returned the pagination cursor %q more than once; "+
 				"stopping rather than looping forever (this is a Barndoor API bug)", policyRevisionsPath, next)
@@ -304,6 +310,7 @@ func listPolicyRevisions(ctx context.Context, c *client.Client, serverID, since 
 		seen[next] = struct{}{}
 		cursor = next
 	}
+	return nil, fmt.Errorf("GET %s: pagination did not terminate after %d pages", policyRevisionsPath, policyRevisionsMaxPages)
 }
 
 // policyRevisionModelFromResponse maps one API row to the schema model.

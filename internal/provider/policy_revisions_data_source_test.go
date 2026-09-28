@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"sync"
 	"testing"
+	"time"
 
 	frameworkdatasource "github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -163,7 +164,19 @@ func TestPolicyRevisionsDataSource_Schema(t *testing.T) {
 
 // --- timestamp parsing --------------------------------------------------------------
 
+// setLocalZoneForTest sets time.Local to UTC-7 for the test and restores it.
+// Callers must not run in parallel.
+func setLocalZoneForTest(t *testing.T) {
+	t.Helper()
+	orig := time.Local
+	time.Local = time.FixedZone("UTC-7", -7*3600)
+	t.Cleanup(func() { time.Local = orig })
+}
+
 func TestParseRevisedAt(t *testing.T) {
+	// Not parallel: time.Local is process-global. A non-UTC local zone makes a
+	// naive timestamp parsed as local time (instead of UTC) fail the test.
+	setLocalZoneForTest(t)
 	cases := []struct {
 		in   string
 		want string
@@ -257,6 +270,48 @@ func TestPolicyRevisionsDataSource_multiPageTraversal(t *testing.T) {
 	}
 }
 
+func TestPolicyRevisionsDataSource_emptyStringCursorEndsPaging(t *testing.T) {
+	// An empty-string next_cursor means "no further page", same as null.
+	fake := setupPolicyRevisionsTest(t, func(q url.Values) (int, string) {
+		if q.Get("cursor") == "" {
+			return http.StatusOK, pageBody(t, []map[string]any{
+				revisionRow("r1", "2026-09-28T18:00:00", nil),
+			}, "cur-2")
+		}
+		return http.StatusOK, pageBody(t, []map[string]any{
+			revisionRow("r2", "2026-09-28T17:00:00", nil),
+		}, "")
+	})
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			Config: revisionsConfig(""),
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr(revisionsDS, "revisions.#", "2"),
+				resource.TestCheckResourceAttr(revisionsDS, "revisions.0.id", "r1"),
+				resource.TestCheckResourceAttr(revisionsDS, "revisions.1.id", "r2"),
+			),
+		}},
+	})
+
+	// Every read must be exactly two requests; a third would mean the empty
+	// cursor was followed.
+	qs := fake.queries()
+	if len(qs) == 0 || len(qs)%2 != 0 {
+		t.Fatalf("expected a whole number of two-request reads, got %d requests", len(qs))
+	}
+	for i, q := range qs {
+		want := ""
+		if i%2 == 1 {
+			want = "cur-2"
+		}
+		if got := q.Get("cursor"); got != want {
+			t.Errorf("request %d cursor = %q, want %q", i, got, want)
+		}
+	}
+}
+
 func TestPolicyRevisionsDataSource_empty(t *testing.T) {
 	setupPolicyRevisionsTest(t, func(url.Values) (int, string) {
 		return http.StatusOK, pageBody(t, nil, nil)
@@ -286,6 +341,41 @@ func TestPolicyRevisionsDataSource_sinceForwarded(t *testing.T) {
 			// A non-UTC offset must be normalized to UTC before it is sent.
 			Config: revisionsConfig("  since = \"2026-09-01T09:00:00-07:00\"\n"),
 			Check:  resource.TestCheckResourceAttr(revisionsDS, "revisions.#", "0"),
+		}},
+	})
+
+	qs := fake.queries()
+	if len(qs) == 0 {
+		t.Fatal("no requests reached the fake")
+	}
+	for _, q := range qs {
+		if got, want := q.Get("since"), "2026-09-01T16:00:00Z"; got != want {
+			t.Errorf("since = %q, want %q (normalized to UTC)", got, want)
+		}
+	}
+}
+
+func TestPolicyRevisionsDataSource_unknownSince(t *testing.T) {
+	fake := setupPolicyRevisionsTest(t, func(url.Values) (int, string) {
+		return http.StatusOK, pageBody(t, nil, nil)
+	})
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			// terraform_data.t.output is unknown at plan time, so validation
+			// must skip `since` instead of parsing the empty placeholder.
+			Config: `
+resource "terraform_data" "t" {
+  input = "2026-09-01T09:00:00-07:00"
+}
+
+data "barndoor_policy_revisions" "test" {
+  mcp_server_id = "` + testRevisionsServerID + `"
+  since         = terraform_data.t.output
+}
+`,
+			Check: resource.TestCheckResourceAttr(revisionsDS, "revisions.#", "0"),
 		}},
 	})
 
@@ -336,6 +426,8 @@ func TestPolicyRevisionsDataSource_invalidSince(t *testing.T) {
 }
 
 func TestPolicyRevisionsDataSource_timestampNormalization(t *testing.T) {
+	// Not parallel: time.Local is process-global (see setLocalZoneForTest).
+	setLocalZoneForTest(t)
 	setupPolicyRevisionsTest(t, func(url.Values) (int, string) {
 		return http.StatusOK, pageBody(t, []map[string]any{
 			revisionRow("naive", "2026-09-28T18:10:24.830776", nil),
@@ -489,5 +581,31 @@ func TestPolicyRevisionsDataSource_repeatedCursorGuard(t *testing.T) {
 				t.Errorf("provider made %d requests; the guard should stop it within a handful", n)
 			}
 		})
+	}
+}
+
+func TestPolicyRevisionsDataSource_pageCap(t *testing.T) {
+	// Not parallel: shrinks a package var.
+	orig := policyRevisionsMaxPages
+	policyRevisionsMaxPages = 3
+	t.Cleanup(func() { policyRevisionsMaxPages = orig })
+
+	// Fresh cursor every page, so only the page cap can stop the walk.
+	fake := setupPolicyRevisionsTest(t, func(q url.Values) (int, string) {
+		return http.StatusOK, pageBody(t, []map[string]any{
+			revisionRow("r-"+q.Get("cursor"), "2026-09-28T18:00:00", nil),
+		}, q.Get("cursor")+"x")
+	})
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{{
+			Config:      revisionsConfig(""),
+			ExpectError: regexp.MustCompile(`(?s)pagination did not terminate after 3\s+pages`),
+		}},
+	})
+
+	if n := len(fake.queries()); n < 3 || n >= maxFakeRevisionRequests {
+		t.Errorf("provider made %d requests; want the walk to stop at the cap of 3 per read", n)
 	}
 }
