@@ -605,7 +605,10 @@ func TestPolicyRevisionsDataSource_pageCap(t *testing.T) {
 		}},
 	})
 
-	if n := len(fake.queries()); n < 3 || n >= maxFakeRevisionRequests {
-		t.Errorf("provider made %d requests; want the walk to stop at the cap of 3 per read", n)
+	// ExpectError stops the step at the first failing read, so a correct walk
+	// makes exactly policyRevisionsMaxPages requests: one fewer means it stopped
+	// early, one more means it walked past the cap it names in the error.
+	if n := len(fake.queries()); n != 3 {
+		t.Errorf("provider made %d requests; want exactly 3 (the page cap)", n)
 	}
 }
