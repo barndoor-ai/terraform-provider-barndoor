@@ -57,6 +57,9 @@ type fakeLlmProvider struct {
 	Settings           json.RawMessage
 	Enabled            bool
 	EnforceHealthCheck bool
+	BillingMode        string
+	BillingReason      *string
+	BillingNote        *string
 	// Credential is the last api_key written. Stored to let tests assert the
 	// write-only round trip; never rendered into a response.
 	Credential string
@@ -358,7 +361,7 @@ func (f *fakeLlmGatewayServer) findProvider(id string) *fakeLlmProvider {
 }
 
 func providerJSON(p *fakeLlmProvider) map[string]any {
-	return map[string]any{
+	out := map[string]any{
 		"id":             p.ID,
 		"org_id":         fakeLlmOrgID,
 		"catalog_id":     nil,
@@ -376,7 +379,50 @@ func providerJSON(p *fakeLlmProvider) map[string]any {
 		"updated_at":           fakeLlmTime,
 		"health_status":        "unverified",
 		"enforce_health_check": p.EnforceHealthCheck,
+		"billing_mode":         p.BillingMode,
 	}
+	// Omitted when null, like production's skip_serializing_if.
+	if p.BillingReason != nil {
+		out["billing_reason"] = *p.BillingReason
+	}
+	if p.BillingNote != nil {
+		out["billing_note"] = *p.BillingNote
+	}
+	return out
+}
+
+// fakeLlmBillingNote mirrors normalize_billing_note: trimmed, blank is absent.
+func fakeLlmBillingNote(note *string) *string {
+	if note == nil || strings.TrimSpace(*note) == "" {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*note)
+	return &trimmed
+}
+
+// validLlmBilling mirrors validate_billing_fields on the resulting row, plus
+// the enum checks serde performs on the way in.
+func validLlmBilling(w http.ResponseWriter, p *fakeLlmProvider) bool {
+	if !slices.Contains([]string{"per_token", "not_metered"}, p.BillingMode) {
+		writeLlmError(w, http.StatusBadRequest, "unknown billing_mode: "+p.BillingMode)
+		return false
+	}
+	if p.BillingReason != nil &&
+		!slices.Contains([]string{"subscription", "local", "external", "other"}, *p.BillingReason) {
+		writeLlmError(w, http.StatusBadRequest, "unknown billing_reason: "+*p.BillingReason)
+		return false
+	}
+	if p.BillingMode == "not_metered" && p.BillingReason == nil {
+		writeLlmError(w, http.StatusBadRequest,
+			"billing_reason is required when billing_mode is 'not_metered'; one of "+
+				"'subscription', 'local', 'external', 'other'.")
+		return false
+	}
+	if p.BillingNote != nil && len([]rune(*p.BillingNote)) > 200 {
+		writeLlmError(w, http.StatusBadRequest, "billing_note must be at most 200 characters")
+		return false
+	}
+	return true
 }
 
 func (f *fakeLlmGatewayServer) handleProviders(w http.ResponseWriter, r *http.Request) {
@@ -426,6 +472,9 @@ func (f *fakeLlmGatewayServer) createProvider(w http.ResponseWriter, r *http.Req
 		APIKey             *string         `json:"api_key"`
 		Settings           json.RawMessage `json:"settings"`
 		EnforceHealthCheck *bool           `json:"enforce_health_check"`
+		BillingMode        *string         `json:"billing_mode"`
+		BillingReason      *string         `json:"billing_reason"`
+		BillingNote        *string         `json:"billing_note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
@@ -456,6 +505,11 @@ func (f *fakeLlmGatewayServer) createProvider(w http.ResponseWriter, r *http.Req
 		enforce = *body.EnforceHealthCheck
 	}
 
+	billingMode := "per_token" // never inferred server-side
+	if body.BillingMode != nil {
+		billingMode = *body.BillingMode
+	}
+
 	p := &fakeLlmProvider{
 		ID:                 f.newID("aaaa"),
 		Name:               body.Name,
@@ -465,7 +519,13 @@ func (f *fakeLlmGatewayServer) createProvider(w http.ResponseWriter, r *http.Req
 		Settings:           settings,
 		Enabled:            true, // create has no enabled field
 		EnforceHealthCheck: enforce,
+		BillingMode:        billingMode,
+		BillingReason:      body.BillingReason,
+		BillingNote:        fakeLlmBillingNote(body.BillingNote),
 		Credential:         credential,
+	}
+	if !validLlmBilling(w, p) {
+		return
 	}
 	f.providers = append(f.providers, p)
 	_ = json.NewEncoder(w).Encode(providerJSON(p))
@@ -486,6 +546,11 @@ func (f *fakeLlmGatewayServer) updateProvider(w http.ResponseWriter, r *http.Req
 		Enabled            *bool           `json:"enabled"`
 		Settings           json.RawMessage `json:"settings"`
 		EnforceHealthCheck *bool           `json:"enforce_health_check"`
+		BillingMode        *string         `json:"billing_mode"`
+		// The clearable billing keys are tri-state: absent keeps, null
+		// clears, a value sets.
+		BillingReason json.RawMessage `json:"billing_reason"`
+		BillingNote   json.RawMessage `json:"billing_note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
@@ -518,6 +583,21 @@ func (f *fakeLlmGatewayServer) updateProvider(w http.ResponseWriter, r *http.Req
 	if body.EnforceHealthCheck != nil {
 		updated.EnforceHealthCheck = *body.EnforceHealthCheck
 	}
+	if body.BillingMode != nil {
+		updated.BillingMode = *body.BillingMode
+	}
+	if body.BillingReason != nil {
+		updated.BillingReason = nil
+		_ = json.Unmarshal(body.BillingReason, &updated.BillingReason)
+	}
+	if body.BillingNote != nil {
+		var note *string
+		_ = json.Unmarshal(body.BillingNote, &note)
+		updated.BillingNote = fakeLlmBillingNote(note)
+	}
+	if !validLlmBilling(w, &updated) {
+		return
+	}
 
 	*p = updated
 	_ = json.NewEncoder(w).Encode(providerJSON(p))
@@ -537,6 +617,7 @@ func (f *fakeLlmGatewayServer) seedProvider() *fakeLlmProvider {
 		Settings:           json.RawMessage("{}"),
 		Enabled:            true,
 		EnforceHealthCheck: true,
+		BillingMode:        "per_token",
 		Credential:         "seeded-key",
 	}
 	f.providers = append(f.providers, p)

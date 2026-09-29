@@ -54,6 +54,9 @@ type llmProviderDataSourceModel struct {
 	Settings           jsontypes.Normalized `tfsdk:"settings"`
 	Enabled            types.Bool           `tfsdk:"enabled"`
 	EnforceHealthCheck types.Bool           `tfsdk:"enforce_health_check"`
+	BillingMode        types.String         `tfsdk:"billing_mode"`
+	BillingReason      types.String         `tfsdk:"billing_reason"`
+	BillingNote        types.String         `tfsdk:"billing_note"`
 	HealthStatus       types.String         `tfsdk:"health_status"`
 	HealthDetail       types.String         `tfsdk:"health_detail"`
 	HealthCheckedAt    types.String         `tfsdk:"health_checked_at"`
@@ -118,6 +121,21 @@ func (d *llmProviderDataSource) Schema(_ context.Context, _ datasource.SchemaReq
 			},
 			"enforce_health_check": schema.BoolAttribute{
 				MarkdownDescription: "Whether routing gates on the connectivity health probe.",
+				Computed:            true,
+			},
+			"billing_mode": schema.StringAttribute{
+				MarkdownDescription: "Whether Barndoor calculates and reports a per-token cost for this " +
+					"provider's traffic: `per_token` or `not_metered` (token usage still counted, token cost " +
+					"recorded as $0).",
+				Computed: true,
+			},
+			"billing_reason": schema.StringAttribute{
+				MarkdownDescription: "How the vendor bills this provider: `subscription`, `local`, " +
+					"`external`, or `other`; null when unset. Always set on a `not_metered` provider.",
+				Computed: true,
+			},
+			"billing_note": schema.StringAttribute{
+				MarkdownDescription: "Free-text context for the billing arrangement; null when unset.",
 				Computed:            true,
 			},
 			"health_status": schema.StringAttribute{
@@ -231,6 +249,9 @@ func (d *llmProviderDataSource) Read(ctx context.Context, req datasource.ReadReq
 		Settings:           state.Settings,
 		Enabled:            state.Enabled,
 		EnforceHealthCheck: state.EnforceHealthCheck,
+		BillingMode:        state.BillingMode,
+		BillingReason:      state.BillingReason,
+		BillingNote:        state.BillingNote,
 		HealthStatus:       state.HealthStatus,
 		HealthDetail:       state.HealthDetail,
 		HealthCheckedAt:    state.HealthCheckedAt,

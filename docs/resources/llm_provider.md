@@ -6,6 +6,7 @@ description: |-
   Manages an LLM Gateway upstream provider: a named connection to a model vendor (OpenAI, Anthropic, Bedrock, …) that model mappings route traffic to.
   The credential (api_key) is write-only: the platform stores it in its secret store and never returns it in any form, so Terraform tracks the configured value and cannot detect out-of-band rotation. Changing it rotates the credential in place and re-probes connectivity.
   Providers backed by a shared connection (connection_id on the platform API) and structured non-API-key credentials (AWS role / static credentials, Google ADC) are not yet supported by this resource — create those in the Barndoor app instead.
+  The billing attributes (billing_mode, billing_reason, billing_note) are left alone unless configured, so a configuration that never mentions them does not disturb billing set in the app. Removing billing_reason or billing_note from a configuration that set it clears it on the platform. Removing billing_mode keeps the stored mode. An attribute counts as set by the configuration once an apply has written it: adopting a value identical to the stored one (for example right after an import) needs no apply, so it is not yet owned.
 ---
 
 # barndoor_llm_provider (Resource)
@@ -15,6 +16,8 @@ Manages an LLM Gateway upstream provider: a named connection to a model vendor (
 The credential (`api_key`) is **write-only**: the platform stores it in its secret store and never returns it in any form, so Terraform tracks the configured value and cannot detect out-of-band rotation. Changing it rotates the credential in place and re-probes connectivity.
 
 Providers backed by a **shared connection** (`connection_id` on the platform API) and structured non-API-key credentials (AWS role / static credentials, Google ADC) are not yet supported by this resource — create those in the Barndoor app instead.
+
+The billing attributes (`billing_mode`, `billing_reason`, `billing_note`) are left alone unless configured, so a configuration that never mentions them does not disturb billing set in the app. Removing `billing_reason` or `billing_note` from a configuration that set it clears it on the platform. Removing `billing_mode` keeps the stored mode. An attribute counts as set by the configuration once an apply has written it: adopting a value identical to the stored one (for example right after an import) needs no apply, so it is not yet owned.
 
 ## Example Usage
 
@@ -65,6 +68,11 @@ variable "anthropic_api_key" {
 
 - `api_key` (String, Sensitive) Upstream API key. Write-only — the platform stores it in its secret store and never echoes it back; changing it rotates the credential in place.
 - `auth_type` (String) How the gateway authenticates upstream (e.g. `bearer_api_key`, `x_api_key`, `azure_api_key`). Defaults per `model_provider` when unset (`anthropic` → `x_api_key`, `azure_openai` → `azure_api_key`, most others → `bearer_api_key`).
+- `billing_mode` (String) Whether Barndoor calculates and reports a per-token cost for this provider's traffic: `per_token` (the default) or `not_metered`. A `not_metered` provider still counts and reports token usage, but records its token cost as $0, and requires `billing_reason`.
+
+Changing it is **not retroactive**: cost is resolved when each request is served, so usage already recorded keeps the cost it was recorded with. Setting `per_token` on a flat-rate provider is also not a way to see what it would have cost at API rates. It records real cost, which appears in cost reports as actual spend and consumes spend budgets. For the same reason, a spend (cost) budget on a `not_metered` provider never fires; use a token budget instead. Left unchanged when removed from configuration.
+- `billing_note` (String) Free-text context for the billing arrangement, at most 200 characters. Human-readable only; never parsed or aggregated.
+- `billing_reason` (String) How the vendor actually bills this provider: `subscription` (a flat-rate plan, e.g. a Claude account over OAuth passthrough), `local` (self-hosted inference), `external` (metered, but billed through another system), or `other` (pair it with `billing_note`). **Required** when `billing_mode` is `not_metered`, and optional with `per_token`, where it describes a subscription that bills overages per token. The two attributes are independent. A descriptive label only: nothing in the billing path reads it.
 - `enabled` (Boolean) Operator intent: whether the provider may serve traffic. Defaults to `true`. Distinct from `health_status`, which the platform records from connectivity probes.
 - `enforce_health_check` (Boolean) Whether routing gates on the connectivity health probe. Defaults to `true`; set `false` to serve the provider even while its probe fails.
 - `settings` (String) Provider-specific settings as a JSON object (`jsonencode({ … })`), e.g. `region` for Bedrock or `api_version` for Azure OpenAI. The API normalizes some shapes (it may add derived keys), and the normalized form is what Terraform tracks — author settings in their normalized form to avoid perpetual diffs.

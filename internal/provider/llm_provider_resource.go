@@ -19,6 +19,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/barndoor-ai/terraform-provider-barndoor/internal/client"
@@ -32,11 +33,29 @@ var llmModelProviders = []string{
 	"openrouter", "deepseek", "custom",
 }
 
+// llmBillingModes / llmBillingReasons are the BillingMode / BillingReason
+// enums' wire values (V69, BCP-3876). The two are independent: a reason is
+// required only when the mode is not_metered.
+var (
+	llmBillingModes   = []string{"per_token", "not_metered"}
+	llmBillingReasons = []string{"subscription", "local", "external", "other"}
+)
+
+// llmBillingNoteMaxLen matches the billing_note varchar(200) column. The API
+// counts characters, not bytes, hence the UTF-8 length validator.
+const llmBillingNoteMaxLen = 200
+
+// llmProviderManagedKey is the private-state key recording which of the
+// clearable billing attributes the configuration set on the last apply. See
+// llmClearIfPreviouslyConfigured.
+const llmProviderManagedKey = "configured_billing_attributes"
+
 // Ensure the resource satisfies the framework interfaces it relies on.
 var (
 	_ resource.Resource                = &llmProviderResource{}
 	_ resource.ResourceWithConfigure   = &llmProviderResource{}
 	_ resource.ResourceWithImportState = &llmProviderResource{}
+	_ resource.ResourceWithModifyPlan  = &llmProviderResource{}
 )
 
 // NewLlmProviderResource returns a new barndoor_llm_provider resource.
@@ -62,6 +81,9 @@ type llmProviderResourceModel struct {
 	Settings           jsontypes.Normalized `tfsdk:"settings"`
 	Enabled            types.Bool           `tfsdk:"enabled"`
 	EnforceHealthCheck types.Bool           `tfsdk:"enforce_health_check"`
+	BillingMode        types.String         `tfsdk:"billing_mode"`
+	BillingReason      types.String         `tfsdk:"billing_reason"`
+	BillingNote        types.String         `tfsdk:"billing_note"`
 	HealthStatus       types.String         `tfsdk:"health_status"`
 	HealthDetail       types.String         `tfsdk:"health_detail"`
 	HealthCheckedAt    types.String         `tfsdk:"health_checked_at"`
@@ -82,7 +104,13 @@ func (r *llmProviderResource) Schema(_ context.Context, _ resource.SchemaRequest
 			"out-of-band rotation. Changing it rotates the credential in place and re-probes connectivity.\n\n" +
 			"Providers backed by a **shared connection** (`connection_id` on the platform API) and " +
 			"structured non-API-key credentials (AWS role / static credentials, Google ADC) are not yet " +
-			"supported by this resource — create those in the Barndoor app instead.",
+			"supported by this resource — create those in the Barndoor app instead.\n\n" +
+			"The billing attributes (`billing_mode`, `billing_reason`, `billing_note`) are left alone " +
+			"unless configured, so a configuration that never mentions them does not disturb billing set " +
+			"in the app. Removing `billing_reason` or `billing_note` from a configuration that set it " +
+			"clears it on the platform. Removing `billing_mode` keeps the stored mode. An attribute counts " +
+			"as set by the configuration once an apply has written it: adopting a value identical to the " +
+			"stored one (for example right after an import) needs no apply, so it is not yet owned.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				MarkdownDescription: "Provider UUID assigned by the API; also the `terraform import` key.",
@@ -169,6 +197,56 @@ func (r *llmProviderResource) Schema(_ context.Context, _ resource.SchemaRequest
 				Computed: true,
 				Default:  booldefault.StaticBool(true),
 			},
+			"billing_mode": schema.StringAttribute{
+				MarkdownDescription: "Whether Barndoor calculates and reports a per-token cost for this " +
+					"provider's traffic: `per_token` (the default) or `not_metered`. A `not_metered` " +
+					"provider still counts and reports token usage, but records its token cost as $0, and " +
+					"requires `billing_reason`.\n\n" +
+					"Changing it is **not retroactive**: cost is resolved when each request is served, so " +
+					"usage already recorded keeps the cost it was recorded with. Setting `per_token` on a " +
+					"flat-rate provider is also not a way to see what it would have cost at API rates. It " +
+					"records real cost, which appears in cost reports as actual spend and consumes spend " +
+					"budgets. For the same reason, a spend (cost) budget on a `not_metered` provider never " +
+					"fires; use a token budget instead. Left unchanged when removed from configuration.",
+				Optional: true,
+				Computed: true,
+				Validators: []validator.String{
+					stringvalidator.OneOf(llmBillingModes...),
+				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"billing_reason": schema.StringAttribute{
+				MarkdownDescription: "How the vendor actually bills this provider: `subscription` (a " +
+					"flat-rate plan, e.g. a Claude account over OAuth passthrough), `local` (self-hosted " +
+					"inference), `external` (metered, but billed through another system), or `other` (pair " +
+					"it with `billing_note`). **Required** when `billing_mode` is `not_metered`, and " +
+					"optional with `per_token`, where it describes a subscription that bills overages per " +
+					"token. The two attributes are independent. A descriptive label only: nothing in the " +
+					"billing path reads it.",
+				Optional: true,
+				Computed: true,
+				Validators: []validator.String{
+					stringvalidator.OneOf(llmBillingReasons...),
+				},
+				PlanModifiers: []planmodifier.String{
+					llmClearIfPreviouslyConfigured{},
+				},
+			},
+			"billing_note": schema.StringAttribute{
+				MarkdownDescription: "Free-text context for the billing arrangement, at most 200 " +
+					"characters. Human-readable only; never parsed or aggregated.",
+				Optional: true,
+				Computed: true,
+				Validators: []validator.String{
+					noSurroundingWhitespace,
+					stringvalidator.UTF8LengthAtMost(llmBillingNoteMaxLen),
+				},
+				PlanModifiers: []planmodifier.String{
+					llmClearIfPreviouslyConfigured{},
+				},
+			},
 			"health_status": schema.StringAttribute{
 				MarkdownDescription: "Observed upstream reachability recorded by the platform's " +
 					"connectivity probes: `unverified`, `healthy`, or `unhealthy`. Refreshed on every " +
@@ -246,16 +324,19 @@ func (r *llmProviderResource) Create(ctx context.Context, req resource.CreateReq
 	// below still leaves it tracked rather than orphaned.
 	state := applyLlmProviderResponse(&provider, &plan)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+	resp.Diagnostics.Append(recordConfiguredBilling(ctx, req.Config, resp.Private)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
 	// The create endpoint has no `enabled` field (new providers are always
 	// enabled); converge a `enabled = false` plan with an immediate update.
+	// The body carries only `enabled`: llmProviderUpdateRequest always sends
+	// the clearable billing keys, and a null there would clear what create
+	// just set.
 	if enabled, ok := knownBool(plan.Enabled); ok && !enabled {
-		disable := false
 		if err := doJSON(ctx, r.client, http.MethodPut, llmGatewayAPIPrefix+"/providers/"+provider.ID,
-			&llmProviderUpdateRequest{Enabled: &disable}, &provider); err != nil {
+			map[string]bool{"enabled": false}, &provider); err != nil {
 			addLlmGatewayAPIError(&resp.Diagnostics, "LLM provider", "disable the LLM provider after create", err)
 			return
 		}
@@ -319,6 +400,123 @@ func (r *llmProviderResource) Update(ctx context.Context, req resource.UpdateReq
 
 	newState := applyLlmProviderResponse(&provider, &plan)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
+	resp.Diagnostics.Append(recordConfiguredBilling(ctx, req.Config, resp.Private)...)
+}
+
+// ModifyPlan rejects a not_metered provider with no billing_reason at plan
+// time (the API answers 400, and the V69 CHECK is the backstop). It runs on
+// the plan rather than the configuration because the reason may be
+// unconfigured yet still set on the platform, which is valid.
+func (r *llmProviderResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() {
+		return // destroy
+	}
+
+	var mode, reason types.String
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("billing_mode"), &mode)...)
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("billing_reason"), &reason)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if m, ok := knownString(mode); ok && m == "not_metered" && reason.IsNull() {
+		resp.Diagnostics.AddAttributeError(path.Root("billing_reason"),
+			"billing_reason is required when billing_mode is \"not_metered\"",
+			"A provider cannot stop recording cost without saying why. Set billing_reason to one of "+
+				"\"subscription\", \"local\", \"external\" or \"other\".")
+	}
+}
+
+// llmClearIfPreviouslyConfigured is the plan modifier for the clearable
+// billing attributes. The platform treats an omitted field as "keep" and an
+// explicit null as "clear", and Terraform cannot express that difference in
+// configuration. So the provider records in private state whether the
+// configuration set each attribute on the last apply:
+//
+//   - configured now: plan the configured value;
+//   - removed after being configured: plan null, which Update sends as an
+//     explicit null to clear it;
+//   - never configured: keep the stored value, so billing set in the app (or
+//     present at import) is left alone.
+//
+// Ownership is recorded by Create/Update, so it is only taken by an apply. A
+// configuration adopting exactly the stored value produces no change and so no
+// apply. Terraform discards plan-time private state on a no-op, and forcing an
+// update would make every matching import plan non-empty. Until something else
+// triggers an apply, removing that value keeps it rather than clearing it.
+type llmClearIfPreviouslyConfigured struct{}
+
+func (llmClearIfPreviouslyConfigured) Description(_ context.Context) string {
+	return "Clears the value when it is removed from a configuration that set it; otherwise keeps the stored value."
+}
+
+func (m llmClearIfPreviouslyConfigured) MarkdownDescription(ctx context.Context) string {
+	return m.Description(ctx)
+}
+
+func (llmClearIfPreviouslyConfigured) PlanModifyString(ctx context.Context, req planmodifier.StringRequest, resp *planmodifier.StringResponse) {
+	if !req.ConfigValue.IsNull() {
+		return
+	}
+	if req.StateValue.IsNull() {
+		// Create, or nothing stored: the platform leaves it null too.
+		resp.PlanValue = types.StringNull()
+		return
+	}
+
+	configured, diags := configuredBilling(ctx, req.Private)
+	resp.Diagnostics.Append(diags...)
+	if configured[req.Path.String()] {
+		resp.PlanValue = types.StringNull()
+		return
+	}
+	resp.PlanValue = req.StateValue
+}
+
+// privateStateReader is the read half of the framework's private state,
+// which both plan-modifier requests and resource responses expose.
+type privateStateReader interface {
+	GetKey(ctx context.Context, key string) ([]byte, diag.Diagnostics)
+}
+
+type privateStateWriter interface {
+	SetKey(ctx context.Context, key string, value []byte) diag.Diagnostics
+}
+
+// configuredBilling reads which clearable billing attributes the last apply's
+// configuration set. Absent (import, or state written by an older provider
+// version) means none were.
+func configuredBilling(ctx context.Context, private privateStateReader) (map[string]bool, diag.Diagnostics) {
+	configured := map[string]bool{}
+	raw, diags := private.GetKey(ctx, llmProviderManagedKey)
+	if diags.HasError() || len(raw) == 0 {
+		return configured, diags
+	}
+	if err := json.Unmarshal(raw, &configured); err != nil {
+		diags.AddError("Malformed provider private state", err.Error())
+	}
+	return configured, diags
+}
+
+// recordConfiguredBilling stores which clearable billing attributes this
+// apply's configuration set, for llmClearIfPreviouslyConfigured.
+func recordConfiguredBilling(ctx context.Context, config tfsdk.Config, private privateStateWriter) diag.Diagnostics {
+	configured := map[string]bool{}
+	var diags diag.Diagnostics
+	for _, name := range []string{"billing_reason", "billing_note"} {
+		var v types.String
+		diags.Append(config.GetAttribute(ctx, path.Root(name), &v)...)
+		configured[name] = !v.IsNull()
+	}
+	if diags.HasError() {
+		return diags
+	}
+	raw, err := json.Marshal(configured)
+	if err != nil {
+		diags.AddError("Failed to encode provider private state", err.Error())
+		return diags
+	}
+	diags.Append(private.SetKey(ctx, llmProviderManagedKey, raw)...)
+	return diags
 }
 
 // Delete removes the provider (the platform also deletes its stored
@@ -369,11 +567,17 @@ type llmProviderCreateRequest struct {
 	APIKey             *string         `json:"api_key,omitempty"`
 	Settings           json.RawMessage `json:"settings,omitempty"`
 	EnforceHealthCheck *bool           `json:"enforce_health_check,omitempty"`
+	BillingMode        *string         `json:"billing_mode,omitempty"`
+	BillingReason      *string         `json:"billing_reason,omitempty"`
+	BillingNote        *string         `json:"billing_note,omitempty"`
 }
 
 // llmProviderUpdateRequest mirrors the llm-gateway UpdateProviderRequest body.
 // Omitted keys leave the corresponding column unchanged, so Update sends every
-// managed field — Terraform's plan is the full desired state.
+// managed field — Terraform's plan is the full desired state. The two
+// clearable billing keys are deliberately **not** omitempty: the API reads an
+// explicit null as "clear", and a planned null only arises from nothing
+// stored or from llmClearIfPreviouslyConfigured asking to clear.
 type llmProviderUpdateRequest struct {
 	Name               *string         `json:"name,omitempty"`
 	BaseURL            *string         `json:"base_url,omitempty"`
@@ -382,14 +586,17 @@ type llmProviderUpdateRequest struct {
 	Settings           json.RawMessage `json:"settings,omitempty"`
 	Enabled            *bool           `json:"enabled,omitempty"`
 	EnforceHealthCheck *bool           `json:"enforce_health_check,omitempty"`
+	BillingMode        *string         `json:"billing_mode,omitempty"`
+	BillingReason      *string         `json:"billing_reason"`
+	BillingNote        *string         `json:"billing_note"`
 }
 
 // llmProviderResponse mirrors the llm-gateway Provider response. The stored
 // credential is never part of it (in any form — not even masked): the API
 // writes it to the platform secret store and returns only the opaque
 // `secret_path`, which this resource does not track. `health_detail`,
-// `health_checked_at`, and `catalog_slug` are omitted from the JSON when
-// null.
+// `health_checked_at`, `billing_reason`, `billing_note` and `catalog_slug`
+// are omitted from the JSON when null.
 type llmProviderResponse struct {
 	ID                 string          `json:"id"`
 	OrgID              string          `json:"org_id"`
@@ -400,6 +607,9 @@ type llmProviderResponse struct {
 	Enabled            bool            `json:"enabled"`
 	Settings           json.RawMessage `json:"settings"`
 	EnforceHealthCheck bool            `json:"enforce_health_check"`
+	BillingMode        string          `json:"billing_mode"`
+	BillingReason      *string         `json:"billing_reason"`
+	BillingNote        *string         `json:"billing_note"`
 	HealthStatus       string          `json:"health_status"`
 	HealthDetail       *string         `json:"health_detail"`
 	HealthCheckedAt    *string         `json:"health_checked_at"`
@@ -441,7 +651,19 @@ func buildLlmProviderCreateRequest(plan *llmProviderResourceModel) (*llmProvider
 	if v, ok := knownBool(plan.EnforceHealthCheck); ok {
 		body.EnforceHealthCheck = &v
 	}
+	body.BillingMode = stringPtrIfKnown(plan.BillingMode)
+	body.BillingReason = stringPtrIfKnown(plan.BillingReason)
+	body.BillingNote = stringPtrIfKnown(plan.BillingNote)
 	return body, nil
+}
+
+// stringPtrIfKnown converts a known, non-null types.String to a wire pointer;
+// null/unknown convert to nil.
+func stringPtrIfKnown(v types.String) *string {
+	if s, ok := knownString(v); ok {
+		return &s
+	}
+	return nil
 }
 
 // buildLlmProviderUpdateRequest converts the planned model to the update
@@ -472,6 +694,9 @@ func buildLlmProviderUpdateRequest(plan *llmProviderResourceModel) (*llmProvider
 	if v, ok := knownBool(plan.EnforceHealthCheck); ok {
 		body.EnforceHealthCheck = &v
 	}
+	body.BillingMode = stringPtrIfKnown(plan.BillingMode)
+	body.BillingReason = stringPtrIfKnown(plan.BillingReason)
+	body.BillingNote = stringPtrIfKnown(plan.BillingNote)
 	return body, nil
 }
 
@@ -506,6 +731,9 @@ func applyLlmProviderResponse(provider *llmProviderResponse, prior *llmProviderR
 		Settings:           settings,
 		Enabled:            types.BoolValue(provider.Enabled),
 		EnforceHealthCheck: types.BoolValue(provider.EnforceHealthCheck),
+		BillingMode:        types.StringValue(provider.BillingMode),
+		BillingReason:      optionalStringFromPtr(provider.BillingReason, prior.BillingReason),
+		BillingNote:        optionalStringFromPtr(provider.BillingNote, prior.BillingNote),
 		HealthStatus:       types.StringValue(provider.HealthStatus),
 		HealthDetail:       optionalStringFromPtr(provider.HealthDetail, prior.HealthDetail),
 		HealthCheckedAt:    optionalStringFromPtr(provider.HealthCheckedAt, prior.HealthCheckedAt),
