@@ -164,12 +164,12 @@ func (r *llmModelMappingResource) Schema(_ context.Context, _ resource.SchemaReq
 				},
 			},
 			"stream_idle_timeout_secs": schema.Int64Attribute{
-				MarkdownDescription: "Per-chunk idle timeout for streaming responses, in seconds (1–120). " +
+				MarkdownDescription: "Per-chunk idle timeout for streaming responses, in seconds (1–300). " +
 					"The platform default is written when unset.",
 				Optional: true,
 				Computed: true,
 				Validators: []validator.Int64{
-					int64validator.Between(1, 120),
+					int64validator.Between(1, 300),
 				},
 				PlanModifiers: []planmodifier.Int64{
 					int64planmodifier.UseStateForUnknown(),

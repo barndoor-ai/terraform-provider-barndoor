@@ -69,7 +69,7 @@ resource "barndoor_llm_model_mapping" "fast" {
 - `request_timeout_secs` (Number) Total-request timeout for non-streaming requests, in seconds (1–600). The platform default is written when unset. On a 1:1 enablement row this sets the model tier consulted by every alias of the model.
 - `retry_on_429_count` (Number) Same-route retries on an upstream 429 before failing over to the next route (0–10). `0` (the default) fails over immediately.
 - `retry_on_429_max_wait_secs` (Number) Cap on honoring the upstream `Retry-After` header, in seconds (0–180). `0` (the default) uses a small built-in default and ignores the header.
-- `stream_idle_timeout_secs` (Number) Per-chunk idle timeout for streaming responses, in seconds (1–120). The platform default is written when unset.
+- `stream_idle_timeout_secs` (Number) Per-chunk idle timeout for streaming responses, in seconds (1–300). The platform default is written when unset.
 
 ### Read-Only
 

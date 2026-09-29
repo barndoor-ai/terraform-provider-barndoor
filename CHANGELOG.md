@@ -5,6 +5,8 @@
 BUG FIXES:
 
 * resource/`barndoor_llm_governance_config`: every apply, and `terraform destroy`, reset settings the resource did not manage to their platform defaults. The platform's update replaces the whole configuration row, and the resource sent only `require_pricing_for_mappings`. As a result, an organization switched to `default_model_access = "deny"` in the app went back to `allow`, reopening model access to every model, and `require_routing_policy` was turned off. The resource now reads the current configuration and changes only what it manages, and destroy resets only `require_pricing_for_mappings`.
+* resource/`barndoor_llm_model_mapping`: `stream_idle_timeout_secs` accepted only 1–120, but the platform allows 1–300 and writes 180 by default. A mapping created with the platform default therefore held a value its own configuration could not express. The validator now matches the platform.
+* resource/`barndoor_llm_provider`: `model_provider` now accepts `azure_foundry`, which the platform supports, and the `auth_type` documentation lists the real per-provider defaults (`bedrock` → `aws_role`, `vertex` → `google_adc`, `azure_foundry` → `azure_foundry_api_key`).
 
 ENHANCEMENTS:
 

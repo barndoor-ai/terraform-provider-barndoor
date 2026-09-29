@@ -297,3 +297,27 @@ data "barndoor_llm_provider" "test" {
 		},
 	})
 }
+
+func TestLlmProviderResource_azureFoundry(t *testing.T) {
+	fake := setupLlmGatewayTest(t)
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllLlmProvidersDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "barndoor_llm_provider" "test" {
+  name           = "Foundry"
+  model_provider = "azure_foundry"
+  base_url       = "https://example.services.ai.azure.com"
+  api_key        = "foundry-key"
+}
+`,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(llmBillingResourceName, "model_provider", "azure_foundry"),
+					resource.TestCheckResourceAttr(llmBillingResourceName, "auth_type", "azure_foundry_api_key"),
+				),
+			},
+		},
+	})
+}

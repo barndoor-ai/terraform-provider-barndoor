@@ -28,9 +28,9 @@ import (
 // llmModelProviders are the upstream model-provider families the gateway can
 // speak to (the `ModelProvider` enum's wire values).
 var llmModelProviders = []string{
-	"openai", "anthropic", "azure_openai", "google_ai", "bedrock", "vertex",
-	"groq", "together", "mistral", "cohere", "xai", "fireworks", "perplexity",
-	"openrouter", "deepseek", "custom",
+	"openai", "anthropic", "azure_openai", "azure_foundry", "google_ai", "bedrock",
+	"vertex", "groq", "together", "mistral", "cohere", "xai", "fireworks",
+	"perplexity", "openrouter", "deepseek", "custom",
 }
 
 // llmBillingModes / llmBillingReasons are the BillingMode / BillingReason
@@ -133,8 +133,8 @@ func (r *llmProviderResource) Schema(_ context.Context, _ resource.SchemaRequest
 			},
 			"model_provider": schema.StringAttribute{
 				MarkdownDescription: "Upstream model-provider family, deciding the wire protocol the " +
-					"gateway speaks: `openai`, `anthropic`, `azure_openai`, `google_ai`, `bedrock`, " +
-					"`vertex`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, " +
+					"gateway speaks: `openai`, `anthropic`, `azure_openai`, `azure_foundry`, `google_ai`, " +
+					"`bedrock`, `vertex`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, " +
 					"`perplexity`, `openrouter`, `deepseek`, or `custom`. Changing it forces a new " +
 					"provider (the API has no update for it).",
 				Required: true,
@@ -155,7 +155,8 @@ func (r *llmProviderResource) Schema(_ context.Context, _ resource.SchemaRequest
 			"auth_type": schema.StringAttribute{
 				MarkdownDescription: "How the gateway authenticates upstream (e.g. `bearer_api_key`, " +
 					"`x_api_key`, `azure_api_key`). Defaults per `model_provider` when unset " +
-					"(`anthropic` → `x_api_key`, `azure_openai` → `azure_api_key`, most others → " +
+					"(`anthropic` → `x_api_key`, `azure_openai` → `azure_api_key`, `azure_foundry` → " +
+					"`azure_foundry_api_key`, `bedrock` → `aws_role`, `vertex` → `google_adc`, all others → " +
 					"`bearer_api_key`).",
 				Optional: true,
 				Computed: true,

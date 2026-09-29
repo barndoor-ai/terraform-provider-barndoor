@@ -61,13 +61,13 @@ variable "anthropic_api_key" {
 ### Required
 
 - `base_url` (String) Upstream API base URL, e.g. `https://api.openai.com/v1`.
-- `model_provider` (String) Upstream model-provider family, deciding the wire protocol the gateway speaks: `openai`, `anthropic`, `azure_openai`, `google_ai`, `bedrock`, `vertex`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, `perplexity`, `openrouter`, `deepseek`, or `custom`. Changing it forces a new provider (the API has no update for it).
+- `model_provider` (String) Upstream model-provider family, deciding the wire protocol the gateway speaks: `openai`, `anthropic`, `azure_openai`, `azure_foundry`, `google_ai`, `bedrock`, `vertex`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, `perplexity`, `openrouter`, `deepseek`, or `custom`. Changing it forces a new provider (the API has no update for it).
 - `name` (String) Human-readable display name of the provider.
 
 ### Optional
 
 - `api_key` (String, Sensitive) Upstream API key. Write-only — the platform stores it in its secret store and never echoes it back; changing it rotates the credential in place.
-- `auth_type` (String) How the gateway authenticates upstream (e.g. `bearer_api_key`, `x_api_key`, `azure_api_key`). Defaults per `model_provider` when unset (`anthropic` → `x_api_key`, `azure_openai` → `azure_api_key`, most others → `bearer_api_key`).
+- `auth_type` (String) How the gateway authenticates upstream (e.g. `bearer_api_key`, `x_api_key`, `azure_api_key`). Defaults per `model_provider` when unset (`anthropic` → `x_api_key`, `azure_openai` → `azure_api_key`, `azure_foundry` → `azure_foundry_api_key`, `bedrock` → `aws_role`, `vertex` → `google_adc`, all others → `bearer_api_key`).
 - `billing_mode` (String) Whether Barndoor calculates and reports a per-token cost for this provider's traffic: `per_token` (the default) or `not_metered`. A `not_metered` provider still counts and reports token usage, but records its token cost as $0, and requires `billing_reason`.
 
 Changing it is **not retroactive**: cost is resolved when each request is served, so usage already recorded keeps the cost it was recorded with. Setting `per_token` on a flat-rate provider is also not a way to see what it would have cost at API rates. It records real cost, which appears in cost reports as actual spend and consumes spend budgets. For the same reason, a spend (cost) budget on a `not_metered` provider never fires; use a token budget instead. Left unchanged when removed from configuration.

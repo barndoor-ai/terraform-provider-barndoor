@@ -124,7 +124,7 @@ resource "barndoor_llm_model_mapping" "alias" {
 					resource.TestCheckResourceAttr(enableName, "enabled", "true"),
 					resource.TestCheckResourceAttr(enableName, "priority", "0"),
 					resource.TestCheckResourceAttr(enableName, "bare_alias", "false"),
-					resource.TestCheckResourceAttr(enableName, "stream_idle_timeout_secs", "30"),
+					resource.TestCheckResourceAttr(enableName, "stream_idle_timeout_secs", "180"),
 					resource.TestCheckResourceAttr(enableName, "request_timeout_secs", "120"),
 					resource.TestCheckResourceAttr(aliasName, "bare_alias", "true"),
 					resource.TestCheckResourceAttr(aliasName, "retry_on_429_count", "0"),
@@ -466,6 +466,38 @@ resource "barndoor_llm_model_mapping" "enable" {
 }
 `, provider.ID),
 				Check: resource.TestCheckResourceAttr("barndoor_llm_model_mapping.enable", "cooldown_overloaded_secs", "0"),
+			},
+		},
+	})
+}
+
+// The platform's stream-idle range is 1–300 with a default of 180, so a
+// mapping imported with the default must be expressible in configuration.
+func TestLlmModelMappingResource_streamIdleRangeMatchesPlatform(t *testing.T) {
+	fake := setupLlmGatewayTest(t)
+	provider := fake.seedProvider()
+	config := func(secs int) string {
+		return fmt.Sprintf(`
+resource "barndoor_llm_model_mapping" "enable" {
+  provider_id              = %q
+  model_alias              = "gpt-4o"
+  upstream_model           = "gpt-4o"
+  stream_idle_timeout_secs = %d
+}
+`, provider.ID, secs)
+	}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      config(301),
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`value must be between 1 and 300`),
+			},
+			{
+				Config: config(300),
+				Check:  resource.TestCheckResourceAttr("barndoor_llm_model_mapping.enable", "stream_idle_timeout_secs", "300"),
 			},
 		},
 	})

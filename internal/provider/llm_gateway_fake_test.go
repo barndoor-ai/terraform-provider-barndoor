@@ -44,7 +44,7 @@ const fakeLlmTime = "2026-07-02T00:00:00Z"
 // Platform timeout defaults materialized at mapping insert
 // (`STREAM_IDLE_TIMEOUT_DEFAULT_SECS` / `TOTAL_REQUEST_TIMEOUT_DEFAULT_SECS`).
 const (
-	fakeLlmStreamIdleDefault = 30
+	fakeLlmStreamIdleDefault = 180
 	fakeLlmRequestDefault    = 120
 )
 
@@ -317,9 +317,9 @@ func writeLlmError(w http.ResponseWriter, status int, message string) {
 // --- providers -----------------------------------------------------------------
 
 var fakeLlmModelProviders = []string{
-	"openai", "anthropic", "azure_openai", "google_ai", "bedrock", "vertex",
-	"groq", "together", "mistral", "cohere", "xai", "fireworks", "perplexity",
-	"openrouter", "deepseek", "custom",
+	"openai", "anthropic", "azure_openai", "azure_foundry", "google_ai", "bedrock",
+	"vertex", "groq", "together", "mistral", "cohere", "xai", "fireworks",
+	"perplexity", "openrouter", "deepseek", "custom",
 }
 
 // fakeLlmDefaultAuthType mirrors production's default_auth_type.
@@ -334,6 +334,8 @@ func fakeLlmDefaultAuthType(modelProvider string, requested *string) string {
 		return "google_adc"
 	case "azure_openai":
 		return "azure_api_key"
+	case "azure_foundry":
+		return "azure_foundry_api_key"
 	case "anthropic":
 		return "x_api_key"
 	default:
@@ -499,7 +501,8 @@ func (f *fakeLlmGatewayServer) createProvider(w http.ResponseWriter, r *http.Req
 	if body.APIKey != nil {
 		credential = *body.APIKey
 	}
-	if credential == "" && (authType == "bearer_api_key" || authType == "x_api_key" || authType == "azure_api_key") {
+	if credential == "" && (authType == "bearer_api_key" || authType == "x_api_key" || authType == "azure_api_key" ||
+		authType == "azure_foundry_api_key") {
 		writeLlmError(w, http.StatusBadRequest, "api_key is required for API-key auth providers")
 		return
 	}
@@ -746,8 +749,8 @@ func validLlmMappingRanges(w http.ResponseWriter, retryCount, retryMaxWait int64
 		writeLlmError(w, http.StatusBadRequest, "retry_on_429_max_wait_secs must be between 0 and 180")
 		return false
 	}
-	if streamIdle != nil && (*streamIdle < 1 || *streamIdle > 120) {
-		writeLlmError(w, http.StatusBadRequest, "stream_idle_timeout_secs must be between 1 and 120")
+	if streamIdle != nil && (*streamIdle < 1 || *streamIdle > 300) {
+		writeLlmError(w, http.StatusBadRequest, "stream_idle_timeout_secs must be between 1 and 300")
 		return false
 	}
 	if requestTimeout != nil && (*requestTimeout < 1 || *requestTimeout > 600) {
