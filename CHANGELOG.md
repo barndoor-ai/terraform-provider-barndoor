@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+ENHANCEMENTS:
+
+* resource/`barndoor_llm_token_budget`, resource/`barndoor_llm_rate_limit`: new optional `member_of_group` attribute, which narrows a broad per-user rule to one IdP group's members. Each member gets their **own** allowance from the single rule, and someone who joins the group picks it up on their next request. That is the opposite of `scope_type = "group"`, which is **one** allowance pooled across the group. Only valid with `scope_type = "user"` and neither `scope_id` nor `scope_value` set. Those shapes are now rejected at plan time instead of at apply. Neither update API accepts the field, so changing or removing it forces replacement. Before this change, a filtered rule could be managed only from the Barndoor app. Requires platform support for `member_of_group` (bdai-platform BCP-3814 / #7195) (BCP-3897).
+
 ## 0.7.0 (2026-09-21)
 
 ENHANCEMENTS:

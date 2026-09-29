@@ -96,6 +96,7 @@ type fakeLlmRateLimit struct {
 	ScopeValue        *string
 	RequestsPerMinute *int64
 	TokensPerMinute   *int64
+	MemberOfGroup     *string
 	TrafficType       string
 	Enabled           bool
 }
@@ -106,6 +107,7 @@ type fakeLlmTokenBudget struct {
 	ScopeType       string
 	ScopeID         *string
 	ScopeValue      *string
+	MemberOfGroup   *string
 	Period          string
 	TokenLimit      int64
 	AlertThresholds []int64
@@ -1068,20 +1070,22 @@ func rateLimitJSON(p *fakeLlmRateLimit) map[string]any {
 		"scope_value":         p.ScopeValue,
 		"requests_per_minute": p.RequestsPerMinute,
 		"tokens_per_minute":   p.TokensPerMinute,
+		"member_of_group":     p.MemberOfGroup,
 		"traffic_type":        p.TrafficType,
 		"enabled":             p.Enabled,
 	}
 }
 
 // rateLimitScopeTaken mirrors the rate_limit_policies_scope_unique_idx
-// (org, scope_type, scope_id, scope_value, traffic_type).
-func (f *fakeLlmGatewayServer) rateLimitScopeTaken(scopeType string, scopeID, scopeValue *string, trafficType, excludeID string) bool {
+// (org, scope_type, scope_id, scope_value, traffic_type, member_of_group — V66).
+func (f *fakeLlmGatewayServer) rateLimitScopeTaken(scopeType string, scopeID, scopeValue *string, trafficType string, memberOfGroup *string, excludeID string) bool {
 	for _, p := range f.rateLimits {
 		if p.ID == excludeID {
 			continue
 		}
 		if p.ScopeType == scopeType && strPtrEq(p.ScopeID, scopeID) &&
-			strPtrEq(p.ScopeValue, scopeValue) && p.TrafficType == trafficType {
+			strPtrEq(p.ScopeValue, scopeValue) && p.TrafficType == trafficType &&
+			strPtrEq(p.MemberOfGroup, memberOfGroup) {
 			return true
 		}
 	}
@@ -1097,6 +1101,29 @@ func strPtrEq(a, b *string) bool {
 		bv = *b
 	}
 	return av == bv
+}
+
+// fakeMemberOfGroupShape mirrors production's normalize_member_of_group (trim,
+// blank means absent) and validate_member_of_group_shape (the filter is only
+// valid on a broad user-scoped rule). It writes the 400 and returns false on a
+// rejected shape.
+func fakeMemberOfGroupShape(w http.ResponseWriter, raw *string, scopeType string, scopeID, scopeValue *string) (*string, bool) {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return nil, true
+	}
+	group := strings.TrimSpace(*raw)
+	switch {
+	case scopeType != "user":
+		writeLlmError(w, http.StatusBadRequest, "member_of_group requires scope_type=user")
+		return nil, false
+	case scopeID != nil:
+		writeLlmError(w, http.StatusBadRequest, "member_of_group cannot be combined with scope_id")
+		return nil, false
+	case scopeValue != nil:
+		writeLlmError(w, http.StatusBadRequest, "member_of_group cannot be combined with scope_value")
+		return nil, false
+	}
+	return &group, true
 }
 
 func (f *fakeLlmGatewayServer) handleRateLimits(w http.ResponseWriter, r *http.Request) {
@@ -1138,6 +1165,7 @@ func (f *fakeLlmGatewayServer) createRateLimit(w http.ResponseWriter, r *http.Re
 		ScopeValue        *string `json:"scope_value"`
 		RequestsPerMinute *int64  `json:"requests_per_minute"`
 		TokensPerMinute   *int64  `json:"tokens_per_minute"`
+		MemberOfGroup     *string `json:"member_of_group"`
 		TrafficType       *string `json:"traffic_type"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -1149,12 +1177,16 @@ func (f *fakeLlmGatewayServer) createRateLimit(w http.ResponseWriter, r *http.Re
 			"at least one of requests_per_minute or tokens_per_minute is required")
 		return
 	}
+	group, ok := fakeMemberOfGroupShape(w, body.MemberOfGroup, body.ScopeType, body.ScopeID, body.ScopeValue)
+	if !ok {
+		return
+	}
 
 	trafficType := "all"
 	if body.TrafficType != nil {
 		trafficType = *body.TrafficType
 	}
-	if f.rateLimitScopeTaken(body.ScopeType, body.ScopeID, body.ScopeValue, trafficType, "") {
+	if f.rateLimitScopeTaken(body.ScopeType, body.ScopeID, body.ScopeValue, trafficType, group, "") {
 		writeLlmError(w, http.StatusConflict,
 			"A policy with this scope and traffic type already exists.")
 		return
@@ -1168,6 +1200,7 @@ func (f *fakeLlmGatewayServer) createRateLimit(w http.ResponseWriter, r *http.Re
 		ScopeValue:        body.ScopeValue,
 		RequestsPerMinute: body.RequestsPerMinute,
 		TokensPerMinute:   body.TokensPerMinute,
+		MemberOfGroup:     group,
 		TrafficType:       trafficType,
 		Enabled:           true, // create has no enabled field
 	}
@@ -1177,7 +1210,9 @@ func (f *fakeLlmGatewayServer) createRateLimit(w http.ResponseWriter, r *http.Re
 
 // updateRateLimit applies production's tri-state PATCH semantics on the two
 // metrics: an absent key keeps the current value, an explicit null clears it,
-// and a number sets it. Everything else is COALESCE.
+// and a number sets it. Everything else is COALESCE. member_of_group is not
+// part of the update contract (production drops the key), and a scope change
+// on a filtered policy is rejected (BCP-3896).
 func (f *fakeLlmGatewayServer) updateRateLimit(w http.ResponseWriter, r *http.Request, id string) {
 	p := f.findRateLimit(id)
 	if p == nil {
@@ -1238,7 +1273,15 @@ func (f *fakeLlmGatewayServer) updateRateLimit(w http.ResponseWriter, r *http.Re
 			"at least one of requests_per_minute or tokens_per_minute must be set")
 		return
 	}
-	if f.rateLimitScopeTaken(updated.ScopeType, updated.ScopeID, updated.ScopeValue, updated.TrafficType, p.ID) {
+	if updated.MemberOfGroup != nil &&
+		(updated.ScopeType != "user" || updated.ScopeID != nil || updated.ScopeValue != nil) {
+		writeLlmError(w, http.StatusBadRequest,
+			"this rate limit policy gives each member of '"+*updated.MemberOfGroup+
+				"' their own allowance, so its scope cannot be changed")
+		return
+	}
+	if f.rateLimitScopeTaken(updated.ScopeType, updated.ScopeID, updated.ScopeValue, updated.TrafficType,
+		updated.MemberOfGroup, p.ID) {
 		writeLlmError(w, http.StatusConflict,
 			"A policy with this scope and traffic type already exists.")
 		return
@@ -1297,6 +1340,7 @@ func budgetJSON(b *fakeLlmTokenBudget) map[string]any {
 		"scope_type":            b.ScopeType,
 		"scope_id":              b.ScopeID,
 		"scope_value":           b.ScopeValue,
+		"member_of_group":       b.MemberOfGroup,
 		"period":                b.Period,
 		"token_limit":           b.TokenLimit,
 		"alert_thresholds":      thresholds,
@@ -1313,14 +1357,16 @@ func budgetJSON(b *fakeLlmTokenBudget) map[string]any {
 }
 
 // budgetScopeTaken mirrors the token_budgets_scope_unique_idx
-// (org, scope_type, scope_id, scope_value, traffic_type, period).
-func (f *fakeLlmGatewayServer) budgetScopeTaken(scopeType string, scopeID, scopeValue *string, trafficType, period, excludeID string) bool {
+// (org, scope_type, scope_id, scope_value, traffic_type, period,
+// member_of_group — V65).
+func (f *fakeLlmGatewayServer) budgetScopeTaken(scopeType string, scopeID, scopeValue *string, trafficType, period string, memberOfGroup *string, excludeID string) bool {
 	for _, b := range f.budgets {
 		if b.ID == excludeID {
 			continue
 		}
 		if b.ScopeType == scopeType && strPtrEq(b.ScopeID, scopeID) &&
-			strPtrEq(b.ScopeValue, scopeValue) && b.TrafficType == trafficType && b.Period == period {
+			strPtrEq(b.ScopeValue, scopeValue) && b.TrafficType == trafficType && b.Period == period &&
+			strPtrEq(b.MemberOfGroup, memberOfGroup) {
 			return true
 		}
 	}
@@ -1364,6 +1410,7 @@ func (f *fakeLlmGatewayServer) createBudget(w http.ResponseWriter, r *http.Reque
 		ScopeType       string  `json:"scope_type"`
 		ScopeID         *string `json:"scope_id"`
 		ScopeValue      *string `json:"scope_value"`
+		MemberOfGroup   *string `json:"member_of_group"`
 		Period          string  `json:"period"`
 		TokenLimit      int64   `json:"token_limit"`
 		AlertThresholds []int64 `json:"alert_thresholds"`
@@ -1387,6 +1434,10 @@ func (f *fakeLlmGatewayServer) createBudget(w http.ResponseWriter, r *http.Reque
 		writeLlmError(w, http.StatusBadRequest, "invalid period: "+body.Period)
 		return
 	}
+	group, ok := fakeMemberOfGroupShape(w, body.MemberOfGroup, body.ScopeType, body.ScopeID, body.ScopeValue)
+	if !ok {
+		return
+	}
 
 	thresholds := body.AlertThresholds
 	if thresholds == nil {
@@ -1401,7 +1452,7 @@ func (f *fakeLlmGatewayServer) createBudget(w http.ResponseWriter, r *http.Reque
 		trafficType = *body.TrafficType
 	}
 
-	if f.budgetScopeTaken(body.ScopeType, body.ScopeID, body.ScopeValue, trafficType, body.Period, "") {
+	if f.budgetScopeTaken(body.ScopeType, body.ScopeID, body.ScopeValue, trafficType, body.Period, group, "") {
 		writeLlmError(w, http.StatusConflict,
 			"A budget with this scope, target, traffic type, and period already exists. "+
 				"Edit the existing one, or vary the scope, target, traffic type, or period.")
@@ -1414,6 +1465,7 @@ func (f *fakeLlmGatewayServer) createBudget(w http.ResponseWriter, r *http.Reque
 		ScopeType:       body.ScopeType,
 		ScopeID:         body.ScopeID,
 		ScopeValue:      body.ScopeValue,
+		MemberOfGroup:   group,
 		Period:          body.Period,
 		TokenLimit:      body.TokenLimit,
 		AlertThresholds: thresholds,
@@ -1473,7 +1525,7 @@ func (f *fakeLlmGatewayServer) updateBudget(w http.ResponseWriter, r *http.Reque
 	}
 
 	if f.budgetScopeTaken(updated.ScopeType, updated.ScopeID, updated.ScopeValue,
-		updated.TrafficType, updated.Period, b.ID) {
+		updated.TrafficType, updated.Period, updated.MemberOfGroup, b.ID) {
 		writeLlmError(w, http.StatusConflict,
 			"A budget with this scope, target, traffic type, and period already exists. "+
 				"Edit the existing one, or vary the scope, target, traffic type, or period.")

@@ -34,9 +34,10 @@ var (
 
 // Ensure the resource satisfies the framework interfaces it relies on.
 var (
-	_ resource.Resource                = &llmTokenBudgetResource{}
-	_ resource.ResourceWithConfigure   = &llmTokenBudgetResource{}
-	_ resource.ResourceWithImportState = &llmTokenBudgetResource{}
+	_ resource.Resource                     = &llmTokenBudgetResource{}
+	_ resource.ResourceWithConfigure        = &llmTokenBudgetResource{}
+	_ resource.ResourceWithImportState      = &llmTokenBudgetResource{}
+	_ resource.ResourceWithConfigValidators = &llmTokenBudgetResource{}
 )
 
 // NewLlmTokenBudgetResource returns a new barndoor_llm_token_budget resource.
@@ -58,6 +59,7 @@ type llmTokenBudgetResourceModel struct {
 	ScopeType       types.String `tfsdk:"scope_type"`
 	ScopeID         types.String `tfsdk:"scope_id"`
 	ScopeValue      types.String `tfsdk:"scope_value"`
+	MemberOfGroup   types.String `tfsdk:"member_of_group"`
 	Period          types.String `tfsdk:"period"`
 	TokenLimit      types.Int64  `tfsdk:"token_limit"`
 	AlertThresholds types.List   `tfsdk:"alert_thresholds"`
@@ -120,6 +122,7 @@ func (r *llmTokenBudgetResource) Schema(_ context.Context, _ resource.SchemaRequ
 					stringplanmodifier.RequiresReplace(),
 				},
 			},
+			"member_of_group": llmMemberOfGroupAttribute("budget"),
 			"period": schema.StringAttribute{
 				MarkdownDescription: "Budget window: `daily`, `weekly` (Monday-anchored), or `monthly`.",
 				Required:            true,
@@ -171,6 +174,14 @@ func (r *llmTokenBudgetResource) Schema(_ context.Context, _ resource.SchemaRequ
 	}
 }
 
+// ConfigValidators enforces the platform's member_of_group shape rule at plan
+// time.
+func (r *llmTokenBudgetResource) ConfigValidators(_ context.Context) []resource.ConfigValidator {
+	return []resource.ConfigValidator{
+		llmMemberOfGroupShapeValidator{what: "budget"},
+	}
+}
+
 func (r *llmTokenBudgetResource) Configure(_ context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
 	if req.ProviderData == nil {
 		return
@@ -209,6 +220,9 @@ func (r *llmTokenBudgetResource) Create(ctx context.Context, req resource.Create
 	}
 	if v, ok := knownString(plan.ScopeValue); ok {
 		body.ScopeValue = &v
+	}
+	if v, ok := knownString(plan.MemberOfGroup); ok {
+		body.MemberOfGroup = &v
 	}
 	if v, ok := knownString(plan.ActionOnExhaust); ok {
 		body.ActionOnExhaust = &v
@@ -392,6 +406,7 @@ type llmTokenBudgetCreateRequest struct {
 	ScopeType       string  `json:"scope_type"`
 	ScopeID         *string `json:"scope_id,omitempty"`
 	ScopeValue      *string `json:"scope_value,omitempty"`
+	MemberOfGroup   *string `json:"member_of_group,omitempty"`
 	Period          string  `json:"period"`
 	TokenLimit      int64   `json:"token_limit"`
 	AlertThresholds []int64 `json:"alert_thresholds,omitempty"`
@@ -401,8 +416,9 @@ type llmTokenBudgetCreateRequest struct {
 
 // llmTokenBudgetUpdateRequest mirrors the llm-gateway UpdateBudgetRequest
 // body. Omitted keys leave the corresponding column unchanged, so Update
-// sends every managed field. The scope attributes are absent by design: the
-// API cannot update them (they are RequiresReplace in the schema).
+// sends every managed field. The scope attributes and member_of_group are
+// absent by design: the API cannot update them (they are RequiresReplace in
+// the schema).
 type llmTokenBudgetUpdateRequest struct {
 	Name            *string `json:"name,omitempty"`
 	TokenLimit      *int64  `json:"token_limit,omitempty"`
@@ -422,6 +438,7 @@ type llmTokenBudgetResponse struct {
 	ScopeType       string  `json:"scope_type"`
 	ScopeID         *string `json:"scope_id"`
 	ScopeValue      *string `json:"scope_value"`
+	MemberOfGroup   *string `json:"member_of_group"`
 	Period          string  `json:"period"`
 	TokenLimit      int64   `json:"token_limit"`
 	AlertThresholds []int64 `json:"alert_thresholds"`
@@ -457,6 +474,7 @@ func applyLlmTokenBudgetResponse(ctx context.Context, budget *llmTokenBudgetResp
 		ScopeType:       types.StringValue(budget.ScopeType),
 		ScopeID:         optionalStringFromPtr(budget.ScopeID, prior.ScopeID),
 		ScopeValue:      optionalStringFromPtr(budget.ScopeValue, prior.ScopeValue),
+		MemberOfGroup:   optionalStringFromPtr(budget.MemberOfGroup, prior.MemberOfGroup),
 		Period:          types.StringValue(budget.Period),
 		TokenLimit:      types.Int64Value(budget.TokenLimit),
 		AlertThresholds: thresholds,

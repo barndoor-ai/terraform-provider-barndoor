@@ -57,6 +57,9 @@ resource "barndoor_llm_token_budget" "contractors_weekly" {
 - `action_on_exhaust` (String) What happens when the budget is exhausted: `block`, `throttle`, or `warn`. Defaults to `block`.
 - `alert_thresholds` (List of Number) Usage percentages (0–100) at which the platform raises alerts. Defaults to `[80, 90]`.
 - `enabled` (Boolean) Whether the policy is enforced. Defaults to `true`.
+- `member_of_group` (String) IdP group name that narrows a broad per-user budget to the members of that group. Each member gets their **own, independent** allowance from this single rule, and a user who joins the group picks it up on their next request with no admin action. This is the opposite of `scope_type = "group"` (with the group name in `scope_value`), which is **one allowance pooled** across every member, so the first heavy user can exhaust it for everyone.
+
+Only valid with `scope_type = "user"` and neither `scope_id` nor `scope_value` set. Changing it forces a new budget (the API cannot update it).
 - `scope_id` (String) UUID of the scoped entity (user, team, API key, …) for UUID-keyed scope types. Changing it forces a new budget (the API has no update for it).
 - `scope_value` (String) String key of the scoped entity for name-keyed scope types (e.g. a role or IdP group name for `role`/`group` scopes). Changing it forces a new budget (the API has no update for it).
 - `traffic_type` (String) Traffic lane the policy applies to: `all`, `llm` (model-proxy traffic), or `mcp` (MCP tool traffic). Defaults to `all`.

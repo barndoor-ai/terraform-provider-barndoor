@@ -52,6 +52,7 @@ type llmRateLimitResourceModel struct {
 	ScopeValue        types.String `tfsdk:"scope_value"`
 	RequestsPerMinute types.Int64  `tfsdk:"requests_per_minute"`
 	TokensPerMinute   types.Int64  `tfsdk:"tokens_per_minute"`
+	MemberOfGroup     types.String `tfsdk:"member_of_group"`
 	TrafficType       types.String `tfsdk:"traffic_type"`
 	Enabled           types.Bool   `tfsdk:"enabled"`
 }
@@ -91,6 +92,7 @@ func (r *llmRateLimitResource) Schema(_ context.Context, _ resource.SchemaReques
 			"scope_id":   llmScopeIDAttribute(),
 			"scope_value": llmScopeValueAttribute("e.g. a role or IdP group name for `role`/`group` " +
 				"scopes"),
+			"member_of_group": llmMemberOfGroupAttribute("rate limit"),
 			"requests_per_minute": schema.Int64Attribute{
 				MarkdownDescription: "Requests allowed per rolling 60-second window. Omit to enforce " +
 					"tokens only.",
@@ -113,14 +115,15 @@ func (r *llmRateLimitResource) Schema(_ context.Context, _ resource.SchemaReques
 	}
 }
 
-// ConfigValidators enforces the API invariant that a policy carries at least
-// one metric.
+// ConfigValidators enforces the API invariants that a policy carries at least
+// one metric and that a member_of_group filter sits on a broad per-user scope.
 func (r *llmRateLimitResource) ConfigValidators(_ context.Context) []resource.ConfigValidator {
 	return []resource.ConfigValidator{
 		resourcevalidator.AtLeastOneOf(
 			path.MatchRoot("requests_per_minute"),
 			path.MatchRoot("tokens_per_minute"),
 		),
+		llmMemberOfGroupShapeValidator{what: "rate limit"},
 	}
 }
 
@@ -162,6 +165,9 @@ func (r *llmRateLimitResource) Create(ctx context.Context, req resource.CreateRe
 	}
 	if v, ok := knownString(plan.ScopeValue); ok {
 		body.ScopeValue = &v
+	}
+	if v, ok := knownString(plan.MemberOfGroup); ok {
+		body.MemberOfGroup = &v
 	}
 	if v, ok := knownString(plan.TrafficType); ok {
 		body.TrafficType = &v
@@ -321,11 +327,12 @@ type llmRateLimitCreateRequest struct {
 	ScopeValue        *string `json:"scope_value,omitempty"`
 	RequestsPerMinute *int32  `json:"requests_per_minute,omitempty"`
 	TokensPerMinute   *int32  `json:"tokens_per_minute,omitempty"`
+	MemberOfGroup     *string `json:"member_of_group,omitempty"`
 	TrafficType       *string `json:"traffic_type,omitempty"`
 }
 
 // llmRateLimitUpdateRequest mirrors the llm-gateway UpdateRateLimitRequest
-// body. The two metric keys are deliberately **not** omitempty: the API's
+// body, which has no member_of_group (it is RequiresReplace). The two metric keys are deliberately **not** omitempty: the API's
 // tri-state PATCH semantics distinguish an absent key (keep the current
 // value) from an explicit null (clear the metric), and Terraform's plan is
 // the full desired state — a nil pointer must clear.
@@ -350,6 +357,7 @@ type llmRateLimitResponse struct {
 	ScopeValue        *string `json:"scope_value"`
 	RequestsPerMinute *int32  `json:"requests_per_minute"`
 	TokensPerMinute   *int32  `json:"tokens_per_minute"`
+	MemberOfGroup     *string `json:"member_of_group"`
 	TrafficType       string  `json:"traffic_type"`
 	Enabled           bool    `json:"enabled"`
 }
@@ -367,6 +375,7 @@ func applyLlmRateLimitResponse(policy *llmRateLimitResponse, prior *llmRateLimit
 		ScopeValue:        optionalStringFromPtr(policy.ScopeValue, prior.ScopeValue),
 		RequestsPerMinute: int64FromInt32Ptr(policy.RequestsPerMinute),
 		TokensPerMinute:   int64FromInt32Ptr(policy.TokensPerMinute),
+		MemberOfGroup:     optionalStringFromPtr(policy.MemberOfGroup, prior.MemberOfGroup),
 		TrafficType:       types.StringValue(policy.TrafficType),
 		Enabled:           types.BoolValue(policy.Enabled),
 	}

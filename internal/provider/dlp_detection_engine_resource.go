@@ -120,7 +120,7 @@ func (r *dlpDetectionEngineResource) Schema(_ context.Context, _ resource.Schema
 					"several provider types.",
 				Required: true,
 				Validators: []validator.String{
-					dlpNoSurroundingWhitespace,
+					noSurroundingWhitespace,
 				},
 			},
 			"provider_type": schema.StringAttribute{
@@ -128,7 +128,7 @@ func (r *dlpDetectionEngineResource) Schema(_ context.Context, _ resource.Schema
 					"for the supported values). Changing it updates the engine in place.",
 				Required: true,
 				Validators: []validator.String{
-					dlpNoSurroundingWhitespace,
+					noSurroundingWhitespace,
 				},
 			},
 			"provider_connection_name": schema.StringAttribute{
@@ -137,7 +137,7 @@ func (r *dlpDetectionEngineResource) Schema(_ context.Context, _ resource.Schema
 					"for built-in providers or to use the provider type's default connection.",
 				Optional: true,
 				Validators: []validator.String{
-					dlpNoSurroundingWhitespace,
+					noSurroundingWhitespace,
 				},
 			},
 			"enabled_detection_types": schema.ListAttribute{
@@ -150,7 +150,7 @@ func (r *dlpDetectionEngineResource) Schema(_ context.Context, _ resource.Schema
 				Validators: []validator.List{
 					listvalidator.SizeAtLeast(1),
 					listvalidator.UniqueValues(),
-					listvalidator.ValueStringsAre(dlpNoSurroundingWhitespace),
+					listvalidator.ValueStringsAre(noSurroundingWhitespace),
 				},
 			},
 			"config": schema.StringAttribute{
