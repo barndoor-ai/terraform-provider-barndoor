@@ -75,7 +75,8 @@ data "barndoor_llm_provider" "by_id" {
 					resource.TestCheckResourceAttr(dataName, "name", "Seeded openai"),
 					resource.TestCheckResourceAttr(dataName, "model_provider", "openai"),
 					resource.TestCheckResourceAttr(dataName, "auth_type", "bearer_api_key"),
-					resource.TestCheckResourceAttr(dataName, "base_url", "https://upstream.example.com/v1"),
+					resource.TestCheckResourceAttr(dataName, "base_url", "https://upstream.example.com"),
+					resource.TestCheckResourceAttr(dataName, "connection_id", *seeded.ConnectionID),
 					resource.TestCheckResourceAttr(dataName, "enabled", "true"),
 					resource.TestCheckResourceAttr(dataName, "enforce_health_check", "true"),
 					resource.TestCheckResourceAttr(dataName, "health_status", "unverified"),
@@ -83,8 +84,8 @@ data "barndoor_llm_provider" "by_id" {
 					resource.TestCheckNoResourceAttr(dataName, "settings"),
 					resource.TestCheckNoResourceAttr(dataName, "health_detail"),
 					resource.TestCheckNoResourceAttr(dataName, "health_checked_at"),
-					// The seeded provider has a stored credential ("seeded-key");
-					// it must not surface anywhere in the data source state.
+					// The seeded connection holds a secret ("seeded-key"); it
+					// must not surface anywhere in the data source state.
 					resource.TestCheckNoResourceAttr(dataName, "api_key"),
 				),
 			},
@@ -151,8 +152,7 @@ func TestLlmProviderDataSource_ambiguousName(t *testing.T) {
 	// providers indicate an API contract change. The fake does not enforce the
 	// index, letting this test prove the data source refuses to guess.
 	fake := setupLlmGatewayTest(t)
-	fake.seedProvider()
-	fake.seedProvider()
+	first, second := fake.seedProvider(), fake.seedProvider()
 
 	resource.UnitTest(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
@@ -166,7 +166,7 @@ data "barndoor_llm_provider" "dup" {
 				// The diagnostic must list the candidate ids so the practitioner
 				// can switch to an `id` lookup without a portal round trip.
 				ExpectError: regexp.MustCompile(
-					`(?s)2 LLM providers matched.*aaaa0000-0000-0000-0000-000000000001.*aaaa0000-0000-0000-0000-000000000002`),
+					`(?s)2 LLM providers matched.*` + first.ID + `.*` + second.ID),
 			},
 		},
 	})

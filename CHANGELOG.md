@@ -2,13 +2,31 @@
 
 ## Unreleased
 
+FEATURES:
+
+* **New Resource:** `barndoor_llm_connection` manages an LLM Gateway connection: a named, shareable credential for a model vendor that providers reference with `connection_id`. It is now the only place an upstream secret can live, because the platform stopped accepting keys on providers in v2.40.0 (BCP-3647).
+  * `api_key` (API-key auth types) and `credentials` (structured secrets for `aws_static_credentials`, `azure_entra_client_secret` or `google_service_account`) are sensitive and write-only. Terraform keeps the configured value, re-sends it on every update, and reports only `key_last4`.
+  * `settings` holds the resource settings, such as a Bedrock `region` and `iam_role_arn`. The platform adds derived keys on write, and those produce no diff. `effective_settings` shows the stored object, including the generated `external_id` an `aws_role` trust policy must require.
+  * Changing `base_url` moves every provider that follows the connection's endpoint.
+  * Destroying a connection that a provider managed outside this configuration still uses fails with the platform's 409.
+  * Import is by id.
+
 BUG FIXES:
+
+* resource/`barndoor_llm_provider`: since platform v2.40.0, creating any provider whose auth type stores a secret has failed, as has any update that re-sent `api_key`. The platform now rejects inline keys and requires `connection_id`, and the resource had no way to supply one. It now takes a `connection_id` (see ENHANCEMENTS), and `api_key` is deprecated.
+* resource/`barndoor_llm_provider`, resource/`barndoor_llm_connection`: a `base_url` ending in `/v1` for the OpenAI-compatible families (`openai`, `anthropic`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, `perplexity`, `openrouter`, `deepseek`, `custom`) now fails at plan time, with the corrected URL. The platform rejects it because the gateway appends the version itself. The previous documentation example `https://api.openai.com/v1` was one of these URLs.
 
 * resource/`barndoor_llm_governance_config`: every apply, and `terraform destroy`, reset settings the resource did not manage to their platform defaults. The platform's update replaces the whole configuration row, and the resource sent only `require_pricing_for_mappings`. As a result, an organization switched to `default_model_access = "deny"` in the app went back to `allow`, reopening model access to every model, and `require_routing_policy` was turned off. The resource now reads the current configuration and changes only what it manages, and destroy resets only `require_pricing_for_mappings`.
 * resource/`barndoor_llm_model_mapping`: `stream_idle_timeout_secs` accepted only 1–120, but the platform allows 1–300 and writes 180 by default. A mapping created with the platform default therefore held a value its own configuration could not express. The validator now matches the platform.
 * resource/`barndoor_llm_provider`: `model_provider` now accepts `azure_foundry`, which the platform supports, and the `auth_type` documentation lists the real per-provider defaults (`bedrock` → `aws_role`, `vertex` → `google_adc`, `azure_foundry` → `azure_foundry_api_key`).
 
 ENHANCEMENTS:
+
+* resource/`barndoor_llm_provider`, data-source/`barndoor_llm_provider`: new `connection_id` attribute, the `barndoor_llm_connection` the provider reads its upstream secret from.
+  * The connection supplies the provider's `auth_type`, its resource settings and, when the provider's `base_url` is unset (now optional), its endpoint. Setting `auth_type` or `api_key` together with `connection_id` is a plan-time error.
+  * Changing `connection_id` rebinds the provider in place. Removing it forces replacement, because the platform cannot detach a provider from its credential.
+  * Providers with a request-scoped OAuth passthrough (`claude_oauth`, `codex_oauth`) still need no connection.
+  * `settings` no longer has to be written in the platform's normalized form. While every configured key keeps its value, keys the platform merges in or derives produce no diff.
 
 * resource/`barndoor_llm_governance_config`: new optional `default_model_access` (`allow` or `deny`) and `require_routing_policy` attributes. Each keeps its stored value when unset. Setting `deny` requires an enabled allowlist, and the API rejects it otherwise. Neither is changed by destroy, so removing the resource never loosens model access. Requires platform support for the deny posture (bdai-platform BCP-3887) and routing-policy enforcement (BCP-4037).
 

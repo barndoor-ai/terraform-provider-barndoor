@@ -23,10 +23,11 @@ import (
 // --- in-process fake llm-gateway-service --------------------------------------
 //
 // fakeLlmGatewayServer emulates the llm-gateway admin REST surface the
-// provider binds (`/api/llm-gateway/admin/providers|model-mappings|
+// provider binds (`/api/llm-gateway/admin/connections|providers|model-mappings|
 // model-access|rate-limits|budgets|model-pricing|governance-config`)
-// faithfully enough to drive real plan/apply cycles: write-only provider
-// credentials (stored, never echoed), per-model-provider auth_type
+// faithfully enough to drive real plan/apply cycles: write-only connection
+// secrets (stored, never echoed), providers bound to connections with inline
+// keys rejected (BCP-3647), per-model-provider auth_type
 // defaulting, settings-must-be-object validation, the model-mapping
 // orphan-alias guard and 1:1 PATCH-or-create upsert with timeout
 // materialization, listing-only reads (no get-by-id) for mappings/policies/
@@ -60,9 +61,7 @@ type fakeLlmProvider struct {
 	BillingMode        string
 	BillingReason      *string
 	BillingNote        *string
-	// Credential is the last api_key written. Stored to let tests assert the
-	// write-only round trip; never rendered into a response.
-	Credential string
+	ConnectionID       *string
 }
 
 type fakeLlmModelMapping struct {
@@ -218,12 +217,13 @@ type fakeLlmGatewayServer struct {
 	nextID int
 
 	// providers etc. keep insertion order for stable listings.
-	providers  []*fakeLlmProvider
-	mappings   []*fakeLlmModelMapping
-	policies   []*fakeLlmModelAccessPolicy
-	rateLimits []*fakeLlmRateLimit
-	budgets    []*fakeLlmTokenBudget
-	pricing    []*fakeLlmPricingVersion
+	providers   []*fakeLlmProvider
+	connections map[string]*fakeLlmConnection
+	mappings    []*fakeLlmModelMapping
+	policies    []*fakeLlmModelAccessPolicy
+	rateLimits  []*fakeLlmRateLimit
+	budgets     []*fakeLlmTokenBudget
+	pricing     []*fakeLlmPricingVersion
 
 	// governance is the org's singleton governance_config row; nil means no
 	// row yet (the API then reports the column defaults).
@@ -240,7 +240,7 @@ type fakeLlmGatewayServer struct {
 }
 
 func newFakeLlmGatewayServer() *fakeLlmGatewayServer {
-	return &fakeLlmGatewayServer{}
+	return &fakeLlmGatewayServer{connections: map[string]*fakeLlmConnection{}}
 }
 
 // newID mints a deterministic UUID-shaped id. Callers hold f.mu.
@@ -256,6 +256,8 @@ func (f *fakeLlmGatewayServer) handler() http.HandlerFunc {
 			writeToken(w)
 		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/providers"):
 			f.handleProviders(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/connections"):
+			f.handleConnections(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/model-mappings"):
 			f.handleModelMappings(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/model-access"):
@@ -371,14 +373,13 @@ func providerJSON(p *fakeLlmProvider) map[string]any {
 		"id":             p.ID,
 		"org_id":         fakeLlmOrgID,
 		"catalog_id":     nil,
-		"connection_id":  nil,
+		"connection_id":  p.ConnectionID,
 		"name":           p.Name,
 		"model_provider": p.ModelProvider,
 		"auth_type":      p.AuthType,
 		"base_url":       p.BaseURL,
-		// The stored credential is never part of the response — only the
-		// opaque secret-store path it was written to.
-		"secret_path":          fmt.Sprintf("orgs/%s/providers/%s", fakeLlmOrgID, p.ID),
+		// The secret lives on the connection; only its path is echoed.
+		"secret_path":          "pending",
 		"enabled":              p.Enabled,
 		"settings":             p.Settings,
 		"created_at":           fakeLlmTime,
@@ -469,13 +470,56 @@ func (f *fakeLlmGatewayServer) handleProviders(w http.ResponseWriter, r *http.Re
 	}
 }
 
+// fakeLlmRequestScopedAuth are the auth types that store no upstream secret
+// (production's REQUEST_SCOPED_AUTH_TYPES): the only ones a provider may use
+// without a connection.
+var fakeLlmRequestScopedAuth = []string{"claude_oauth", "codex_oauth"}
+
+// fakeLlmVersionedBaseFamilies mirrors forwards_gateway_version_prefix.
+var fakeLlmVersionedBaseFamilies = []string{
+	"openai", "anthropic", "groq", "together", "mistral", "cohere", "xai",
+	"fireworks", "perplexity", "openrouter", "deepseek", "custom",
+}
+
+// validLlmBaseURL mirrors validate_base_url's /v1 rule, applied only to a
+// base_url the request supplied.
+func validLlmBaseURL(w http.ResponseWriter, baseURL, modelProvider, authType string) bool {
+	if !slices.Contains(fakeLlmVersionedBaseFamilies, modelProvider) ||
+		(modelProvider == "openai" && authType == "codex_oauth") {
+		return true
+	}
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if corrected, found := strings.CutSuffix(trimmed, "/v1"); found && corrected != "" {
+		writeLlmError(w, http.StatusBadRequest, fmt.Sprintf(
+			"base_url must not end in '/v1': the gateway appends the API version itself. Use '%s' instead", corrected))
+		return false
+	}
+	return true
+}
+
+// fakeLlmMergeSettings mirrors merge_connection_settings: the connection's
+// settings are the base, the provider's overlay them.
+func fakeLlmMergeSettings(connection, provider json.RawMessage) json.RawMessage {
+	merged := map[string]json.RawMessage{}
+	_ = json.Unmarshal(connection, &merged)
+	overlay := map[string]json.RawMessage{}
+	_ = json.Unmarshal(provider, &overlay)
+	for k, v := range overlay {
+		merged[k] = v
+	}
+	out, _ := json.Marshal(merged)
+	return out
+}
+
 func (f *fakeLlmGatewayServer) createProvider(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name               string          `json:"name"`
 		ModelProvider      string          `json:"model_provider"`
 		AuthType           *string         `json:"auth_type"`
 		BaseURL            string          `json:"base_url"`
+		ConnectionID       *string         `json:"connection_id"`
 		APIKey             *string         `json:"api_key"`
+		Credentials        json.RawMessage `json:"credentials"`
 		Settings           json.RawMessage `json:"settings"`
 		EnforceHealthCheck *bool           `json:"enforce_health_check"`
 		BillingMode        *string         `json:"billing_mode"`
@@ -494,16 +538,37 @@ func (f *fakeLlmGatewayServer) createProvider(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
-	// Production requires a credential for the direct (no-connection) flow of
-	// the API-key auth families.
+
+	// BCP-3647: a provider's secret lives on a connection; only the
+	// request-scoped OAuth passthroughs may arrive without one.
 	authType := fakeLlmDefaultAuthType(body.ModelProvider, body.AuthType)
-	credential := ""
-	if body.APIKey != nil {
-		credential = *body.APIKey
+	storesSecret := !slices.Contains(fakeLlmRequestScopedAuth, authType)
+	if storesSecret && (body.APIKey != nil || len(body.Credentials) > 0) {
+		writeLlmError(w, http.StatusBadRequest, "a provider cannot store its own key: create a credential "+
+			"(POST /admin/connections) and reference it with connection_id")
+		return
 	}
-	if credential == "" && (authType == "bearer_api_key" || authType == "x_api_key" || authType == "azure_api_key" ||
-		authType == "azure_foundry_api_key") {
-		writeLlmError(w, http.StatusBadRequest, "api_key is required for API-key auth providers")
+	if body.ConnectionID == nil && storesSecret {
+		writeLlmError(w, http.StatusBadRequest,
+			"connection_id is required: create a credential first, then reference it")
+		return
+	}
+	baseURL := body.BaseURL
+	if body.ConnectionID != nil {
+		conn := f.connections[*body.ConnectionID]
+		if conn == nil {
+			writeLlmError(w, http.StatusNotFound, fmt.Sprintf("connection {id: %s} not found", *body.ConnectionID))
+			return
+		}
+		// The connection is the source of truth for auth_type and the
+		// resource settings once bound.
+		authType = conn.AuthType
+		settings = fakeLlmMergeSettings(conn.Settings, settings)
+		if strings.TrimSpace(baseURL) == "" {
+			baseURL = conn.BaseURL
+		}
+	}
+	if body.BaseURL != "" && !validLlmBaseURL(w, body.BaseURL, body.ModelProvider, authType) {
 		return
 	}
 
@@ -522,14 +587,14 @@ func (f *fakeLlmGatewayServer) createProvider(w http.ResponseWriter, r *http.Req
 		Name:               body.Name,
 		ModelProvider:      body.ModelProvider,
 		AuthType:           authType,
-		BaseURL:            body.BaseURL,
+		BaseURL:            baseURL,
+		ConnectionID:       body.ConnectionID,
 		Settings:           settings,
 		Enabled:            true, // create has no enabled field
 		EnforceHealthCheck: enforce,
 		BillingMode:        billingMode,
 		BillingReason:      body.BillingReason,
 		BillingNote:        fakeLlmBillingNote(body.BillingNote),
-		Credential:         credential,
 	}
 	if !validLlmBilling(w, p) {
 		return
@@ -550,12 +615,13 @@ func (f *fakeLlmGatewayServer) updateProvider(w http.ResponseWriter, r *http.Req
 		BaseURL            *string         `json:"base_url"`
 		AuthType           *string         `json:"auth_type"`
 		APIKey             *string         `json:"api_key"`
+		Credentials        json.RawMessage `json:"credentials"`
 		Enabled            *bool           `json:"enabled"`
 		Settings           json.RawMessage `json:"settings"`
 		EnforceHealthCheck *bool           `json:"enforce_health_check"`
 		BillingMode        *string         `json:"billing_mode"`
-		// The clearable billing keys are tri-state: absent keeps, null
-		// clears, a value sets.
+		// Tri-state keys: absent keeps, null clears, a value sets.
+		ConnectionID  json.RawMessage `json:"connection_id"`
 		BillingReason json.RawMessage `json:"billing_reason"`
 		BillingNote   json.RawMessage `json:"billing_note"`
 	}
@@ -568,14 +634,48 @@ func (f *fakeLlmGatewayServer) updateProvider(w http.ResponseWriter, r *http.Req
 	if body.Name != nil {
 		updated.Name = *body.Name
 	}
-	if body.BaseURL != nil {
-		updated.BaseURL = *body.BaseURL
-	}
 	if body.AuthType != nil {
 		updated.AuthType = *body.AuthType
 	}
-	if body.APIKey != nil {
-		updated.Credential = *body.APIKey
+	if body.APIKey != nil || len(body.Credentials) > 0 {
+		if !slices.Contains(fakeLlmRequestScopedAuth, updated.AuthType) {
+			writeLlmError(w, http.StatusBadRequest, "a provider cannot store its own key: create a credential "+
+				"(POST /admin/connections) and reference it with connection_id")
+			return
+		}
+	}
+	if body.ConnectionID != nil {
+		var connID *string
+		_ = json.Unmarshal(body.ConnectionID, &connID)
+		if connID == nil {
+			if p.ConnectionID != nil && !slices.Contains(fakeLlmRequestScopedAuth, updated.AuthType) {
+				writeLlmError(w, http.StatusBadRequest, "a provider cannot be detached from its credential: "+
+					"pick a different credential, or delete the provider")
+				return
+			}
+			updated.ConnectionID = nil
+		} else {
+			conn := f.connections[*connID]
+			if conn == nil {
+				writeLlmError(w, http.StatusNotFound, fmt.Sprintf("connection {id: %s} not found", *connID))
+				return
+			}
+			updated.ConnectionID = connID
+			updated.AuthType = conn.AuthType
+			// The credential's settings are the base on a (re)bind; the
+			// provider's own keys overlay them.
+			overlay := body.Settings
+			if len(overlay) == 0 || string(overlay) == "null" {
+				overlay = p.Settings
+			}
+			updated.Settings = fakeLlmMergeSettings(conn.Settings, overlay)
+		}
+	}
+	if body.BaseURL != nil {
+		if !validLlmBaseURL(w, *body.BaseURL, updated.ModelProvider, updated.AuthType) {
+			return
+		}
+		updated.BaseURL = *body.BaseURL
 	}
 	if body.Enabled != nil {
 		updated.Enabled = *body.Enabled
@@ -584,6 +684,9 @@ func (f *fakeLlmGatewayServer) updateProvider(w http.ResponseWriter, r *http.Req
 		settings, ok := validLlmSettings(w, body.Settings)
 		if !ok {
 			return
+		}
+		if updated.ConnectionID != nil {
+			settings = fakeLlmMergeSettings(f.connections[*updated.ConnectionID].Settings, settings)
 		}
 		updated.Settings = settings
 	}
@@ -611,36 +714,300 @@ func (f *fakeLlmGatewayServer) updateProvider(w http.ResponseWriter, r *http.Req
 }
 
 // seedProvider plants an openai provider out-of-band, as if created in the
-// app.
+// app, bound to a seeded connection.
 func (f *fakeLlmGatewayServer) seedProvider() *fakeLlmProvider {
+	conn := f.seedConnection("openai")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p := &fakeLlmProvider{
 		ID:                 f.newID("aaaa"),
 		Name:               "Seeded openai",
 		ModelProvider:      "openai",
-		AuthType:           fakeLlmDefaultAuthType("openai", nil),
-		BaseURL:            "https://upstream.example.com/v1",
+		AuthType:           conn.AuthType,
+		BaseURL:            conn.BaseURL,
+		ConnectionID:       &conn.ID,
 		Settings:           json.RawMessage("{}"),
 		Enabled:            true,
 		EnforceHealthCheck: true,
 		BillingMode:        "per_token",
-		Credential:         "seeded-key",
 	}
 	f.providers = append(f.providers, p)
 	return p
 }
 
-// providerCredential reads the stored (never-echoed) credential.
-func (f *fakeLlmGatewayServer) providerCredential(t *testing.T, id string) string {
+// --- connections ----------------------------------------------------------------
+
+type fakeLlmConnection struct {
+	ID            string
+	Name          string
+	ModelProvider string
+	AuthType      string
+	BaseURL       string
+	Settings      json.RawMessage
+	// Secret is the last api_key / credentials written. Stored to let tests
+	// assert the write-only round trip; never rendered into a response.
+	Secret string
+}
+
+func connectionJSON(c *fakeLlmConnection) map[string]any {
+	out := map[string]any{
+		"id":                  c.ID,
+		"org_id":              fakeLlmOrgID,
+		"name":                c.Name,
+		"model_provider":      c.ModelProvider,
+		"auth_type":           c.AuthType,
+		"base_url":            c.BaseURL,
+		"secret_path":         fmt.Sprintf("orgs/%s/connections/%s", fakeLlmOrgID, c.ID),
+		"settings":            c.Settings,
+		"key_last4":           nil,
+		"stores_key_material": fakeLlmStoresKeyMaterial(c.AuthType),
+		"created_at":          fakeLlmTime,
+		"updated_at":          fakeLlmTime,
+	}
+	if out["stores_key_material"] == true && len(c.Secret) >= 4 {
+		out["key_last4"] = c.Secret[len(c.Secret)-4:]
+	}
+	return out
+}
+
+// fakeLlmStoresKeyMaterial: the ambient-identity auth types hold no secret.
+func fakeLlmStoresKeyMaterial(authType string) bool {
+	return !slices.Contains([]string{
+		"aws_role", "google_adc", "google_service_account_impersonation", "claude_oauth", "codex_oauth",
+	}, authType)
+}
+
+// fakeLlmConnectionSecret mirrors the api-key arm of normalize_credentials:
+// API-key auth types need api_key or credentials; ambient ones need nothing.
+func fakeLlmConnectionSecret(w http.ResponseWriter, authType string, apiKey *string, credentials json.RawMessage) (string, bool) {
+	if len(credentials) > 0 && string(credentials) != "null" {
+		var obj map[string]any
+		if json.Unmarshal(credentials, &obj) != nil {
+			writeLlmError(w, http.StatusBadRequest, "credentials must be a JSON object")
+			return "", false
+		}
+		return string(credentials), true
+	}
+	if apiKey != nil && *apiKey != "" {
+		return *apiKey, true
+	}
+	if !fakeLlmStoresKeyMaterial(authType) {
+		return "", true
+	}
+	writeLlmError(w, http.StatusBadRequest, "api_key or credentials.key is required for API-key providers")
+	return "", false
+}
+
+// fakeLlmNormalizeConnectionSettings mirrors the Bedrock arm of
+// normalize_settings: it validates required keys and adds derived ones
+// (a generated external_id for aws_role, a defaulted model_api_family).
+func (f *fakeLlmGatewayServer) fakeLlmNormalizeConnectionSettings(w http.ResponseWriter, modelProvider, authType string, raw json.RawMessage) (json.RawMessage, bool) {
+	settings, ok := validLlmSettings(w, raw)
+	if !ok {
+		return nil, false
+	}
+	if modelProvider != "bedrock" {
+		return settings, true
+	}
+	obj := map[string]any{}
+	_ = json.Unmarshal(settings, &obj)
+	if s, _ := obj["region"].(string); s == "" {
+		writeLlmError(w, http.StatusBadRequest, "settings.region is required for Bedrock providers")
+		return nil, false
+	}
+	if authType == "aws_role" {
+		if s, _ := obj["iam_role_arn"].(string); s == "" {
+			writeLlmError(w, http.StatusBadRequest, "settings.iam_role_arn is required for aws_role Bedrock providers")
+			return nil, false
+		}
+		if _, ok := obj["external_id"]; !ok {
+			obj["external_id"] = f.newID("ffff")
+		}
+	}
+	if _, ok := obj["model_api_family"]; !ok {
+		obj["model_api_family"] = "bedrock_converse"
+	}
+	out, _ := json.Marshal(obj)
+	return out, true
+}
+
+func (f *fakeLlmGatewayServer) handleConnections(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	id := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/llm-gateway/admin/connections"), "/")
+	conn := f.connections[id]
+
+	switch {
+	case id == "" && r.Method == http.MethodPost:
+		f.createConnection(w, r)
+	case id == "" && r.Method == http.MethodGet:
+		items := make([]map[string]any, 0, len(f.connections))
+		for _, c := range f.connections {
+			items = append(items, connectionJSON(c))
+		}
+		_ = json.NewEncoder(w).Encode(items)
+	case conn == nil:
+		writeLlmError(w, http.StatusNotFound, fmt.Sprintf("connection {id: %s} not found", id))
+	case r.Method == http.MethodGet:
+		_ = json.NewEncoder(w).Encode(connectionJSON(conn))
+	case r.Method == http.MethodPut:
+		f.updateConnection(w, r, conn)
+	case r.Method == http.MethodDelete:
+		// BCP-3655: refuse while providers still read their key from it.
+		var users []string
+		for _, p := range f.providers {
+			if p.ConnectionID != nil && *p.ConnectionID == id {
+				users = append(users, p.Name)
+			}
+		}
+		if len(users) > 0 {
+			writeLlmError(w, http.StatusConflict, fmt.Sprintf(
+				"these credentials are in use by %d provider(s): %s", len(users), strings.Join(users, ", ")))
+			return
+		}
+		delete(f.connections, id)
+		_ = json.NewEncoder(w).Encode(map[string]any{"deleted": true})
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (f *fakeLlmGatewayServer) createConnection(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name          string          `json:"name"`
+		ModelProvider string          `json:"model_provider"`
+		AuthType      *string         `json:"auth_type"`
+		BaseURL       string          `json:"base_url"`
+		APIKey        *string         `json:"api_key"`
+		Credentials   json.RawMessage `json:"credentials"`
+		Settings      json.RawMessage `json:"settings"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeLlmError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !slices.Contains(fakeLlmModelProviders, body.ModelProvider) {
+		writeLlmError(w, http.StatusBadRequest, "unknown model provider: "+body.ModelProvider)
+		return
+	}
+	authType := fakeLlmDefaultAuthType(body.ModelProvider, body.AuthType)
+	if !validLlmBaseURL(w, body.BaseURL, body.ModelProvider, authType) {
+		return
+	}
+	settings, ok := f.fakeLlmNormalizeConnectionSettings(w, body.ModelProvider, authType, body.Settings)
+	if !ok {
+		return
+	}
+	secret, ok := fakeLlmConnectionSecret(w, authType, body.APIKey, body.Credentials)
+	if !ok {
+		return
+	}
+	c := &fakeLlmConnection{
+		ID:            f.newID("cccc"),
+		Name:          body.Name,
+		ModelProvider: body.ModelProvider,
+		AuthType:      authType,
+		BaseURL:       body.BaseURL,
+		Settings:      settings,
+		Secret:        secret,
+	}
+	f.connections[c.ID] = c
+	_ = json.NewEncoder(w).Encode(connectionJSON(c))
+}
+
+// updateConnection applies COALESCE semantics, and like production moves
+// every provider that was following the old endpoint.
+func (f *fakeLlmGatewayServer) updateConnection(w http.ResponseWriter, r *http.Request, c *fakeLlmConnection) {
+	var body struct {
+		Name        *string         `json:"name"`
+		BaseURL     *string         `json:"base_url"`
+		AuthType    *string         `json:"auth_type"`
+		APIKey      *string         `json:"api_key"`
+		Credentials json.RawMessage `json:"credentials"`
+		Settings    json.RawMessage `json:"settings"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeLlmError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updated := *c
+	if body.Name != nil {
+		updated.Name = *body.Name
+	}
+	if body.AuthType != nil {
+		updated.AuthType = *body.AuthType
+	}
+	if body.BaseURL != nil {
+		if !validLlmBaseURL(w, *body.BaseURL, c.ModelProvider, updated.AuthType) {
+			return
+		}
+		updated.BaseURL = *body.BaseURL
+	}
+	if len(body.Settings) > 0 && string(body.Settings) != "null" {
+		// Stored derived keys survive a re-save that omits them.
+		merged := fakeLlmMergeSettings(c.Settings, body.Settings)
+		settings, ok := f.fakeLlmNormalizeConnectionSettings(w, c.ModelProvider, updated.AuthType, merged)
+		if !ok {
+			return
+		}
+		updated.Settings = settings
+	}
+	if body.APIKey != nil || len(body.Credentials) > 0 {
+		secret, ok := fakeLlmConnectionSecret(w, updated.AuthType, body.APIKey, body.Credentials)
+		if !ok {
+			return
+		}
+		updated.Secret = secret
+	}
+	for _, p := range f.providers {
+		if p.ConnectionID != nil && *p.ConnectionID == c.ID && p.BaseURL == c.BaseURL {
+			p.BaseURL = updated.BaseURL
+		}
+	}
+	*c = updated
+	_ = json.NewEncoder(w).Encode(connectionJSON(c))
+}
+
+// seedConnection plants an API-key connection out-of-band.
+func (f *fakeLlmGatewayServer) seedConnection(modelProvider string) *fakeLlmConnection {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c := &fakeLlmConnection{
+		ID:            f.newID("cccc"),
+		Name:          "Seeded " + modelProvider + " key",
+		ModelProvider: modelProvider,
+		AuthType:      fakeLlmDefaultAuthType(modelProvider, nil),
+		BaseURL:       "https://upstream.example.com",
+		Settings:      json.RawMessage("{}"),
+		Secret:        "seeded-key",
+	}
+	f.connections[c.ID] = c
+	return c
+}
+
+// connectionSecret reads a connection's stored (never-echoed) secret.
+func (f *fakeLlmGatewayServer) connectionSecret(t *testing.T, id string) string {
 	t.Helper()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	p := f.findProvider(id)
-	if p == nil {
-		t.Fatalf("fake has no provider %q", id)
+	c := f.connections[id]
+	if c == nil {
+		t.Fatalf("fake has no connection %q", id)
 	}
-	return p.Credential
+	return c.Secret
+}
+
+// checkAllLlmConnectionsDeleted is the CheckDestroy for connection tests.
+func checkAllLlmConnectionsDeleted(fake *fakeLlmGatewayServer) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		for _, c := range fake.connections {
+			return fmt.Errorf("LLM connection %s (%s) was not deleted on destroy", c.ID, c.Name)
+		}
+		return nil
+	}
 }
 
 // markProviderDeleted removes a stored provider out-of-band.

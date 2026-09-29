@@ -4,8 +4,8 @@ page_title: "barndoor_llm_provider Resource - Barndoor"
 subcategory: ""
 description: |-
   Manages an LLM Gateway upstream provider: a named connection to a model vendor (OpenAI, Anthropic, Bedrock, …) that model mappings route traffic to.
-  The credential (api_key) is write-only: the platform stores it in its secret store and never returns it in any form, so Terraform tracks the configured value and cannot detect out-of-band rotation. Changing it rotates the credential in place and re-probes connectivity.
-  Providers backed by a shared connection (connection_id on the platform API) and structured non-API-key credentials (AWS role / static credentials, Google ADC) are not yet supported by this resource — create those in the Barndoor app instead.
+  A provider reads its upstream secret from a barndoor_llm_connection, referenced by connection_id. The connection also supplies the provider's auth_type, its resource settings, and (unless base_url is set here) its endpoint. Every auth type that stores a secret needs a connection; only the request-scoped OAuth passthroughs (claude_oauth, codex_oauth) are created without one, by setting auth_type instead.
+  The inline api_key is deprecated. The platform has rejected it since release v2.40.0 (BCP-3647), for create and for update alike: move the key onto a connection.
   The billing attributes (billing_mode, billing_reason, billing_note) are left alone unless configured, so a configuration that never mentions them does not disturb billing set in the app. Removing billing_reason or billing_note from a configuration that set it clears it on the platform. Removing billing_mode keeps the stored mode. An attribute counts as set by the configuration once an apply has written it: adopting a value identical to the stored one (for example right after an import) needs no apply, so it is not yet owned.
 ---
 
@@ -13,35 +13,59 @@ description: |-
 
 Manages an LLM Gateway upstream provider: a named connection to a model vendor (OpenAI, Anthropic, Bedrock, …) that model mappings route traffic to.
 
-The credential (`api_key`) is **write-only**: the platform stores it in its secret store and never returns it in any form, so Terraform tracks the configured value and cannot detect out-of-band rotation. Changing it rotates the credential in place and re-probes connectivity.
+A provider reads its upstream secret from a `barndoor_llm_connection`, referenced by `connection_id`. The connection also supplies the provider's `auth_type`, its resource settings, and (unless `base_url` is set here) its endpoint. Every auth type that stores a secret needs a connection; only the request-scoped OAuth passthroughs (`claude_oauth`, `codex_oauth`) are created without one, by setting `auth_type` instead.
 
-Providers backed by a **shared connection** (`connection_id` on the platform API) and structured non-API-key credentials (AWS role / static credentials, Google ADC) are not yet supported by this resource — create those in the Barndoor app instead.
+The inline `api_key` is **deprecated**. The platform has rejected it since release v2.40.0 (BCP-3647), for create and for update alike: move the key onto a connection.
 
 The billing attributes (`billing_mode`, `billing_reason`, `billing_note`) are left alone unless configured, so a configuration that never mentions them does not disturb billing set in the app. Removing `billing_reason` or `billing_note` from a configuration that set it clears it on the platform. Removing `billing_mode` keeps the stored mode. An attribute counts as set by the configuration once an apply has written it: adopting a value identical to the stored one (for example right after an import) needs no apply, so it is not yet owned.
 
 ## Example Usage
 
 ```terraform
-# An OpenAI-family provider with a direct API key. The credential is
-# write-only: the platform stores it in its secret store and never returns
-# it, so keep it out of committed configuration (a variable, or TF_VAR_*).
+# A provider reads its upstream secret from a connection. Several providers
+# can share one connection; base_url, unset here, follows the connection's.
+resource "barndoor_llm_connection" "openai" {
+  name           = "OpenAI production key"
+  model_provider = "openai"
+  base_url       = "https://api.openai.com"
+  api_key        = var.openai_api_key
+}
+
 resource "barndoor_llm_provider" "openai" {
   name           = "OpenAI"
   model_provider = "openai"
-  base_url       = "https://api.openai.com/v1"
-  api_key        = var.openai_api_key
+  connection_id  = barndoor_llm_connection.openai.id
 }
 
 # A provider that is configured but not yet serving traffic, with the
 # connectivity-probe routing gate bypassed.
-resource "barndoor_llm_provider" "staging" {
-  name           = "Anthropic (staging)"
+resource "barndoor_llm_connection" "anthropic" {
+  name           = "Anthropic staging key"
   model_provider = "anthropic"
   base_url       = "https://api.anthropic.com"
   api_key        = var.anthropic_api_key
+}
+
+resource "barndoor_llm_provider" "staging" {
+  name           = "Anthropic (staging)"
+  model_provider = "anthropic"
+  connection_id  = barndoor_llm_connection.anthropic.id
 
   enabled              = false
   enforce_health_check = false
+}
+
+# A request-scoped OAuth passthrough: callers bring their own Claude
+# subscription, so nothing is stored upstream and no connection is needed.
+# The subscription is billed flat, so the provider records no token cost.
+resource "barndoor_llm_provider" "claude_subscription" {
+  name           = "Claude (subscription)"
+  model_provider = "anthropic"
+  auth_type      = "claude_oauth"
+  base_url       = "https://api.anthropic.com"
+
+  billing_mode   = "not_metered"
+  billing_reason = "subscription"
 }
 
 variable "openai_api_key" {
@@ -60,22 +84,23 @@ variable "anthropic_api_key" {
 
 ### Required
 
-- `base_url` (String) Upstream API base URL, e.g. `https://api.openai.com/v1`.
 - `model_provider` (String) Upstream model-provider family, deciding the wire protocol the gateway speaks: `openai`, `anthropic`, `azure_openai`, `azure_foundry`, `google_ai`, `bedrock`, `vertex`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, `perplexity`, `openrouter`, `deepseek`, or `custom`. Changing it forces a new provider (the API has no update for it).
 - `name` (String) Human-readable display name of the provider.
 
 ### Optional
 
-- `api_key` (String, Sensitive) Upstream API key. Write-only — the platform stores it in its secret store and never echoes it back; changing it rotates the credential in place.
-- `auth_type` (String) How the gateway authenticates upstream (e.g. `bearer_api_key`, `x_api_key`, `azure_api_key`). Defaults per `model_provider` when unset (`anthropic` → `x_api_key`, `azure_openai` → `azure_api_key`, `azure_foundry` → `azure_foundry_api_key`, `bedrock` → `aws_role`, `vertex` → `google_adc`, all others → `bearer_api_key`).
+- `api_key` (String, Sensitive, Deprecated) **Deprecated.** An upstream key stored on the provider itself. The platform rejects it since v2.40.0 (BCP-3647): put the key on a `barndoor_llm_connection` and reference it with `connection_id`. Conflicts with `connection_id`.
+- `auth_type` (String) How the gateway authenticates upstream. With a `connection_id` this is the connection's auth type, read-only here (setting both is an error). Without one, set it to a request-scoped OAuth passthrough (`claude_oauth` or `codex_oauth`). Defaults per `model_provider` when unset (`anthropic` → `x_api_key`, `azure_openai` → `azure_api_key`, `azure_foundry` → `azure_foundry_api_key`, `bedrock` → `aws_role`, `vertex` → `google_adc`, all others → `bearer_api_key`).
+- `base_url` (String) Upstream API base URL, e.g. `https://api.openai.com`. Optional with a `connection_id`: unset, the provider follows the connection's endpoint, including when the connection's `base_url` later changes. For the OpenAI-compatible families it must **not** end in `/v1`, because the gateway appends the version itself.
 - `billing_mode` (String) Whether Barndoor calculates and reports a per-token cost for this provider's traffic: `per_token` (the default) or `not_metered`. A `not_metered` provider still counts and reports token usage, but records its token cost as $0, and requires `billing_reason`.
 
 Changing it is **not retroactive**: cost is resolved when each request is served, so usage already recorded keeps the cost it was recorded with. Setting `per_token` on a flat-rate provider is also not a way to see what it would have cost at API rates. It records real cost, which appears in cost reports as actual spend and consumes spend budgets. For the same reason, a spend (cost) budget on a `not_metered` provider never fires; use a token budget instead. Left unchanged when removed from configuration.
 - `billing_note` (String) Free-text context for the billing arrangement, at most 200 characters. Human-readable only; never parsed or aggregated.
 - `billing_reason` (String) How the vendor actually bills this provider: `subscription` (a flat-rate plan, e.g. a Claude account over OAuth passthrough), `local` (self-hosted inference), `external` (metered, but billed through another system), or `other` (pair it with `billing_note`). **Required** when `billing_mode` is `not_metered`, and optional with `per_token`, where it describes a subscription that bills overages per token. The two attributes are independent. A descriptive label only: nothing in the billing path reads it.
+- `connection_id` (String) UUID of the `barndoor_llm_connection` the provider reads its upstream secret from. Changing it rebinds the provider in place and re-probes connectivity. Removing it forces a new provider, because the platform cannot detach a provider from its credential.
 - `enabled` (Boolean) Operator intent: whether the provider may serve traffic. Defaults to `true`. Distinct from `health_status`, which the platform records from connectivity probes.
 - `enforce_health_check` (Boolean) Whether routing gates on the connectivity health probe. Defaults to `true`; set `false` to serve the provider even while its probe fails.
-- `settings` (String) Provider-specific settings as a JSON object (`jsonencode({ … })`), e.g. `region` for Bedrock or `api_version` for Azure OpenAI. The API normalizes some shapes (it may add derived keys), and the normalized form is what Terraform tracks — author settings in their normalized form to avoid perpetual diffs.
+- `settings` (String) Provider-specific settings as a JSON object (`jsonencode({ … })`), e.g. `model_api_family`, or `api_version` for Azure OpenAI. The platform layers these over the connection's settings and adds derived keys on write. Those additions produce no diff here: while every configured key keeps its configured value, Terraform tracks the configured object.
 
 ### Read-Only
 
@@ -94,7 +119,7 @@ Import is supported using the following syntax:
 The [`terraform import` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
 
 ```shell
-# Import by provider UUID. api_key is write-only and cannot be imported;
-# set it in configuration and the next apply rotates the stored credential.
+# Import by provider UUID. The upstream secret lives on the provider's
+# barndoor_llm_connection, so nothing write-only is lost on import.
 terraform import barndoor_llm_provider.openai 5b1c9c6e-6a51-4f8e-9d0e-1f2a3b4c5d6e
 ```

@@ -44,10 +44,11 @@ output "openai_health_status" {
 ### Read-Only
 
 - `auth_type` (String) How the gateway authenticates upstream (e.g. `bearer_api_key`, `x_api_key`, `azure_api_key`).
-- `base_url` (String) Upstream API base URL, e.g. `https://api.openai.com/v1`.
+- `base_url` (String) Upstream API base URL, e.g. `https://api.openai.com`.
 - `billing_mode` (String) Whether Barndoor calculates and reports a per-token cost for this provider's traffic: `per_token` or `not_metered` (token usage still counted, token cost recorded as $0).
 - `billing_note` (String) Free-text context for the billing arrangement; null when unset.
 - `billing_reason` (String) How the vendor bills this provider: `subscription`, `local`, `external`, or `other`; null when unset. Always set on a `not_metered` provider.
+- `connection_id` (String) UUID of the LLM connection the provider reads its upstream secret from; null for a request-scoped OAuth passthrough provider.
 - `created_at` (String) When the provider was created (RFC 3339).
 - `enabled` (Boolean) Operator intent: whether the provider may serve traffic. Distinct from `health_status`, which the platform records from connectivity probes.
 - `enforce_health_check` (Boolean) Whether routing gates on the connectivity health probe.

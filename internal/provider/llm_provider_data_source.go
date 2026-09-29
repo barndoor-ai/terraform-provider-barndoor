@@ -50,6 +50,7 @@ type llmProviderDataSourceModel struct {
 	Name               types.String         `tfsdk:"name"`
 	ModelProvider      types.String         `tfsdk:"model_provider"`
 	BaseURL            types.String         `tfsdk:"base_url"`
+	ConnectionID       types.String         `tfsdk:"connection_id"`
 	AuthType           types.String         `tfsdk:"auth_type"`
 	Settings           jsontypes.Normalized `tfsdk:"settings"`
 	Enabled            types.Bool           `tfsdk:"enabled"`
@@ -100,8 +101,13 @@ func (d *llmProviderDataSource) Schema(_ context.Context, _ datasource.SchemaReq
 				Computed: true,
 			},
 			"base_url": schema.StringAttribute{
-				MarkdownDescription: "Upstream API base URL, e.g. `https://api.openai.com/v1`.",
+				MarkdownDescription: "Upstream API base URL, e.g. `https://api.openai.com`.",
 				Computed:            true,
+			},
+			"connection_id": schema.StringAttribute{
+				MarkdownDescription: "UUID of the LLM connection the provider reads its upstream secret from; " +
+					"null for a request-scoped OAuth passthrough provider.",
+				Computed: true,
 			},
 			"auth_type": schema.StringAttribute{
 				MarkdownDescription: "How the gateway authenticates upstream (e.g. `bearer_api_key`, " +
@@ -245,6 +251,7 @@ func (d *llmProviderDataSource) Read(ctx context.Context, req datasource.ReadReq
 		Name:               state.Name,
 		ModelProvider:      state.ModelProvider,
 		BaseURL:            state.BaseURL,
+		ConnectionID:       state.ConnectionID,
 		AuthType:           state.AuthType,
 		Settings:           state.Settings,
 		Enabled:            state.Enabled,

@@ -52,10 +52,11 @@ const llmProviderManagedKey = "configured_billing_attributes"
 
 // Ensure the resource satisfies the framework interfaces it relies on.
 var (
-	_ resource.Resource                = &llmProviderResource{}
-	_ resource.ResourceWithConfigure   = &llmProviderResource{}
-	_ resource.ResourceWithImportState = &llmProviderResource{}
-	_ resource.ResourceWithModifyPlan  = &llmProviderResource{}
+	_ resource.Resource                   = &llmProviderResource{}
+	_ resource.ResourceWithConfigure      = &llmProviderResource{}
+	_ resource.ResourceWithImportState    = &llmProviderResource{}
+	_ resource.ResourceWithModifyPlan     = &llmProviderResource{}
+	_ resource.ResourceWithValidateConfig = &llmProviderResource{}
 )
 
 // NewLlmProviderResource returns a new barndoor_llm_provider resource.
@@ -76,6 +77,7 @@ type llmProviderResourceModel struct {
 	Name               types.String         `tfsdk:"name"`
 	ModelProvider      types.String         `tfsdk:"model_provider"`
 	BaseURL            types.String         `tfsdk:"base_url"`
+	ConnectionID       types.String         `tfsdk:"connection_id"`
 	AuthType           types.String         `tfsdk:"auth_type"`
 	APIKey             types.String         `tfsdk:"api_key"`
 	Settings           jsontypes.Normalized `tfsdk:"settings"`
@@ -99,12 +101,13 @@ func (r *llmProviderResource) Schema(_ context.Context, _ resource.SchemaRequest
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "Manages an LLM Gateway upstream provider: a named connection to a model " +
 			"vendor (OpenAI, Anthropic, Bedrock, …) that model mappings route traffic to.\n\n" +
-			"The credential (`api_key`) is **write-only**: the platform stores it in its secret store and " +
-			"never returns it in any form, so Terraform tracks the configured value and cannot detect " +
-			"out-of-band rotation. Changing it rotates the credential in place and re-probes connectivity.\n\n" +
-			"Providers backed by a **shared connection** (`connection_id` on the platform API) and " +
-			"structured non-API-key credentials (AWS role / static credentials, Google ADC) are not yet " +
-			"supported by this resource — create those in the Barndoor app instead.\n\n" +
+			"A provider reads its upstream secret from a `barndoor_llm_connection`, referenced by " +
+			"`connection_id`. The connection also supplies the provider's `auth_type`, its resource " +
+			"settings, and (unless `base_url` is set here) its endpoint. Every auth type that stores a " +
+			"secret needs a connection; only the request-scoped OAuth passthroughs (`claude_oauth`, " +
+			"`codex_oauth`) are created without one, by setting `auth_type` instead.\n\n" +
+			"The inline `api_key` is **deprecated**. The platform has rejected it since release v2.40.0 " +
+			"(BCP-3647), for create and for update alike: move the key onto a connection.\n\n" +
 			"The billing attributes (`billing_mode`, `billing_reason`, `billing_note`) are left alone " +
 			"unless configured, so a configuration that never mentions them does not disturb billing set " +
 			"in the app. Removing `billing_reason` or `billing_note` from a configuration that set it " +
@@ -146,36 +149,67 @@ func (r *llmProviderResource) Schema(_ context.Context, _ resource.SchemaRequest
 				},
 			},
 			"base_url": schema.StringAttribute{
-				MarkdownDescription: "Upstream API base URL, e.g. `https://api.openai.com/v1`.",
-				Required:            true,
+				MarkdownDescription: "Upstream API base URL, e.g. `https://api.openai.com`. Optional with a " +
+					"`connection_id`: unset, the provider follows the connection's endpoint, including when " +
+					"the connection's `base_url` later changes. For the OpenAI-compatible families it must " +
+					"**not** end in `/v1`, because the gateway appends the version itself.",
+				Optional: true,
+				Computed: true,
 				Validators: []validator.String{
 					stringvalidator.LengthAtLeast(1),
 				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"connection_id": schema.StringAttribute{
+				MarkdownDescription: "UUID of the `barndoor_llm_connection` the provider reads its upstream " +
+					"secret from. Changing it rebinds the provider in place and re-probes connectivity. " +
+					"Removing it forces a new provider, because the platform cannot detach a provider from its " +
+					"credential.",
+				Optional: true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplaceIf(llmReplaceWhenCleared,
+						"Removing connection_id requires replacement: the platform cannot detach a provider from its credential.",
+						"Removing `connection_id` requires replacement: the platform cannot detach a provider from its credential."),
+				},
 			},
 			"auth_type": schema.StringAttribute{
-				MarkdownDescription: "How the gateway authenticates upstream (e.g. `bearer_api_key`, " +
-					"`x_api_key`, `azure_api_key`). Defaults per `model_provider` when unset " +
+				MarkdownDescription: "How the gateway authenticates upstream. With a `connection_id` this is " +
+					"the connection's auth type, read-only here (setting both is an error). Without one, set " +
+					"it to a request-scoped OAuth passthrough (`claude_oauth` or `codex_oauth`). Defaults per " +
+					"`model_provider` when unset " +
 					"(`anthropic` → `x_api_key`, `azure_openai` → `azure_api_key`, `azure_foundry` → " +
 					"`azure_foundry_api_key`, `bedrock` → `aws_role`, `vertex` → `google_adc`, all others → " +
 					"`bearer_api_key`).",
 				Optional: true,
 				Computed: true,
+				Validators: []validator.String{
+					stringvalidator.ConflictsWith(path.MatchRoot("connection_id")),
+				},
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
 			"api_key": schema.StringAttribute{
-				MarkdownDescription: "Upstream API key. Write-only — the platform stores it in its secret " +
-					"store and never echoes it back; changing it rotates the credential in place.",
+				MarkdownDescription: "**Deprecated.** An upstream key stored on the provider itself. The " +
+					"platform rejects it since v2.40.0 (BCP-3647): put the key on a " +
+					"`barndoor_llm_connection` and reference it with `connection_id`. Conflicts with " +
+					"`connection_id`.",
+				DeprecationMessage: "The platform no longer accepts a key on the provider (since v2.40.0, " +
+					"BCP-3647). Move it to a barndoor_llm_connection and set connection_id instead.",
 				Optional:  true,
 				Sensitive: true,
+				Validators: []validator.String{
+					stringvalidator.ConflictsWith(path.MatchRoot("connection_id")),
+				},
 			},
 			"settings": schema.StringAttribute{
 				MarkdownDescription: "Provider-specific settings as a JSON object " +
-					"(`jsonencode({ … })`), e.g. `region` for Bedrock or `api_version` for Azure " +
-					"OpenAI. The API normalizes some shapes (it may add derived keys), and the " +
-					"normalized form is what Terraform tracks — author settings in their normalized " +
-					"form to avoid perpetual diffs.",
+					"(`jsonencode({ … })`), e.g. `model_api_family`, or `api_version` for Azure OpenAI. " +
+					"The platform layers these over the connection's settings and adds derived keys on " +
+					"write. Those additions produce no diff here: while every configured key keeps its " +
+					"configured value, Terraform tracks the configured object.",
 				CustomType: jsontypes.NormalizedType{},
 				Optional:   true,
 				Computed:   true,
@@ -404,6 +438,31 @@ func (r *llmProviderResource) Update(ctx context.Context, req resource.UpdateReq
 	resp.Diagnostics.Append(recordConfiguredBilling(ctx, req.Config, resp.Private)...)
 }
 
+// ValidateConfig rejects a base_url ending in the `/v1` the gateway appends
+// itself. With a connection, the effective auth type is the connection's and
+// unknown here. Only `codex_oauth` exempts the openai family, and it needs no
+// connection, so the check assumes an API-key auth type in that case.
+func (r *llmProviderResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var baseURL, modelProvider, authType types.String
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("base_url"), &baseURL)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("model_provider"), &modelProvider)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("auth_type"), &authType)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	url, ok := knownString(baseURL)
+	if !ok {
+		return
+	}
+	family, ok := knownString(modelProvider)
+	if !ok || authType.IsUnknown() {
+		return
+	}
+	if corrected, bad := llmRedundantVersionSuffix(url, family, authType.ValueString()); bad {
+		addLlmBaseURLVersionError(&resp.Diagnostics, url, corrected)
+	}
+}
+
 // ModifyPlan rejects a not_metered provider with no billing_reason at plan
 // time (the API answers 400, and the V69 CHECK is the backstop). It runs on
 // the plan rather than the configuration because the reason may be
@@ -411,6 +470,27 @@ func (r *llmProviderResource) Update(ctx context.Context, req resource.UpdateReq
 func (r *llmProviderResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.Plan.Raw.IsNull() {
 		return // destroy
+	}
+
+	// Rebinding to another connection changes what the connection supplies:
+	// the auth type always, and the merged settings when the configuration
+	// doesn't pin them. Kept-from-state values would then disagree with the
+	// server's answer.
+	if !req.State.Raw.IsNull() {
+		var planConn, stateConn types.String
+		resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("connection_id"), &planConn)...)
+		resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("connection_id"), &stateConn)...)
+		var cfgSettings jsontypes.Normalized
+		resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("settings"), &cfgSettings)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if !planConn.IsUnknown() && !planConn.Equal(stateConn) {
+			resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("auth_type"), types.StringUnknown())...)
+			if cfgSettings.IsNull() {
+				resp.Diagnostics.Append(resp.Plan.SetAttribute(ctx, path.Root("settings"), jsontypes.NewNormalizedUnknown())...)
+			}
+		}
 	}
 
 	var mode, reason types.String
@@ -558,12 +638,14 @@ func (r *llmProviderResource) requireClient(diags *diag.Diagnostics) bool {
 // --- request/response DTOs ---------------------------------------------------
 
 // llmProviderCreateRequest mirrors the llm-gateway CreateProviderRequest body
-// (the subset this resource manages — catalog_id, connection_id, models, and
-// structured credentials are out of scope).
+// (the subset this resource manages — catalog_id, models, and structured
+// credentials are out of scope; credentials belong on a connection). An empty
+// base_url makes the platform take the connection's.
 type llmProviderCreateRequest struct {
 	Name               string          `json:"name"`
 	ModelProvider      string          `json:"model_provider"`
 	BaseURL            string          `json:"base_url"`
+	ConnectionID       *string         `json:"connection_id,omitempty"`
 	AuthType           *string         `json:"auth_type,omitempty"`
 	APIKey             *string         `json:"api_key,omitempty"`
 	Settings           json.RawMessage `json:"settings,omitempty"`
@@ -582,6 +664,7 @@ type llmProviderCreateRequest struct {
 type llmProviderUpdateRequest struct {
 	Name               *string         `json:"name,omitempty"`
 	BaseURL            *string         `json:"base_url,omitempty"`
+	ConnectionID       *string         `json:"connection_id,omitempty"`
 	AuthType           *string         `json:"auth_type,omitempty"`
 	APIKey             *string         `json:"api_key,omitempty"`
 	Settings           json.RawMessage `json:"settings,omitempty"`
@@ -605,6 +688,7 @@ type llmProviderResponse struct {
 	ModelProvider      string          `json:"model_provider"`
 	AuthType           string          `json:"auth_type"`
 	BaseURL            string          `json:"base_url"`
+	ConnectionID       *string         `json:"connection_id"`
 	Enabled            bool            `json:"enabled"`
 	Settings           json.RawMessage `json:"settings"`
 	EnforceHealthCheck bool            `json:"enforce_health_check"`
@@ -640,7 +724,8 @@ func buildLlmProviderCreateRequest(plan *llmProviderResourceModel) (*llmProvider
 	body := &llmProviderCreateRequest{
 		Name:          plan.Name.ValueString(),
 		ModelProvider: plan.ModelProvider.ValueString(),
-		BaseURL:       plan.BaseURL.ValueString(),
+		BaseURL:       plan.BaseURL.ValueString(), // "" when unknown: follow the connection
+		ConnectionID:  stringPtrIfKnown(plan.ConnectionID),
 		Settings:      settings,
 	}
 	if v, ok := knownString(plan.AuthType); ok {
@@ -677,14 +762,16 @@ func buildLlmProviderUpdateRequest(plan *llmProviderResourceModel) (*llmProvider
 		return nil, err
 	}
 	name := plan.Name.ValueString()
-	baseURL := plan.BaseURL.ValueString()
 	body := &llmProviderUpdateRequest{
-		Name:     &name,
-		BaseURL:  &baseURL,
-		Settings: settings,
+		Name:         &name,
+		BaseURL:      stringPtrIfKnown(plan.BaseURL),
+		ConnectionID: stringPtrIfKnown(plan.ConnectionID),
+		Settings:     settings,
 	}
-	if v, ok := knownString(plan.AuthType); ok {
-		body.AuthType = &v
+	// A bound provider's auth type is the connection's: sending the stored
+	// copy back would only be overridden, and after a rebind it is unknown.
+	if plan.ConnectionID.IsNull() {
+		body.AuthType = stringPtrIfKnown(plan.AuthType)
 	}
 	if v, ok := knownString(plan.APIKey); ok {
 		body.APIKey = &v
@@ -705,17 +792,6 @@ func buildLlmProviderUpdateRequest(plan *llmProviderResourceModel) (*llmProvider
 // is the plan (Create/Update) or previous state (Read) — the source of the
 // write-only credential and the settings null settling.
 func applyLlmProviderResponse(provider *llmProviderResponse, prior *llmProviderResourceModel) llmProviderResourceModel {
-	// An empty settings object settles back to null when the configuration
-	// said nothing — the server materializes `{}` for an omitted settings.
-	settings := jsontypes.NewNormalizedNull()
-	if len(provider.Settings) > 0 {
-		raw := string(provider.Settings)
-		priorUnset := prior.Settings.IsNull() || prior.Settings.IsUnknown()
-		if raw != "{}" || !priorUnset {
-			settings = jsontypes.NewNormalizedValue(raw)
-		}
-	}
-
 	apiKey := prior.APIKey
 	if apiKey.IsUnknown() {
 		apiKey = types.StringNull()
@@ -727,9 +803,10 @@ func applyLlmProviderResponse(provider *llmProviderResponse, prior *llmProviderR
 		Name:               types.StringValue(provider.Name),
 		ModelProvider:      types.StringValue(provider.ModelProvider),
 		BaseURL:            types.StringValue(provider.BaseURL),
+		ConnectionID:       optionalStringFromPtr(provider.ConnectionID, prior.ConnectionID),
 		AuthType:           types.StringValue(provider.AuthType),
 		APIKey:             apiKey,
-		Settings:           settings,
+		Settings:           settleLlmSettings(provider.Settings, prior.Settings),
 		Enabled:            types.BoolValue(provider.Enabled),
 		EnforceHealthCheck: types.BoolValue(provider.EnforceHealthCheck),
 		BillingMode:        types.StringValue(provider.BillingMode),

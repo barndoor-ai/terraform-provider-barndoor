@@ -17,12 +17,11 @@ import (
 const llmBillingResourceName = "barndoor_llm_provider.test"
 
 func llmBillingConfig(name, billing string) string {
-	return fmt.Sprintf(`
+	return llmConnectionHCL("anthropic", "anthropic", "sk-test") + fmt.Sprintf(`
 resource "barndoor_llm_provider" "test" {
   name           = %q
   model_provider = "anthropic"
-  base_url       = "https://api.anthropic.com"
-  api_key        = "sk-test"
+  connection_id  = barndoor_llm_connection.anthropic.id
 %s
 }
 `, name, billing)
@@ -93,8 +92,6 @@ func TestLlmProviderResource_billingLifecycle(t *testing.T) {
 				ResourceName:      llmBillingResourceName,
 				ImportState:       true,
 				ImportStateVerify: true,
-				// The credential is write-only and never read back.
-				ImportStateVerifyIgnore: []string{"api_key"},
 			},
 			{
 				Config: overage,
@@ -306,11 +303,17 @@ func TestLlmProviderResource_azureFoundry(t *testing.T) {
 		Steps: []resource.TestStep{
 			{
 				Config: `
-resource "barndoor_llm_provider" "test" {
-  name           = "Foundry"
+resource "barndoor_llm_connection" "foundry" {
+  name           = "Foundry key"
   model_provider = "azure_foundry"
   base_url       = "https://example.services.ai.azure.com"
   api_key        = "foundry-key"
+}
+
+resource "barndoor_llm_provider" "test" {
+  name           = "Foundry"
+  model_provider = "azure_foundry"
+  connection_id  = barndoor_llm_connection.foundry.id
 }
 `,
 				Check: resource.ComposeAggregateTestCheckFunc(
