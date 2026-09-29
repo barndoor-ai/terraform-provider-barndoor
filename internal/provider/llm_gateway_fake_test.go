@@ -74,6 +74,76 @@ type fakeLlmModelMapping struct {
 	BareAlias             bool
 	StreamIdleTimeoutSecs int64
 	RequestTimeoutSecs    int64
+	Cooldown              fakeLlmCooldown
+}
+
+// fakeLlmCooldown is a route's passive cooldown policy (BCP-2671 H5): six NOT
+// NULL columns with defaults, rendered flat on the mapping.
+type fakeLlmCooldown struct {
+	FailureThreshold int64 `json:"cooldown_failure_threshold"`
+	WindowSecs       int64 `json:"cooldown_window_secs"`
+	BaseSecs         int64 `json:"cooldown_base_secs"`
+	MaxSecs          int64 `json:"cooldown_max_secs"`
+	Default429Secs   int64 `json:"cooldown_429_default_secs"`
+	OverloadedSecs   int64 `json:"cooldown_overloaded_secs"`
+}
+
+// fakeLlmCooldownDefaults are the V-migration column defaults.
+var fakeLlmCooldownDefaults = fakeLlmCooldown{
+	FailureThreshold: 10, WindowSecs: 60, BaseSecs: 30, MaxSecs: 300, Default429Secs: 30, OverloadedSecs: 10,
+}
+
+// fakeLlmCooldownPatch carries the request's cooldown keys; nil keeps.
+type fakeLlmCooldownPatch struct {
+	FailureThreshold *int64 `json:"cooldown_failure_threshold"`
+	WindowSecs       *int64 `json:"cooldown_window_secs"`
+	BaseSecs         *int64 `json:"cooldown_base_secs"`
+	MaxSecs          *int64 `json:"cooldown_max_secs"`
+	Default429Secs   *int64 `json:"cooldown_429_default_secs"`
+	OverloadedSecs   *int64 `json:"cooldown_overloaded_secs"`
+}
+
+func (c fakeLlmCooldown) apply(p fakeLlmCooldownPatch) fakeLlmCooldown {
+	for _, f := range []struct {
+		dst *int64
+		src *int64
+	}{
+		{&c.FailureThreshold, p.FailureThreshold}, {&c.WindowSecs, p.WindowSecs},
+		{&c.BaseSecs, p.BaseSecs}, {&c.MaxSecs, p.MaxSecs},
+		{&c.Default429Secs, p.Default429Secs}, {&c.OverloadedSecs, p.OverloadedSecs},
+	} {
+		if f.src != nil {
+			*f.dst = *f.src
+		}
+	}
+	return c
+}
+
+// validLlmCooldown mirrors CooldownPolicy::validate: per-field ranges, then
+// every window capped by cooldown_max_secs (0 exempts the 529 cooldown).
+func validLlmCooldown(w http.ResponseWriter, c fakeLlmCooldown) bool {
+	for _, r := range []struct {
+		name      string
+		v, lo, hi int64
+	}{
+		{"cooldown_failure_threshold", c.FailureThreshold, 0, 100},
+		{"cooldown_window_secs", c.WindowSecs, 1, 3600},
+		{"cooldown_base_secs", c.BaseSecs, 1, 3600},
+		{"cooldown_max_secs", c.MaxSecs, 1, 86400},
+		{"cooldown_429_default_secs", c.Default429Secs, 1, 3600},
+		{"cooldown_overloaded_secs", c.OverloadedSecs, 0, 3600},
+	} {
+		if r.v < r.lo || r.v > r.hi {
+			writeLlmError(w, http.StatusBadRequest, fmt.Sprintf("%s must be between %d and %d", r.name, r.lo, r.hi))
+			return false
+		}
+	}
+	if c.BaseSecs > c.MaxSecs || c.Default429Secs > c.MaxSecs || (c.OverloadedSecs != 0 && c.OverloadedSecs > c.MaxSecs) {
+		writeLlmError(w, http.StatusBadRequest,
+			"cooldown_base_secs, cooldown_429_default_secs and cooldown_overloaded_secs must be at most cooldown_max_secs")
+		return false
+	}
+	return true
 }
 
 type fakeLlmModelAccessPolicy struct {
@@ -536,6 +606,8 @@ func mappingJSON(f *fakeLlmGatewayServer, m *fakeLlmModelMapping, withProvider b
 		"stream_idle_timeout_secs":   m.StreamIdleTimeoutSecs,
 		"request_timeout_secs":       m.RequestTimeoutSecs,
 	}
+	raw, _ := json.Marshal(m.Cooldown)
+	_ = json.Unmarshal(raw, &out)
 	if withProvider {
 		// The org-wide listing wraps rows with provider annotations the
 		// provider must ignore.
@@ -612,6 +684,7 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 		BareAlias             *bool  `json:"bare_alias"`
 		StreamIdleTimeoutSecs *int64 `json:"stream_idle_timeout_secs"`
 		RequestTimeoutSecs    *int64 `json:"request_timeout_secs"`
+		fakeLlmCooldownPatch
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
@@ -660,6 +733,13 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 	// PATCH-or-create for 1:1 rows: a second POST folds into the existing
 	// anchor instead of duplicating.
 	if alias1to1 && anchor != nil {
+		// Upsert-only for the cooldown policy: omitted keys keep the stored
+		// value rather than resetting it.
+		cooldown := anchor.Cooldown.apply(body.fakeLlmCooldownPatch)
+		if !validLlmCooldown(w, cooldown) {
+			return
+		}
+		anchor.Cooldown = cooldown
 		anchor.Enabled = enabled
 		anchor.Priority = body.Priority
 		anchor.RetryOn429Count = body.RetryOn429Count
@@ -684,6 +764,10 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 	if body.RequestTimeoutSecs != nil {
 		requestTimeout = *body.RequestTimeoutSecs
 	}
+	cooldown := fakeLlmCooldownDefaults.apply(body.fakeLlmCooldownPatch)
+	if !validLlmCooldown(w, cooldown) {
+		return
+	}
 
 	m := &fakeLlmModelMapping{
 		ID:                    f.newID("bbbb"),
@@ -697,6 +781,7 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 		BareAlias:             bareAlias,
 		StreamIdleTimeoutSecs: streamIdle,
 		RequestTimeoutSecs:    requestTimeout,
+		Cooldown:              cooldown,
 	}
 	f.mappings = append(f.mappings, m)
 	_ = json.NewEncoder(w).Encode(mappingJSON(f, m, false))
@@ -719,6 +804,7 @@ func (f *fakeLlmGatewayServer) updateModelMapping(w http.ResponseWriter, r *http
 		BareAlias             *bool   `json:"bare_alias"`
 		StreamIdleTimeoutSecs *int64  `json:"stream_idle_timeout_secs"`
 		RequestTimeoutSecs    *int64  `json:"request_timeout_secs"`
+		fakeLlmCooldownPatch
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
@@ -757,6 +843,10 @@ func (f *fakeLlmGatewayServer) updateModelMapping(w http.ResponseWriter, r *http
 	retryMaxWait := updated.RetryOn429MaxWaitSecs
 	if !validLlmMappingRanges(w, retryCount, retryMaxWait,
 		&updated.StreamIdleTimeoutSecs, &updated.RequestTimeoutSecs) {
+		return
+	}
+	updated.Cooldown = updated.Cooldown.apply(body.fakeLlmCooldownPatch)
+	if !validLlmCooldown(w, updated.Cooldown) {
 		return
 	}
 

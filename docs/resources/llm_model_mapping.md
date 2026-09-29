@@ -6,6 +6,7 @@ description: |-
   Manages an LLM Gateway model mapping: the route from a caller-facing model_alias to an upstream_model on a provider, with its failover priority and retry policy.
   Two shapes exist: a 1:1 enablement (model_alias == upstream_model) enables the model on the provider, and a custom alias (model_alias != upstream_model) routes an alias to it. A custom alias requires the 1:1 enablement for its (provider_id, upstream_model) pair to exist first — the API rejects orphan aliases with a 400. The create endpoint upserts 1:1 rows: creating a 1:1 mapping that already exists on the platform adopts and updates the existing row instead of failing.
   priority orders failover between routes serving the same alias (lower wins) and is written through the per-mapping update endpoint. The platform's bulk PUT /model-mappings/reorder endpoint is a UI convenience for atomic drag-reordering and is not used by this resource — assign each mapping an explicit priority instead.
+  The cooldown_* attributes set the route's passive cooldown policy: after enough upstream failures the gateway stops sending traffic to the route for a while and fails over to the next one. Each takes the platform default when unset. The policy belongs to the route (the (provider, upstream model) pair) and is shared by every caller.
 ---
 
 # barndoor_llm_model_mapping (Resource)
@@ -15,6 +16,8 @@ Manages an LLM Gateway model mapping: the route from a caller-facing `model_alia
 Two shapes exist: a **1:1 enablement** (`model_alias == upstream_model`) enables the model on the provider, and a **custom alias** (`model_alias != upstream_model`) routes an alias to it. A custom alias requires the 1:1 enablement for its `(provider_id, upstream_model)` pair to exist first — the API rejects orphan aliases with a 400. The create endpoint **upserts** 1:1 rows: creating a 1:1 mapping that already exists on the platform adopts and updates the existing row instead of failing.
 
 `priority` orders failover between routes serving the same alias (lower wins) and is written through the per-mapping update endpoint. The platform's bulk `PUT /model-mappings/reorder` endpoint is a UI convenience for atomic drag-reordering and is not used by this resource — assign each mapping an explicit `priority` instead.
+
+The `cooldown_*` attributes set the route's **passive cooldown** policy: after enough upstream failures the gateway stops sending traffic to the route for a while and fails over to the next one. Each takes the platform default when unset. The policy belongs to the route (the `(provider, upstream model)` pair) and is shared by every caller.
 
 ## Example Usage
 
@@ -55,6 +58,12 @@ resource "barndoor_llm_model_mapping" "fast" {
 ### Optional
 
 - `bare_alias` (Boolean) Whether the row participates in bare-name resolution (a request naming the alias alone, without the `<provider>/` prefix). Inferred when unset: custom aliases default to `true`, 1:1 enablements to `false`.
+- `cooldown_429_default_secs` (Number) Cooldown after an upstream 429 that carries no usable `Retry-After` header, in seconds (1–3600, and at most `cooldown_max_secs`). Defaults to `30`.
+- `cooldown_base_secs` (Number) First cooldown once the threshold trips, in seconds (1–3600, and at most `cooldown_max_secs`). Doubled on each failed recovery probe, up to `cooldown_max_secs`. Defaults to `30`.
+- `cooldown_failure_threshold` (Number) Upstream failures within `cooldown_window_secs` that cool the route (0–100). Defaults to `10`. `0` disables every cooldown of the shared route (rolling failures, 429 and 529); per-user credential cooldowns on passthrough routes still apply.
+- `cooldown_max_secs` (Number) Cap on every cooldown, in seconds: the doubling, 429 and 529 cooldowns alike (1–86400). Defaults to `300`.
+- `cooldown_overloaded_secs` (Number) Flat cooldown after an upstream 529 ("overloaded") with no usable `Retry-After`, in seconds (0–3600, and at most `cooldown_max_secs` unless `0`). Defaults to `10`. `0` counts a 529 as an ordinary failure instead.
+- `cooldown_window_secs` (Number) Rolling window, in seconds, over which failures are counted toward `cooldown_failure_threshold` (1–3600). Defaults to `60`.
 - `enabled` (Boolean) Whether the route serves traffic. Defaults to `true`. Disabling a 1:1 enablement row also darkens every custom alias of its upstream model.
 - `priority` (Number) Failover order among routes serving the same alias — lower wins. Defaults to `0`.
 - `request_timeout_secs` (Number) Total-request timeout for non-streaming requests, in seconds (1–600). The platform default is written when unset. On a 1:1 enablement row this sets the model tier consulted by every alias of the model.

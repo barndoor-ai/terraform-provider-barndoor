@@ -29,6 +29,7 @@ var (
 	_ resource.Resource                = &llmModelMappingResource{}
 	_ resource.ResourceWithConfigure   = &llmModelMappingResource{}
 	_ resource.ResourceWithImportState = &llmModelMappingResource{}
+	_ resource.ResourceWithModifyPlan  = &llmModelMappingResource{}
 )
 
 // NewLlmModelMappingResource returns a new barndoor_llm_model_mapping resource.
@@ -56,6 +57,13 @@ type llmModelMappingResourceModel struct {
 	BareAlias             types.Bool   `tfsdk:"bare_alias"`
 	StreamIdleTimeoutSecs types.Int64  `tfsdk:"stream_idle_timeout_secs"`
 	RequestTimeoutSecs    types.Int64  `tfsdk:"request_timeout_secs"`
+
+	CooldownFailureThreshold types.Int64 `tfsdk:"cooldown_failure_threshold"`
+	CooldownWindowSecs       types.Int64 `tfsdk:"cooldown_window_secs"`
+	CooldownBaseSecs         types.Int64 `tfsdk:"cooldown_base_secs"`
+	CooldownMaxSecs          types.Int64 `tfsdk:"cooldown_max_secs"`
+	Cooldown429DefaultSecs   types.Int64 `tfsdk:"cooldown_429_default_secs"`
+	CooldownOverloadedSecs   types.Int64 `tfsdk:"cooldown_overloaded_secs"`
 }
 
 func (r *llmModelMappingResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -76,7 +84,11 @@ func (r *llmModelMappingResource) Schema(_ context.Context, _ resource.SchemaReq
 			"`priority` orders failover between routes serving the same alias (lower wins) and is " +
 			"written through the per-mapping update endpoint. The platform's bulk " +
 			"`PUT /model-mappings/reorder` endpoint is a UI convenience for atomic drag-reordering and " +
-			"is not used by this resource — assign each mapping an explicit `priority` instead.",
+			"is not used by this resource — assign each mapping an explicit `priority` instead.\n\n" +
+			"The `cooldown_*` attributes set the route's **passive cooldown** policy: after enough upstream " +
+			"failures the gateway stops sending traffic to the route for a while and fails over to the next " +
+			"one. Each takes the platform default when unset. The policy belongs to the route (the " +
+			"`(provider, upstream model)` pair) and is shared by every caller.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				MarkdownDescription: "Model mapping UUID assigned by the API; also the `terraform import` key.",
@@ -176,7 +188,88 @@ func (r *llmModelMappingResource) Schema(_ context.Context, _ resource.SchemaReq
 					int64planmodifier.UseStateForUnknown(),
 				},
 			},
+			"cooldown_failure_threshold": llmCooldownAttribute(
+				"Upstream failures within `cooldown_window_secs` that cool the route (0–100). Defaults to "+
+					"`10`. `0` disables every cooldown of the shared route (rolling failures, 429 and 529); "+
+					"per-user credential cooldowns on passthrough routes still apply.", 0, 100),
+			"cooldown_window_secs": llmCooldownAttribute(
+				"Rolling window, in seconds, over which failures are counted toward "+
+					"`cooldown_failure_threshold` (1–3600). Defaults to `60`.", 1, 3600),
+			"cooldown_base_secs": llmCooldownAttribute(
+				"First cooldown once the threshold trips, in seconds (1–3600, and at most "+
+					"`cooldown_max_secs`). Doubled on each failed recovery probe, up to `cooldown_max_secs`. "+
+					"Defaults to `30`.", 1, 3600),
+			"cooldown_max_secs": llmCooldownAttribute(
+				"Cap on every cooldown, in seconds: the doubling, 429 and 529 cooldowns alike "+
+					"(1–86400). Defaults to `300`.", 1, 86400),
+			"cooldown_429_default_secs": llmCooldownAttribute(
+				"Cooldown after an upstream 429 that carries no usable `Retry-After` header, in seconds "+
+					"(1–3600, and at most `cooldown_max_secs`). Defaults to `30`.", 1, 3600),
+			"cooldown_overloaded_secs": llmCooldownAttribute(
+				"Flat cooldown after an upstream 529 (\"overloaded\") with no usable `Retry-After`, in "+
+					"seconds (0–3600, and at most `cooldown_max_secs` unless `0`). Defaults to `10`. `0` "+
+					"counts a 529 as an ordinary failure instead.", 0, 3600),
 		},
+	}
+}
+
+// llmCooldownAttribute builds one of the six cooldown policy attributes:
+// optional, with the platform's column default materialized on create and the
+// stored value kept when unset thereafter (the API treats an omitted field as
+// "keep", and the columns are NOT NULL, so there is nothing to clear to).
+func llmCooldownAttribute(description string, lower, upper int64) schema.Int64Attribute {
+	return schema.Int64Attribute{
+		MarkdownDescription: description,
+		Optional:            true,
+		Computed:            true,
+		Validators: []validator.Int64{
+			int64validator.Between(lower, upper),
+		},
+		PlanModifiers: []planmodifier.Int64{
+			int64planmodifier.UseStateForUnknown(),
+		},
+	}
+}
+
+// ModifyPlan mirrors the cross-field rules of the platform's
+// CooldownPolicy::validate on the planned values: every cooldown window is
+// capped by cooldown_max_secs, with 0 exempting cooldown_overloaded_secs. The
+// API enforces the same rules with a 400; checking here fails at plan instead.
+// A rule is skipped while either side is still unknown (an omitted attribute
+// on create), leaving the server as the backstop.
+func (r *llmModelMappingResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() {
+		return // destroy
+	}
+
+	var plan llmModelMappingResourceModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if plan.CooldownMaxSecs.IsNull() || plan.CooldownMaxSecs.IsUnknown() {
+		return
+	}
+	maxSecs := plan.CooldownMaxSecs.ValueInt64()
+
+	for _, c := range []struct {
+		name      string
+		value     types.Int64
+		zeroIsOff bool
+	}{
+		{"cooldown_base_secs", plan.CooldownBaseSecs, false},
+		{"cooldown_429_default_secs", plan.Cooldown429DefaultSecs, false},
+		{"cooldown_overloaded_secs", plan.CooldownOverloadedSecs, true},
+	} {
+		if c.value.IsNull() || c.value.IsUnknown() {
+			continue
+		}
+		v := c.value.ValueInt64()
+		if v > maxSecs && (!c.zeroIsOff || v != 0) {
+			resp.Diagnostics.AddAttributeError(path.Root(c.name), "Cooldown exceeds cooldown_max_secs",
+				fmt.Sprintf("%s (%d) must be at most cooldown_max_secs (%d), which caps every cooldown "+
+					"window. Lower it, or raise cooldown_max_secs.", c.name, v, maxSecs))
+		}
 	}
 }
 
@@ -328,6 +421,7 @@ type llmModelMappingCreateRequest struct {
 	BareAlias             *bool  `json:"bare_alias,omitempty"`
 	StreamIdleTimeoutSecs *int32 `json:"stream_idle_timeout_secs,omitempty"`
 	RequestTimeoutSecs    *int32 `json:"request_timeout_secs,omitempty"`
+	llmCooldownFields
 }
 
 // llmModelMappingUpdateRequest mirrors the llm-gateway UpdateModelMappingRequest
@@ -344,6 +438,20 @@ type llmModelMappingUpdateRequest struct {
 	BareAlias             *bool   `json:"bare_alias,omitempty"`
 	StreamIdleTimeoutSecs *int32  `json:"stream_idle_timeout_secs,omitempty"`
 	RequestTimeoutSecs    *int32  `json:"request_timeout_secs,omitempty"`
+	llmCooldownFields
+}
+
+// llmCooldownFields is the route's cooldown policy on the create and update
+// bodies. An omitted key takes the column default on create and keeps the
+// stored value on update; an explicit null also keeps (the columns are NOT
+// NULL), so omitempty loses nothing.
+type llmCooldownFields struct {
+	CooldownFailureThreshold *int32 `json:"cooldown_failure_threshold,omitempty"`
+	CooldownWindowSecs       *int32 `json:"cooldown_window_secs,omitempty"`
+	CooldownBaseSecs         *int32 `json:"cooldown_base_secs,omitempty"`
+	CooldownMaxSecs          *int32 `json:"cooldown_max_secs,omitempty"`
+	Cooldown429DefaultSecs   *int32 `json:"cooldown_429_default_secs,omitempty"`
+	CooldownOverloadedSecs   *int32 `json:"cooldown_overloaded_secs,omitempty"`
 }
 
 // llmModelMappingResponse mirrors the llm-gateway ModelMapping response. The
@@ -361,6 +469,26 @@ type llmModelMappingResponse struct {
 	BareAlias             bool   `json:"bare_alias"`
 	StreamIdleTimeoutSecs *int32 `json:"stream_idle_timeout_secs"`
 	RequestTimeoutSecs    *int32 `json:"request_timeout_secs"`
+
+	CooldownFailureThreshold int32 `json:"cooldown_failure_threshold"`
+	CooldownWindowSecs       int32 `json:"cooldown_window_secs"`
+	CooldownBaseSecs         int32 `json:"cooldown_base_secs"`
+	CooldownMaxSecs          int32 `json:"cooldown_max_secs"`
+	Cooldown429DefaultSecs   int32 `json:"cooldown_429_default_secs"`
+	CooldownOverloadedSecs   int32 `json:"cooldown_overloaded_secs"`
+}
+
+// plannedCooldown converts the planned cooldown attributes to the wire
+// fields; unknown/null values are omitted.
+func plannedCooldown(plan *llmModelMappingResourceModel) llmCooldownFields {
+	return llmCooldownFields{
+		CooldownFailureThreshold: int32PtrFromInt64(plan.CooldownFailureThreshold),
+		CooldownWindowSecs:       int32PtrFromInt64(plan.CooldownWindowSecs),
+		CooldownBaseSecs:         int32PtrFromInt64(plan.CooldownBaseSecs),
+		CooldownMaxSecs:          int32PtrFromInt64(plan.CooldownMaxSecs),
+		Cooldown429DefaultSecs:   int32PtrFromInt64(plan.Cooldown429DefaultSecs),
+		CooldownOverloadedSecs:   int32PtrFromInt64(plan.CooldownOverloadedSecs),
+	}
 }
 
 // boolPtrFromBool converts a known types.Bool to a *bool wire value; a
@@ -387,6 +515,7 @@ func buildLlmModelMappingCreateRequest(plan *llmModelMappingResourceModel) *llmM
 		BareAlias:             boolPtrFromBool(plan.BareAlias),
 		StreamIdleTimeoutSecs: int32PtrFromInt64(plan.StreamIdleTimeoutSecs),
 		RequestTimeoutSecs:    int32PtrFromInt64(plan.RequestTimeoutSecs),
+		llmCooldownFields:     plannedCooldown(plan),
 	}
 }
 
@@ -405,6 +534,7 @@ func buildLlmModelMappingUpdateRequest(plan *llmModelMappingResourceModel) *llmM
 		BareAlias:             boolPtrFromBool(plan.BareAlias),
 		StreamIdleTimeoutSecs: int32PtrFromInt64(plan.StreamIdleTimeoutSecs),
 		RequestTimeoutSecs:    int32PtrFromInt64(plan.RequestTimeoutSecs),
+		llmCooldownFields:     plannedCooldown(plan),
 	}
 }
 
@@ -424,5 +554,12 @@ func applyLlmModelMappingResponse(mapping *llmModelMappingResponse) llmModelMapp
 		BareAlias:             types.BoolValue(mapping.BareAlias),
 		StreamIdleTimeoutSecs: int64FromInt32Ptr(mapping.StreamIdleTimeoutSecs),
 		RequestTimeoutSecs:    int64FromInt32Ptr(mapping.RequestTimeoutSecs),
+
+		CooldownFailureThreshold: types.Int64Value(int64(mapping.CooldownFailureThreshold)),
+		CooldownWindowSecs:       types.Int64Value(int64(mapping.CooldownWindowSecs)),
+		CooldownBaseSecs:         types.Int64Value(int64(mapping.CooldownBaseSecs)),
+		CooldownMaxSecs:          types.Int64Value(int64(mapping.CooldownMaxSecs)),
+		Cooldown429DefaultSecs:   types.Int64Value(int64(mapping.Cooldown429DefaultSecs)),
+		CooldownOverloadedSecs:   types.Int64Value(int64(mapping.CooldownOverloadedSecs)),
 	}
 }

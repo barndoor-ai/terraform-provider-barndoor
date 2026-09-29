@@ -11,6 +11,7 @@ import (
 
 	frameworkresource "github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 )
 
@@ -171,6 +172,7 @@ func TestLlmModelMappingResource_oneToOneCreateAdoptsExistingRow(t *testing.T) {
 
 	// Pre-existing 1:1 enablement, as if created from the app's Models tab.
 	fake.mu.Lock()
+	tunedThreshold := int64(3)
 	existing := &fakeLlmModelMapping{
 		ID:                    fake.newID("bbbb"),
 		ProviderID:            provider.ID,
@@ -180,6 +182,8 @@ func TestLlmModelMappingResource_oneToOneCreateAdoptsExistingRow(t *testing.T) {
 		BareAlias:             false,
 		StreamIdleTimeoutSecs: fakeLlmStreamIdleDefault,
 		RequestTimeoutSecs:    fakeLlmRequestDefault,
+		// Tuned in the app; the upsert must keep it, not reset it.
+		Cooldown: fakeLlmCooldownDefaults.apply(fakeLlmCooldownPatch{FailureThreshold: &tunedThreshold}),
 	}
 	fake.mappings = append(fake.mappings, existing)
 	fake.mu.Unlock()
@@ -201,12 +205,16 @@ resource "barndoor_llm_model_mapping" "enable" {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr(resourceName, "id", existing.ID),
 					resource.TestCheckResourceAttr(resourceName, "bare_alias", "true"),
+					resource.TestCheckResourceAttr(resourceName, "cooldown_failure_threshold", "3"),
 					func(*terraform.State) error {
 						fake.mu.Lock()
 						defer fake.mu.Unlock()
 						if len(fake.mappings) != 1 {
 							return fmt.Errorf("expected the upsert to fold into the existing row, have %d rows",
 								len(fake.mappings))
+						}
+						if got := fake.mappings[0].Cooldown.FailureThreshold; got != 3 {
+							return fmt.Errorf("upsert reset cooldown_failure_threshold to %d, want 3 kept", got)
 						}
 						return nil
 					},
@@ -283,6 +291,181 @@ resource "barndoor_llm_model_mapping" "orphan" {
 }
 `, provider.ID),
 				ExpectError: regexp.MustCompile(`the model is not enabled`),
+			},
+		},
+	})
+}
+
+func TestLlmModelMappingResource_cooldownPolicy(t *testing.T) {
+	fake := setupLlmGatewayTest(t)
+	provider := fake.seedProvider()
+	const resourceName = "barndoor_llm_model_mapping.enable"
+
+	config := func(cooldown string) string {
+		return fmt.Sprintf(`
+resource "barndoor_llm_model_mapping" "enable" {
+  provider_id    = %q
+  model_alias    = "gpt-4o"
+  upstream_model = "gpt-4o"
+%s
+}
+`, provider.ID, cooldown)
+	}
+	stored := func(want fakeLlmCooldown) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			fake.mu.Lock()
+			defer fake.mu.Unlock()
+			if got := fake.mappings[0].Cooldown; got != want {
+				return fmt.Errorf("platform cooldown = %+v, want %+v", got, want)
+			}
+			return nil
+		}
+	}
+
+	tuned := fakeLlmCooldown{
+		FailureThreshold: 0, WindowSecs: 120, BaseSecs: 45, MaxSecs: 900, Default429Secs: 60, OverloadedSecs: 0,
+	}
+	tunedConfig := config(`
+  cooldown_failure_threshold = 0
+  cooldown_window_secs       = 120
+  cooldown_base_secs         = 45
+  cooldown_max_secs          = 900
+  cooldown_429_default_secs  = 60
+  cooldown_overloaded_secs   = 0`)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllLlmMappingsDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				// Unset: the column defaults are materialized into state.
+				Config: config(""),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "cooldown_failure_threshold", "10"),
+					resource.TestCheckResourceAttr(resourceName, "cooldown_window_secs", "60"),
+					resource.TestCheckResourceAttr(resourceName, "cooldown_base_secs", "30"),
+					resource.TestCheckResourceAttr(resourceName, "cooldown_max_secs", "300"),
+					resource.TestCheckResourceAttr(resourceName, "cooldown_429_default_secs", "30"),
+					resource.TestCheckResourceAttr(resourceName, "cooldown_overloaded_secs", "10"),
+					stored(fakeLlmCooldownDefaults),
+				),
+			},
+			{
+				// In-place update of all six, including both 0 sentinels.
+				Config: tunedConfig,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(resourceName, plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "cooldown_failure_threshold", "0"),
+					resource.TestCheckResourceAttr(resourceName, "cooldown_max_secs", "900"),
+					resource.TestCheckResourceAttr(resourceName, "cooldown_overloaded_secs", "0"),
+					stored(tuned),
+				),
+			},
+			{
+				Config:   tunedConfig,
+				PlanOnly: true,
+			},
+			{
+				// Dropping the attributes from configuration keeps the stored
+				// policy: the columns are NOT NULL, so there is nothing to
+				// clear to, and the API treats omission as "keep".
+				Config:   config(""),
+				PlanOnly: true,
+			},
+			{
+				ResourceName:      resourceName,
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func TestLlmModelMappingResource_cooldownValidation(t *testing.T) {
+	fake := setupLlmGatewayTest(t)
+	provider := fake.seedProvider()
+
+	cases := []struct {
+		name     string
+		cooldown string
+		want     *regexp.Regexp
+	}{
+		{
+			name:     "base above max",
+			cooldown: "cooldown_base_secs = 600\n  cooldown_max_secs = 300",
+			want:     regexp.MustCompile(`cooldown_base_secs \(600\) must be at most cooldown_max_secs \(300\)`),
+		},
+		{
+			name:     "429 default above max",
+			cooldown: "cooldown_429_default_secs = 400\n  cooldown_max_secs = 300",
+			want:     regexp.MustCompile(`cooldown_429_default_secs \(400\) must be at most`),
+		},
+		{
+			name:     "overloaded above max",
+			cooldown: "cooldown_overloaded_secs = 20\n  cooldown_max_secs = 10\n  cooldown_base_secs = 5\n  cooldown_429_default_secs = 5",
+			want:     regexp.MustCompile(`cooldown_overloaded_secs \(20\) must be at most`),
+		},
+		{
+			name:     "threshold out of range",
+			cooldown: "cooldown_failure_threshold = 101",
+			want:     regexp.MustCompile(`cooldown_failure_threshold value must be between 0 and 100`),
+		},
+		{
+			name:     "window zero",
+			cooldown: "cooldown_window_secs = 0",
+			want:     regexp.MustCompile(`cooldown_window_secs value must be between 1 and 3600`),
+		},
+		{
+			name:     "max out of range",
+			cooldown: "cooldown_max_secs = 86401",
+			want:     regexp.MustCompile(`cooldown_max_secs value must be between 1 and 86400`),
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+				Steps: []resource.TestStep{
+					{
+						Config: fmt.Sprintf(`
+resource "barndoor_llm_model_mapping" "enable" {
+  provider_id    = %q
+  model_alias    = "gpt-4o"
+  upstream_model = "gpt-4o"
+  %s
+}
+`, provider.ID, c.cooldown),
+						PlanOnly:    true,
+						ExpectError: c.want,
+					},
+				},
+			})
+		})
+	}
+
+	// A 0 overloaded cooldown is "count a 529 as an ordinary failure", so it is
+	// exempt from the max cap and must plan cleanly.
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+resource "barndoor_llm_model_mapping" "enable" {
+  provider_id    = %q
+  model_alias    = "gpt-4o"
+  upstream_model = "gpt-4o"
+
+  cooldown_max_secs         = 5
+  cooldown_base_secs        = 5
+  cooldown_429_default_secs = 5
+  cooldown_overloaded_secs  = 0
+}
+`, provider.ID),
+				Check: resource.TestCheckResourceAttr("barndoor_llm_model_mapping.enable", "cooldown_overloaded_secs", "0"),
 			},
 		},
 	})
