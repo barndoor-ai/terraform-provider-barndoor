@@ -4,14 +4,17 @@ page_title: "barndoor_llm_governance_config Resource - Barndoor"
 subcategory: ""
 description: |-
   Manages the organization's singleton LLM Gateway governance configuration. The platform keys this configuration by the organization (an org without a configuration row behaves as all-defaults), so this resource adopts and configures the singleton rather than creating anything.
-  terraform destroy cannot delete the configuration — it resets every setting to the platform defaults (require_pricing_for_mappings = false) and then forgets the resource.
+  The platform stores every setting in one row and its update replaces the whole row, so each apply first reads the current configuration and changes only what this resource configures. Settings left unconfigured keep whatever the app last set.
+  terraform destroy cannot delete the configuration. It resets require_pricing_for_mappings to the platform default (false), then forgets the resource. default_model_access and require_routing_policy are left as they are, so destroying this resource never loosens model access.
 ---
 
 # barndoor_llm_governance_config (Resource)
 
 Manages the organization's **singleton** LLM Gateway governance configuration. The platform keys this configuration by the organization (an org without a configuration row behaves as all-defaults), so this resource **adopts and configures** the singleton rather than creating anything.
 
-`terraform destroy` cannot delete the configuration — it **resets every setting to the platform defaults** (`require_pricing_for_mappings = false`) and then forgets the resource.
+The platform stores every setting in one row and its update replaces the whole row, so each apply first reads the current configuration and changes only what this resource configures. Settings left unconfigured keep whatever the app last set.
+
+`terraform destroy` cannot delete the configuration. It **resets `require_pricing_for_mappings`** to the platform default (`false`), then forgets the resource. `default_model_access` and `require_routing_policy` are left as they are, so destroying this resource never loosens model access.
 
 ## Example Usage
 
@@ -31,6 +34,11 @@ resource "barndoor_llm_governance_config" "org" {
 ### Required
 
 - `require_pricing_for_mappings` (Boolean) Whether every model mapping (route) must have a matching pricing rule before the gateway accepts it. The platform default is `false`.
+
+### Optional
+
+- `default_model_access` (String) What happens to a request for a model that no model-access policy mentions: `allow` (the platform default) or `deny`. Setting `deny` requires at least one enabled allowlist, so switching over cannot lock the organization out; the API rejects it otherwise. Allowlists narrow access and never grant it on their own, so `deny` is what makes them a closed list. Keeps the stored value when unset.
+- `require_routing_policy` (Boolean) Whether callers must address a routing policy rather than naming a model directly. The platform default is `false`. Keeps the stored value when unset.
 
 ### Read-Only
 

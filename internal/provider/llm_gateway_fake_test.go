@@ -228,6 +228,10 @@ type fakeLlmGatewayServer struct {
 	// governance is the org's singleton governance_config row; nil means no
 	// row yet (the API then reports the column defaults).
 	governance *bool
+	// defaultModelAccess ("" = allow) and requireRoutingPolicy are the later
+	// governance_config columns (V70, V78).
+	defaultModelAccess   string
+	requireRoutingPolicy bool
 
 	// forbidden simulates a credential that fails the Cerbos authorize()
 	// check every admin handler runs; when set, the governance-config and
@@ -1750,11 +1754,7 @@ func (f *fakeLlmGatewayServer) handleGovernanceConfig(w http.ResponseWriter, r *
 
 	switch r.Method {
 	case http.MethodGet:
-		val := false
-		if f.governance != nil {
-			val = *f.governance
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"require_pricing_for_mappings": val})
+		_ = json.NewEncoder(w).Encode(f.governanceJSON())
 	case http.MethodPut:
 		var raw map[string]json.RawMessage
 		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
@@ -1769,10 +1769,45 @@ func (f *fakeLlmGatewayServer) handleGovernanceConfig(w http.ResponseWriter, r *
 				"missing field `require_pricing_for_mappings`", http.StatusUnprocessableEntity)
 			return
 		}
+		// The later fields are #[serde(default)]: an omitted key takes the
+		// default rather than keeping the stored value, and the row is
+		// upserted whole.
+		posture, routing := "allow", false
+		if v, ok := raw["default_model_access"]; ok {
+			_ = json.Unmarshal(v, &posture)
+		}
+		if v, ok := raw["require_routing_policy"]; ok {
+			_ = json.Unmarshal(v, &routing)
+		}
+		if !slices.Contains([]string{"allow", "deny"}, posture) {
+			http.Error(w, "Failed to deserialize the JSON body into the target type: "+
+				"default_model_access: unknown variant `"+posture+"`", http.StatusUnprocessableEntity)
+			return
+		}
 		f.governance = &val
-		_ = json.NewEncoder(w).Encode(map[string]any{"require_pricing_for_mappings": val})
+		f.defaultModelAccess = posture
+		f.requireRoutingPolicy = routing
+		_ = json.NewEncoder(w).Encode(f.governanceJSON())
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+// governanceJSON renders the stored row, or the column defaults when none
+// exists. Callers hold f.mu.
+func (f *fakeLlmGatewayServer) governanceJSON() map[string]any {
+	pricing := false
+	if f.governance != nil {
+		pricing = *f.governance
+	}
+	posture := f.defaultModelAccess
+	if posture == "" {
+		posture = "allow"
+	}
+	return map[string]any{
+		"require_pricing_for_mappings": pricing,
+		"default_model_access":         posture,
+		"require_routing_policy":       f.requireRoutingPolicy,
 	}
 }
 
