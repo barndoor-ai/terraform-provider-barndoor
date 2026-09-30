@@ -181,3 +181,132 @@ resource "barndoor_llm_governance_config" "test" {
 		},
 	})
 }
+
+// The PUT replaces the whole row, and an omitted field takes its default.
+// A configuration that manages only require_pricing_for_mappings must still
+// carry through a deny posture and a routing-policy requirement set in the
+// app, on apply and on destroy alike. Otherwise every apply would reopen
+// model access for the whole organization.
+func TestLlmGovernanceConfigResource_preservesUnconfiguredSettings(t *testing.T) {
+	fake := setupLlmGatewayTest(t)
+	const resourceName = "barndoor_llm_governance_config.test"
+
+	fake.mu.Lock()
+	fake.defaultModelAccess = "deny"
+	fake.requireRoutingPolicy = true
+	fake.mu.Unlock()
+
+	postureKept := func(*terraform.State) error {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		if fake.defaultModelAccess != "deny" || !fake.requireRoutingPolicy {
+			return fmt.Errorf("platform default_model_access = %q, require_routing_policy = %t; want deny, true",
+				fake.defaultModelAccess, fake.requireRoutingPolicy)
+		}
+		return nil
+	}
+
+	config := func(pricing bool) string {
+		return fmt.Sprintf(`
+resource "barndoor_llm_governance_config" "test" {
+  require_pricing_for_mappings = %t
+}
+`, pricing)
+	}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy: resource.ComposeAggregateTestCheckFunc(
+			checkLlmGovernanceReset(fake),
+			postureKept,
+		),
+		Steps: []resource.TestStep{
+			{
+				Config: config(true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "default_model_access", "deny"),
+					resource.TestCheckResourceAttr(resourceName, "require_routing_policy", "true"),
+					postureKept,
+				),
+			},
+			{
+				Config: config(false),
+				Check:  postureKept,
+			},
+			{
+				Config:   config(false),
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+func TestLlmGovernanceConfigResource_managesPostureAndRoutingRequirement(t *testing.T) {
+	fake := setupLlmGatewayTest(t)
+	const resourceName = "barndoor_llm_governance_config.test"
+
+	config := func(posture string, routing bool) string {
+		return fmt.Sprintf(`
+resource "barndoor_llm_governance_config" "test" {
+  require_pricing_for_mappings = false
+  default_model_access         = %q
+  require_routing_policy       = %t
+}
+`, posture, routing)
+	}
+	stored := func(posture string, routing bool) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			fake.mu.Lock()
+			defer fake.mu.Unlock()
+			if fake.defaultModelAccess != posture || fake.requireRoutingPolicy != routing {
+				return fmt.Errorf("platform default_model_access = %q, require_routing_policy = %t; want %q, %t",
+					fake.defaultModelAccess, fake.requireRoutingPolicy, posture, routing)
+			}
+			return nil
+		}
+	}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: config("deny", true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "default_model_access", "deny"),
+					resource.TestCheckResourceAttr(resourceName, "require_routing_policy", "true"),
+					stored("deny", true),
+				),
+			},
+			{
+				Config:   config("deny", true),
+				PlanOnly: true,
+			},
+			{
+				ResourceName:      resourceName,
+				ImportState:       true,
+				ImportStateId:     fakeLlmOrgID,
+				ImportStateVerify: true,
+			},
+			{
+				Config: config("allow", false),
+				Check:  stored("allow", false),
+			},
+		},
+	})
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "barndoor_llm_governance_config" "test" {
+  require_pricing_for_mappings = false
+  default_model_access         = "closed"
+}
+`,
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`value must be one of`),
+			},
+		},
+	})
+}

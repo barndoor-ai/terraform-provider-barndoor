@@ -50,11 +50,11 @@ var (
 	dlpPrincipalTypes = []string{"GROUP", "ROLE"}
 )
 
-// dlpNoSurroundingWhitespace mirrors the API's trimming of identifier-ish
+// noSurroundingWhitespace mirrors the API's trimming of identifier-ish
 // values (names, scope ids): a padded value would read back trimmed and
 // surface as a "provider produced an inconsistent result" error, so reject it
 // (and the empty string) at plan time instead.
-var dlpNoSurroundingWhitespace = stringvalidator.RegexMatches(
+var noSurroundingWhitespace = stringvalidator.RegexMatches(
 	regexp.MustCompile(`^\S(.*\S)?$`),
 	"must not be empty or have leading/trailing whitespace",
 )
@@ -149,7 +149,7 @@ func (r *dlpEnforcementPolicyResource) Schema(_ context.Context, _ resource.Sche
 					"policies.",
 				Required: true,
 				Validators: []validator.String{
-					dlpNoSurroundingWhitespace,
+					noSurroundingWhitespace,
 				},
 			},
 			"target_kind": schema.StringAttribute{
@@ -172,7 +172,7 @@ func (r *dlpEnforcementPolicyResource) Schema(_ context.Context, _ resource.Sche
 				Optional:    true,
 				Validators: []validator.List{
 					listvalidator.UniqueValues(),
-					listvalidator.ValueStringsAre(dlpNoSurroundingWhitespace),
+					listvalidator.ValueStringsAre(noSurroundingWhitespace),
 				},
 			},
 			"model_alias": schema.StringAttribute{
@@ -180,7 +180,7 @@ func (r *dlpEnforcementPolicyResource) Schema(_ context.Context, _ resource.Sche
 					"Omit to match every model.",
 				Optional: true,
 				Validators: []validator.String{
-					dlpNoSurroundingWhitespace,
+					noSurroundingWhitespace,
 				},
 			},
 			"runtime_stage": schema.StringAttribute{
@@ -247,7 +247,7 @@ func (r *dlpEnforcementPolicyResource) Schema(_ context.Context, _ resource.Sche
 				Validators: []validator.List{
 					listvalidator.SizeAtLeast(1),
 					listvalidator.UniqueValues(),
-					listvalidator.ValueStringsAre(dlpNoSurroundingWhitespace),
+					listvalidator.ValueStringsAre(noSurroundingWhitespace),
 				},
 			},
 			"created_by": schema.StringAttribute{

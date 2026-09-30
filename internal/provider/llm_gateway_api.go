@@ -7,9 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
+	"slices"
 	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework-jsontypes/jsontypes"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
@@ -117,4 +121,77 @@ func int64FromInt32Ptr(p *int32) types.Int64 {
 		return types.Int64Null()
 	}
 	return types.Int64Value(int64(*p))
+}
+
+// llmVersionedBaseFamilies are the model-provider families whose gateway
+// adapter appends its own `/v1/...` path onto base_url, so a base already
+// ending in `/v1` sends the version twice and the platform rejects it
+// (`forwards_gateway_version_prefix`). `openai` is exempt only under
+// `codex_oauth`.
+var llmVersionedBaseFamilies = []string{
+	"openai", "anthropic", "groq", "together", "mistral", "cohere", "xai",
+	"fireworks", "perplexity", "openrouter", "deepseek", "typesafe", "custom",
+}
+
+// llmRedundantVersionSuffix mirrors the platform's `redundant_version_suffix`:
+// it returns the corrected base URL and true when baseURL ends in a `/v1` the
+// gateway would add again.
+func llmRedundantVersionSuffix(baseURL, modelProvider, authType string) (string, bool) {
+	if !slices.Contains(llmVersionedBaseFamilies, modelProvider) ||
+		(modelProvider == "openai" && authType == "codex_oauth") {
+		return "", false
+	}
+	corrected, found := strings.CutSuffix(strings.TrimRight(strings.TrimSpace(baseURL), "/"), "/v1")
+	if !found || corrected == "" {
+		return "", false
+	}
+	return corrected, true
+}
+
+// addLlmBaseURLVersionError reports a redundant `/v1` on base_url.
+func addLlmBaseURLVersionError(diags *diag.Diagnostics, baseURL, corrected string) {
+	diags.AddAttributeError(path.Root("base_url"), "base_url must not end in /v1",
+		fmt.Sprintf("The gateway appends the API version itself (for example /v1/chat/completions), so "+
+			"requests built from %q would carry it twice and the platform rejects it. Use %q instead.",
+			baseURL, corrected))
+}
+
+// settleLlmSettings maps a settings object the server returned onto state.
+// The platform normalizes settings on write: it adds derived keys (a
+// generated AWS `external_id`, a defaulted `model_api_family`, an Azure
+// `api_version`), and on a provider it merges the bound connection's
+// settings underneath. A configuration can't be expected to spell all of
+// that out. So while every configured key still holds its configured value,
+// state keeps the configured object and a Terraform plan stays quiet. When a
+// configured key changes or disappears, the server's object is recorded and
+// the drift shows. An empty object settles to null when nothing was configured.
+func settleLlmSettings(server json.RawMessage, prior jsontypes.Normalized) jsontypes.Normalized {
+	raw := strings.TrimSpace(string(server))
+	priorValue, priorKnown := knownNormalized(prior)
+	if raw == "" || raw == "null" || raw == "{}" {
+		if !priorKnown {
+			return jsontypes.NewNormalizedNull()
+		}
+		raw = "{}"
+	}
+	if priorKnown && llmSettingsContain(raw, priorValue) {
+		return prior
+	}
+	return jsontypes.NewNormalizedValue(raw)
+}
+
+// llmSettingsContain reports whether every key of the JSON object want is
+// present in the JSON object have with a deep-equal value.
+func llmSettingsContain(have, want string) bool {
+	var h, w map[string]any
+	if json.Unmarshal([]byte(have), &h) != nil || json.Unmarshal([]byte(want), &w) != nil {
+		return false
+	}
+	for k, v := range w {
+		hv, ok := h[k]
+		if !ok || !reflect.DeepEqual(hv, v) {
+			return false
+		}
+	}
+	return true
 }

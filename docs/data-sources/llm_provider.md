@@ -44,14 +44,18 @@ output "openai_health_status" {
 ### Read-Only
 
 - `auth_type` (String) How the gateway authenticates upstream (e.g. `bearer_api_key`, `x_api_key`, `azure_api_key`).
-- `base_url` (String) Upstream API base URL, e.g. `https://api.openai.com/v1`.
+- `base_url` (String) Upstream API base URL, e.g. `https://api.openai.com`.
+- `billing_mode` (String) Whether Barndoor calculates and reports a per-token cost for this provider's traffic: `per_token` or `not_metered` (token usage still counted, token cost recorded as $0).
+- `billing_note` (String) Free-text context for the billing arrangement; null when unset.
+- `billing_reason` (String) How the vendor bills this provider: `subscription`, `local`, `external`, or `other`; null when unset. Always set on a `not_metered` provider.
+- `connection_id` (String) UUID of the LLM connection the provider reads its upstream secret from; null for a request-scoped OAuth passthrough provider.
 - `created_at` (String) When the provider was created (RFC 3339).
 - `enabled` (Boolean) Operator intent: whether the provider may serve traffic. Distinct from `health_status`, which the platform records from connectivity probes.
 - `enforce_health_check` (Boolean) Whether routing gates on the connectivity health probe.
 - `health_checked_at` (String) When the last connectivity probe ran (RFC 3339); null until the first probe.
 - `health_detail` (String) Human-readable reason for the last `unhealthy` probe; null otherwise.
 - `health_status` (String) Observed upstream reachability recorded by the platform's connectivity probes: `unverified`, `healthy`, or `unhealthy`.
-- `model_provider` (String) Upstream model-provider family, deciding the wire protocol the gateway speaks: `openai`, `anthropic`, `azure_openai`, `google_ai`, `bedrock`, `vertex`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, `perplexity`, `openrouter`, `deepseek`, or `custom`.
+- `model_provider` (String) Upstream model-provider family, deciding the wire protocol the gateway speaks: `openai`, `anthropic`, `azure_openai`, `azure_foundry`, `google_ai`, `bedrock`, `vertex`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, `perplexity`, `openrouter`, `deepseek`, `typesafe`, or `custom`.
 - `org_id` (String) Organization the provider belongs to.
 - `settings` (String) Provider-specific settings as a JSON object, e.g. `region` for Bedrock or `api_version` for Azure OpenAI; null when the provider has none.
 - `updated_at` (String) When the provider was last updated (RFC 3339).

@@ -145,6 +145,7 @@ func (p *BarndoorProvider) Resources(ctx context.Context) []func() resource.Reso
 		NewDlpFieldControlPolicyResource,
 		NewDlpOrgConfigResource,
 		NewIdpResource,
+		NewLlmConnectionResource,
 		NewLlmGovernanceConfigResource,
 		NewLlmModelAccessResource,
 		NewLlmModelMappingResource,

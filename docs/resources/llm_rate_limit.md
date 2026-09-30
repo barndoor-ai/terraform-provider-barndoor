@@ -45,6 +45,9 @@ resource "barndoor_llm_rate_limit" "engineering_tokens" {
 ### Optional
 
 - `enabled` (Boolean) Whether the policy is enforced. Defaults to `true`.
+- `member_of_group` (String) IdP group name that narrows a broad per-user rate limit to the members of that group. Each member gets their **own, independent** allowance from this single rule, and a user who joins the group picks it up on their next request with no admin action. This is the opposite of `scope_type = "group"` (with the group name in `scope_value`), which is **one allowance pooled** across every member, so the first heavy user can exhaust it for everyone.
+
+Only valid with `scope_type = "user"` and neither `scope_id` nor `scope_value` set. Changing it forces a new rate limit (the API cannot update it).
 - `requests_per_minute` (Number) Requests allowed per rolling 60-second window. Omit to enforce tokens only.
 - `scope_id` (String) UUID of the scoped entity (user, team, API key, …) for UUID-keyed scope types. Removing it forces a new resource — the API cannot clear it in place.
 - `scope_value` (String) String key of the scoped entity for name-keyed scope types (e.g. a role or IdP group name for `role`/`group` scopes). Removing it forces a new resource — the API cannot clear it in place.

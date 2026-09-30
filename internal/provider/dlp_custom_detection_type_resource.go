@@ -125,14 +125,14 @@ func (r *dlpCustomDetectionTypeResource) Schema(_ context.Context, _ resource.Sc
 				MarkdownDescription: "Human-readable display name of the detection type.",
 				Required:            true,
 				Validators: []validator.String{
-					dlpNoSurroundingWhitespace,
+					noSurroundingWhitespace,
 				},
 			},
 			"description": schema.StringAttribute{
 				MarkdownDescription: "What the detection type matches (free-form).",
 				Optional:            true,
 				Validators: []validator.String{
-					dlpNoSurroundingWhitespace,
+					noSurroundingWhitespace,
 				},
 			},
 			"patterns": schema.ListNestedAttribute{
@@ -202,7 +202,7 @@ func dlpCustomDetectionPatternNestedObject() schema.NestedAttributeObject {
 				MarkdownDescription: "The literal value or regular expression to match, per `pattern_type`.",
 				Required:            true,
 				Validators: []validator.String{
-					dlpNoSurroundingWhitespace,
+					noSurroundingWhitespace,
 				},
 			},
 			"pattern_type": schema.StringAttribute{

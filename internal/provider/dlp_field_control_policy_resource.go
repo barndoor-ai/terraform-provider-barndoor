@@ -97,7 +97,7 @@ func (r *dlpFieldControlPolicyResource) Schema(_ context.Context, _ resource.Sch
 					"organization; changing it forces a new policy.",
 				Required: true,
 				Validators: []validator.String{
-					dlpNoSurroundingWhitespace,
+					noSurroundingWhitespace,
 				},
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
@@ -107,7 +107,7 @@ func (r *dlpFieldControlPolicyResource) Schema(_ context.Context, _ resource.Sch
 				MarkdownDescription: "Policy name.",
 				Required:            true,
 				Validators: []validator.String{
-					dlpNoSurroundingWhitespace,
+					noSurroundingWhitespace,
 				},
 			},
 			"enabled": schema.BoolAttribute{

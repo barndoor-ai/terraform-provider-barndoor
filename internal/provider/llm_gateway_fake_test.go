@@ -23,10 +23,11 @@ import (
 // --- in-process fake llm-gateway-service --------------------------------------
 //
 // fakeLlmGatewayServer emulates the llm-gateway admin REST surface the
-// provider binds (`/api/llm-gateway/admin/providers|model-mappings|
+// provider binds (`/api/llm-gateway/admin/connections|providers|model-mappings|
 // model-access|rate-limits|budgets|model-pricing|governance-config`)
-// faithfully enough to drive real plan/apply cycles: write-only provider
-// credentials (stored, never echoed), per-model-provider auth_type
+// faithfully enough to drive real plan/apply cycles: write-only connection
+// secrets (stored, never echoed), providers bound to connections with inline
+// keys rejected (BCP-3647), per-model-provider auth_type
 // defaulting, settings-must-be-object validation, the model-mapping
 // orphan-alias guard and 1:1 PATCH-or-create upsert with timeout
 // materialization, listing-only reads (no get-by-id) for mappings/policies/
@@ -44,7 +45,7 @@ const fakeLlmTime = "2026-07-02T00:00:00Z"
 // Platform timeout defaults materialized at mapping insert
 // (`STREAM_IDLE_TIMEOUT_DEFAULT_SECS` / `TOTAL_REQUEST_TIMEOUT_DEFAULT_SECS`).
 const (
-	fakeLlmStreamIdleDefault = 30
+	fakeLlmStreamIdleDefault = 180
 	fakeLlmRequestDefault    = 120
 )
 
@@ -57,9 +58,10 @@ type fakeLlmProvider struct {
 	Settings           json.RawMessage
 	Enabled            bool
 	EnforceHealthCheck bool
-	// Credential is the last api_key written. Stored to let tests assert the
-	// write-only round trip; never rendered into a response.
-	Credential string
+	BillingMode        string
+	BillingReason      *string
+	BillingNote        *string
+	ConnectionID       *string
 }
 
 type fakeLlmModelMapping struct {
@@ -74,6 +76,76 @@ type fakeLlmModelMapping struct {
 	BareAlias             bool
 	StreamIdleTimeoutSecs int64
 	RequestTimeoutSecs    int64
+	Cooldown              fakeLlmCooldown
+}
+
+// fakeLlmCooldown is a route's passive cooldown policy (BCP-2671 H5): six NOT
+// NULL columns with defaults, rendered flat on the mapping.
+type fakeLlmCooldown struct {
+	FailureThreshold int64 `json:"cooldown_failure_threshold"`
+	WindowSecs       int64 `json:"cooldown_window_secs"`
+	BaseSecs         int64 `json:"cooldown_base_secs"`
+	MaxSecs          int64 `json:"cooldown_max_secs"`
+	Default429Secs   int64 `json:"cooldown_429_default_secs"`
+	OverloadedSecs   int64 `json:"cooldown_overloaded_secs"`
+}
+
+// fakeLlmCooldownDefaults are the V-migration column defaults.
+var fakeLlmCooldownDefaults = fakeLlmCooldown{
+	FailureThreshold: 10, WindowSecs: 60, BaseSecs: 30, MaxSecs: 300, Default429Secs: 30, OverloadedSecs: 10,
+}
+
+// fakeLlmCooldownPatch carries the request's cooldown keys; nil keeps.
+type fakeLlmCooldownPatch struct {
+	FailureThreshold *int64 `json:"cooldown_failure_threshold"`
+	WindowSecs       *int64 `json:"cooldown_window_secs"`
+	BaseSecs         *int64 `json:"cooldown_base_secs"`
+	MaxSecs          *int64 `json:"cooldown_max_secs"`
+	Default429Secs   *int64 `json:"cooldown_429_default_secs"`
+	OverloadedSecs   *int64 `json:"cooldown_overloaded_secs"`
+}
+
+func (c fakeLlmCooldown) apply(p fakeLlmCooldownPatch) fakeLlmCooldown {
+	for _, f := range []struct {
+		dst *int64
+		src *int64
+	}{
+		{&c.FailureThreshold, p.FailureThreshold}, {&c.WindowSecs, p.WindowSecs},
+		{&c.BaseSecs, p.BaseSecs}, {&c.MaxSecs, p.MaxSecs},
+		{&c.Default429Secs, p.Default429Secs}, {&c.OverloadedSecs, p.OverloadedSecs},
+	} {
+		if f.src != nil {
+			*f.dst = *f.src
+		}
+	}
+	return c
+}
+
+// validLlmCooldown mirrors CooldownPolicy::validate: per-field ranges, then
+// every window capped by cooldown_max_secs (0 exempts the 529 cooldown).
+func validLlmCooldown(w http.ResponseWriter, c fakeLlmCooldown) bool {
+	for _, r := range []struct {
+		name      string
+		v, lo, hi int64
+	}{
+		{"cooldown_failure_threshold", c.FailureThreshold, 0, 100},
+		{"cooldown_window_secs", c.WindowSecs, 1, 3600},
+		{"cooldown_base_secs", c.BaseSecs, 1, 3600},
+		{"cooldown_max_secs", c.MaxSecs, 1, 86400},
+		{"cooldown_429_default_secs", c.Default429Secs, 1, 3600},
+		{"cooldown_overloaded_secs", c.OverloadedSecs, 0, 3600},
+	} {
+		if r.v < r.lo || r.v > r.hi {
+			writeLlmError(w, http.StatusBadRequest, fmt.Sprintf("%s must be between %d and %d", r.name, r.lo, r.hi))
+			return false
+		}
+	}
+	if c.BaseSecs > c.MaxSecs || c.Default429Secs > c.MaxSecs || (c.OverloadedSecs != 0 && c.OverloadedSecs > c.MaxSecs) {
+		writeLlmError(w, http.StatusBadRequest,
+			"cooldown_base_secs, cooldown_429_default_secs and cooldown_overloaded_secs must be at most cooldown_max_secs")
+		return false
+	}
+	return true
 }
 
 type fakeLlmModelAccessPolicy struct {
@@ -96,6 +168,7 @@ type fakeLlmRateLimit struct {
 	ScopeValue        *string
 	RequestsPerMinute *int64
 	TokensPerMinute   *int64
+	MemberOfGroup     *string
 	TrafficType       string
 	Enabled           bool
 }
@@ -106,6 +179,7 @@ type fakeLlmTokenBudget struct {
 	ScopeType       string
 	ScopeID         *string
 	ScopeValue      *string
+	MemberOfGroup   *string
 	Period          string
 	TokenLimit      int64
 	AlertThresholds []int64
@@ -143,16 +217,21 @@ type fakeLlmGatewayServer struct {
 	nextID int
 
 	// providers etc. keep insertion order for stable listings.
-	providers  []*fakeLlmProvider
-	mappings   []*fakeLlmModelMapping
-	policies   []*fakeLlmModelAccessPolicy
-	rateLimits []*fakeLlmRateLimit
-	budgets    []*fakeLlmTokenBudget
-	pricing    []*fakeLlmPricingVersion
+	providers   []*fakeLlmProvider
+	connections map[string]*fakeLlmConnection
+	mappings    []*fakeLlmModelMapping
+	policies    []*fakeLlmModelAccessPolicy
+	rateLimits  []*fakeLlmRateLimit
+	budgets     []*fakeLlmTokenBudget
+	pricing     []*fakeLlmPricingVersion
 
 	// governance is the org's singleton governance_config row; nil means no
 	// row yet (the API then reports the column defaults).
 	governance *bool
+	// defaultModelAccess ("" = allow) and requireRoutingPolicy are the later
+	// governance_config columns (V70, V78).
+	defaultModelAccess   string
+	requireRoutingPolicy bool
 
 	// forbidden simulates a credential that fails the Cerbos authorize()
 	// check every admin handler runs; when set, the governance-config and
@@ -161,7 +240,7 @@ type fakeLlmGatewayServer struct {
 }
 
 func newFakeLlmGatewayServer() *fakeLlmGatewayServer {
-	return &fakeLlmGatewayServer{}
+	return &fakeLlmGatewayServer{connections: map[string]*fakeLlmConnection{}}
 }
 
 // newID mints a deterministic UUID-shaped id. Callers hold f.mu.
@@ -177,6 +256,8 @@ func (f *fakeLlmGatewayServer) handler() http.HandlerFunc {
 			writeToken(w)
 		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/providers"):
 			f.handleProviders(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/connections"):
+			f.handleConnections(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/model-mappings"):
 			f.handleModelMappings(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/model-access"):
@@ -238,9 +319,9 @@ func writeLlmError(w http.ResponseWriter, status int, message string) {
 // --- providers -----------------------------------------------------------------
 
 var fakeLlmModelProviders = []string{
-	"openai", "anthropic", "azure_openai", "google_ai", "bedrock", "vertex",
-	"groq", "together", "mistral", "cohere", "xai", "fireworks", "perplexity",
-	"openrouter", "deepseek", "custom",
+	"openai", "anthropic", "azure_openai", "azure_foundry", "google_ai", "bedrock",
+	"vertex", "groq", "together", "mistral", "cohere", "xai", "fireworks",
+	"perplexity", "openrouter", "deepseek", "typesafe", "custom",
 }
 
 // fakeLlmDefaultAuthType mirrors production's default_auth_type.
@@ -255,6 +336,8 @@ func fakeLlmDefaultAuthType(modelProvider string, requested *string) string {
 		return "google_adc"
 	case "azure_openai":
 		return "azure_api_key"
+	case "azure_foundry":
+		return "azure_foundry_api_key"
 	case "anthropic":
 		return "x_api_key"
 	default:
@@ -286,25 +369,67 @@ func (f *fakeLlmGatewayServer) findProvider(id string) *fakeLlmProvider {
 }
 
 func providerJSON(p *fakeLlmProvider) map[string]any {
-	return map[string]any{
+	out := map[string]any{
 		"id":             p.ID,
 		"org_id":         fakeLlmOrgID,
 		"catalog_id":     nil,
-		"connection_id":  nil,
+		"connection_id":  p.ConnectionID,
 		"name":           p.Name,
 		"model_provider": p.ModelProvider,
 		"auth_type":      p.AuthType,
 		"base_url":       p.BaseURL,
-		// The stored credential is never part of the response — only the
-		// opaque secret-store path it was written to.
-		"secret_path":          fmt.Sprintf("orgs/%s/providers/%s", fakeLlmOrgID, p.ID),
+		// The secret lives on the connection; only its path is echoed.
+		"secret_path":          "pending",
 		"enabled":              p.Enabled,
 		"settings":             p.Settings,
 		"created_at":           fakeLlmTime,
 		"updated_at":           fakeLlmTime,
 		"health_status":        "unverified",
 		"enforce_health_check": p.EnforceHealthCheck,
+		"billing_mode":         p.BillingMode,
 	}
+	// Omitted when null, like production's skip_serializing_if.
+	if p.BillingReason != nil {
+		out["billing_reason"] = *p.BillingReason
+	}
+	if p.BillingNote != nil {
+		out["billing_note"] = *p.BillingNote
+	}
+	return out
+}
+
+// fakeLlmBillingNote mirrors normalize_billing_note: trimmed, blank is absent.
+func fakeLlmBillingNote(note *string) *string {
+	if note == nil || strings.TrimSpace(*note) == "" {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*note)
+	return &trimmed
+}
+
+// validLlmBilling mirrors validate_billing_fields on the resulting row, plus
+// the enum checks serde performs on the way in.
+func validLlmBilling(w http.ResponseWriter, p *fakeLlmProvider) bool {
+	if !slices.Contains([]string{"per_token", "not_metered"}, p.BillingMode) {
+		writeLlmError(w, http.StatusBadRequest, "unknown billing_mode: "+p.BillingMode)
+		return false
+	}
+	if p.BillingReason != nil &&
+		!slices.Contains([]string{"subscription", "local", "external", "other"}, *p.BillingReason) {
+		writeLlmError(w, http.StatusBadRequest, "unknown billing_reason: "+*p.BillingReason)
+		return false
+	}
+	if p.BillingMode == "not_metered" && p.BillingReason == nil {
+		writeLlmError(w, http.StatusBadRequest,
+			"billing_reason is required when billing_mode is 'not_metered'; one of "+
+				"'subscription', 'local', 'external', 'other'.")
+		return false
+	}
+	if p.BillingNote != nil && len([]rune(*p.BillingNote)) > 200 {
+		writeLlmError(w, http.StatusBadRequest, "billing_note must be at most 200 characters")
+		return false
+	}
+	return true
 }
 
 func (f *fakeLlmGatewayServer) handleProviders(w http.ResponseWriter, r *http.Request) {
@@ -345,15 +470,61 @@ func (f *fakeLlmGatewayServer) handleProviders(w http.ResponseWriter, r *http.Re
 	}
 }
 
+// fakeLlmRequestScopedAuth are the auth types that store no upstream secret
+// (production's REQUEST_SCOPED_AUTH_TYPES): the only ones a provider may use
+// without a connection.
+var fakeLlmRequestScopedAuth = []string{"claude_oauth", "codex_oauth"}
+
+// fakeLlmVersionedBaseFamilies mirrors forwards_gateway_version_prefix.
+var fakeLlmVersionedBaseFamilies = []string{
+	"openai", "anthropic", "groq", "together", "mistral", "cohere", "xai",
+	"fireworks", "perplexity", "openrouter", "deepseek", "typesafe", "custom",
+}
+
+// validLlmBaseURL mirrors validate_base_url's /v1 rule, applied only to a
+// base_url the request supplied.
+func validLlmBaseURL(w http.ResponseWriter, baseURL, modelProvider, authType string) bool {
+	if !slices.Contains(fakeLlmVersionedBaseFamilies, modelProvider) ||
+		(modelProvider == "openai" && authType == "codex_oauth") {
+		return true
+	}
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if corrected, found := strings.CutSuffix(trimmed, "/v1"); found && corrected != "" {
+		writeLlmError(w, http.StatusBadRequest, fmt.Sprintf(
+			"base_url must not end in '/v1': the gateway appends the API version itself. Use '%s' instead", corrected))
+		return false
+	}
+	return true
+}
+
+// fakeLlmMergeSettings mirrors merge_connection_settings: the connection's
+// settings are the base, the provider's overlay them.
+func fakeLlmMergeSettings(connection, provider json.RawMessage) json.RawMessage {
+	merged := map[string]json.RawMessage{}
+	_ = json.Unmarshal(connection, &merged)
+	overlay := map[string]json.RawMessage{}
+	_ = json.Unmarshal(provider, &overlay)
+	for k, v := range overlay {
+		merged[k] = v
+	}
+	out, _ := json.Marshal(merged)
+	return out
+}
+
 func (f *fakeLlmGatewayServer) createProvider(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name               string          `json:"name"`
 		ModelProvider      string          `json:"model_provider"`
 		AuthType           *string         `json:"auth_type"`
 		BaseURL            string          `json:"base_url"`
+		ConnectionID       *string         `json:"connection_id"`
 		APIKey             *string         `json:"api_key"`
+		Credentials        json.RawMessage `json:"credentials"`
 		Settings           json.RawMessage `json:"settings"`
 		EnforceHealthCheck *bool           `json:"enforce_health_check"`
+		BillingMode        *string         `json:"billing_mode"`
+		BillingReason      *string         `json:"billing_reason"`
+		BillingNote        *string         `json:"billing_note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
@@ -367,15 +538,37 @@ func (f *fakeLlmGatewayServer) createProvider(w http.ResponseWriter, r *http.Req
 	if !ok {
 		return
 	}
-	// Production requires a credential for the direct (no-connection) flow of
-	// the API-key auth families.
+
+	// BCP-3647: a provider's secret lives on a connection; only the
+	// request-scoped OAuth passthroughs may arrive without one.
 	authType := fakeLlmDefaultAuthType(body.ModelProvider, body.AuthType)
-	credential := ""
-	if body.APIKey != nil {
-		credential = *body.APIKey
+	storesSecret := !slices.Contains(fakeLlmRequestScopedAuth, authType)
+	if storesSecret && (body.APIKey != nil || len(body.Credentials) > 0) {
+		writeLlmError(w, http.StatusBadRequest, "a provider cannot store its own key: create a credential "+
+			"(POST /admin/connections) and reference it with connection_id")
+		return
 	}
-	if credential == "" && (authType == "bearer_api_key" || authType == "x_api_key" || authType == "azure_api_key") {
-		writeLlmError(w, http.StatusBadRequest, "api_key is required for API-key auth providers")
+	if body.ConnectionID == nil && storesSecret {
+		writeLlmError(w, http.StatusBadRequest,
+			"connection_id is required: create a credential first, then reference it")
+		return
+	}
+	baseURL := body.BaseURL
+	if body.ConnectionID != nil {
+		conn := f.connections[*body.ConnectionID]
+		if conn == nil {
+			writeLlmError(w, http.StatusNotFound, fmt.Sprintf("connection {id: %s} not found", *body.ConnectionID))
+			return
+		}
+		// The connection is the source of truth for auth_type and the
+		// resource settings once bound.
+		authType = conn.AuthType
+		settings = fakeLlmMergeSettings(conn.Settings, settings)
+		if strings.TrimSpace(baseURL) == "" {
+			baseURL = conn.BaseURL
+		}
+	}
+	if body.BaseURL != "" && !validLlmBaseURL(w, body.BaseURL, body.ModelProvider, authType) {
 		return
 	}
 
@@ -384,16 +577,27 @@ func (f *fakeLlmGatewayServer) createProvider(w http.ResponseWriter, r *http.Req
 		enforce = *body.EnforceHealthCheck
 	}
 
+	billingMode := "per_token" // never inferred server-side
+	if body.BillingMode != nil {
+		billingMode = *body.BillingMode
+	}
+
 	p := &fakeLlmProvider{
 		ID:                 f.newID("aaaa"),
 		Name:               body.Name,
 		ModelProvider:      body.ModelProvider,
 		AuthType:           authType,
-		BaseURL:            body.BaseURL,
+		BaseURL:            baseURL,
+		ConnectionID:       body.ConnectionID,
 		Settings:           settings,
 		Enabled:            true, // create has no enabled field
 		EnforceHealthCheck: enforce,
-		Credential:         credential,
+		BillingMode:        billingMode,
+		BillingReason:      body.BillingReason,
+		BillingNote:        fakeLlmBillingNote(body.BillingNote),
+	}
+	if !validLlmBilling(w, p) {
+		return
 	}
 	f.providers = append(f.providers, p)
 	_ = json.NewEncoder(w).Encode(providerJSON(p))
@@ -411,9 +615,15 @@ func (f *fakeLlmGatewayServer) updateProvider(w http.ResponseWriter, r *http.Req
 		BaseURL            *string         `json:"base_url"`
 		AuthType           *string         `json:"auth_type"`
 		APIKey             *string         `json:"api_key"`
+		Credentials        json.RawMessage `json:"credentials"`
 		Enabled            *bool           `json:"enabled"`
 		Settings           json.RawMessage `json:"settings"`
 		EnforceHealthCheck *bool           `json:"enforce_health_check"`
+		BillingMode        *string         `json:"billing_mode"`
+		// Tri-state keys: absent keeps, null clears, a value sets.
+		ConnectionID  json.RawMessage `json:"connection_id"`
+		BillingReason json.RawMessage `json:"billing_reason"`
+		BillingNote   json.RawMessage `json:"billing_note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
@@ -424,14 +634,48 @@ func (f *fakeLlmGatewayServer) updateProvider(w http.ResponseWriter, r *http.Req
 	if body.Name != nil {
 		updated.Name = *body.Name
 	}
-	if body.BaseURL != nil {
-		updated.BaseURL = *body.BaseURL
-	}
 	if body.AuthType != nil {
 		updated.AuthType = *body.AuthType
 	}
-	if body.APIKey != nil {
-		updated.Credential = *body.APIKey
+	if body.APIKey != nil || len(body.Credentials) > 0 {
+		if !slices.Contains(fakeLlmRequestScopedAuth, updated.AuthType) {
+			writeLlmError(w, http.StatusBadRequest, "a provider cannot store its own key: create a credential "+
+				"(POST /admin/connections) and reference it with connection_id")
+			return
+		}
+	}
+	if body.ConnectionID != nil {
+		var connID *string
+		_ = json.Unmarshal(body.ConnectionID, &connID)
+		if connID == nil {
+			if p.ConnectionID != nil && !slices.Contains(fakeLlmRequestScopedAuth, updated.AuthType) {
+				writeLlmError(w, http.StatusBadRequest, "a provider cannot be detached from its credential: "+
+					"pick a different credential, or delete the provider")
+				return
+			}
+			updated.ConnectionID = nil
+		} else {
+			conn := f.connections[*connID]
+			if conn == nil {
+				writeLlmError(w, http.StatusNotFound, fmt.Sprintf("connection {id: %s} not found", *connID))
+				return
+			}
+			updated.ConnectionID = connID
+			updated.AuthType = conn.AuthType
+			// The credential's settings are the base on a (re)bind; the
+			// provider's own keys overlay them.
+			overlay := body.Settings
+			if len(overlay) == 0 || string(overlay) == "null" {
+				overlay = p.Settings
+			}
+			updated.Settings = fakeLlmMergeSettings(conn.Settings, overlay)
+		}
+	}
+	if body.BaseURL != nil {
+		if !validLlmBaseURL(w, *body.BaseURL, updated.ModelProvider, updated.AuthType) {
+			return
+		}
+		updated.BaseURL = *body.BaseURL
 	}
 	if body.Enabled != nil {
 		updated.Enabled = *body.Enabled
@@ -441,10 +685,28 @@ func (f *fakeLlmGatewayServer) updateProvider(w http.ResponseWriter, r *http.Req
 		if !ok {
 			return
 		}
+		if updated.ConnectionID != nil {
+			settings = fakeLlmMergeSettings(f.connections[*updated.ConnectionID].Settings, settings)
+		}
 		updated.Settings = settings
 	}
 	if body.EnforceHealthCheck != nil {
 		updated.EnforceHealthCheck = *body.EnforceHealthCheck
+	}
+	if body.BillingMode != nil {
+		updated.BillingMode = *body.BillingMode
+	}
+	if body.BillingReason != nil {
+		updated.BillingReason = nil
+		_ = json.Unmarshal(body.BillingReason, &updated.BillingReason)
+	}
+	if body.BillingNote != nil {
+		var note *string
+		_ = json.Unmarshal(body.BillingNote, &note)
+		updated.BillingNote = fakeLlmBillingNote(note)
+	}
+	if !validLlmBilling(w, &updated) {
+		return
 	}
 
 	*p = updated
@@ -452,35 +714,300 @@ func (f *fakeLlmGatewayServer) updateProvider(w http.ResponseWriter, r *http.Req
 }
 
 // seedProvider plants an openai provider out-of-band, as if created in the
-// app.
+// app, bound to a seeded connection.
 func (f *fakeLlmGatewayServer) seedProvider() *fakeLlmProvider {
+	conn := f.seedConnection("openai")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p := &fakeLlmProvider{
 		ID:                 f.newID("aaaa"),
 		Name:               "Seeded openai",
 		ModelProvider:      "openai",
-		AuthType:           fakeLlmDefaultAuthType("openai", nil),
-		BaseURL:            "https://upstream.example.com/v1",
+		AuthType:           conn.AuthType,
+		BaseURL:            conn.BaseURL,
+		ConnectionID:       &conn.ID,
 		Settings:           json.RawMessage("{}"),
 		Enabled:            true,
 		EnforceHealthCheck: true,
-		Credential:         "seeded-key",
+		BillingMode:        "per_token",
 	}
 	f.providers = append(f.providers, p)
 	return p
 }
 
-// providerCredential reads the stored (never-echoed) credential.
-func (f *fakeLlmGatewayServer) providerCredential(t *testing.T, id string) string {
+// --- connections ----------------------------------------------------------------
+
+type fakeLlmConnection struct {
+	ID            string
+	Name          string
+	ModelProvider string
+	AuthType      string
+	BaseURL       string
+	Settings      json.RawMessage
+	// Secret is the last api_key / credentials written. Stored to let tests
+	// assert the write-only round trip; never rendered into a response.
+	Secret string
+}
+
+func connectionJSON(c *fakeLlmConnection) map[string]any {
+	out := map[string]any{
+		"id":                  c.ID,
+		"org_id":              fakeLlmOrgID,
+		"name":                c.Name,
+		"model_provider":      c.ModelProvider,
+		"auth_type":           c.AuthType,
+		"base_url":            c.BaseURL,
+		"secret_path":         fmt.Sprintf("orgs/%s/connections/%s", fakeLlmOrgID, c.ID),
+		"settings":            c.Settings,
+		"key_last4":           nil,
+		"stores_key_material": fakeLlmStoresKeyMaterial(c.AuthType),
+		"created_at":          fakeLlmTime,
+		"updated_at":          fakeLlmTime,
+	}
+	if out["stores_key_material"] == true && len(c.Secret) >= 4 {
+		out["key_last4"] = c.Secret[len(c.Secret)-4:]
+	}
+	return out
+}
+
+// fakeLlmStoresKeyMaterial: the ambient-identity auth types hold no secret.
+func fakeLlmStoresKeyMaterial(authType string) bool {
+	return !slices.Contains([]string{
+		"aws_role", "google_adc", "google_service_account_impersonation", "claude_oauth", "codex_oauth",
+	}, authType)
+}
+
+// fakeLlmConnectionSecret mirrors the api-key arm of normalize_credentials:
+// API-key auth types need api_key or credentials; ambient ones need nothing.
+func fakeLlmConnectionSecret(w http.ResponseWriter, authType string, apiKey *string, credentials json.RawMessage) (string, bool) {
+	if len(credentials) > 0 && string(credentials) != "null" {
+		var obj map[string]any
+		if json.Unmarshal(credentials, &obj) != nil {
+			writeLlmError(w, http.StatusBadRequest, "credentials must be a JSON object")
+			return "", false
+		}
+		return string(credentials), true
+	}
+	if apiKey != nil && *apiKey != "" {
+		return *apiKey, true
+	}
+	if !fakeLlmStoresKeyMaterial(authType) {
+		return "", true
+	}
+	writeLlmError(w, http.StatusBadRequest, "api_key or credentials.key is required for API-key providers")
+	return "", false
+}
+
+// fakeLlmNormalizeConnectionSettings mirrors the Bedrock arm of
+// normalize_settings: it validates required keys and adds derived ones
+// (a generated external_id for aws_role, a defaulted model_api_family).
+func (f *fakeLlmGatewayServer) fakeLlmNormalizeConnectionSettings(w http.ResponseWriter, modelProvider, authType string, raw json.RawMessage) (json.RawMessage, bool) {
+	settings, ok := validLlmSettings(w, raw)
+	if !ok {
+		return nil, false
+	}
+	if modelProvider != "bedrock" {
+		return settings, true
+	}
+	obj := map[string]any{}
+	_ = json.Unmarshal(settings, &obj)
+	if s, _ := obj["region"].(string); s == "" {
+		writeLlmError(w, http.StatusBadRequest, "settings.region is required for Bedrock providers")
+		return nil, false
+	}
+	if authType == "aws_role" {
+		if s, _ := obj["iam_role_arn"].(string); s == "" {
+			writeLlmError(w, http.StatusBadRequest, "settings.iam_role_arn is required for aws_role Bedrock providers")
+			return nil, false
+		}
+		if _, ok := obj["external_id"]; !ok {
+			obj["external_id"] = f.newID("ffff")
+		}
+	}
+	if _, ok := obj["model_api_family"]; !ok {
+		obj["model_api_family"] = "bedrock_converse"
+	}
+	out, _ := json.Marshal(obj)
+	return out, true
+}
+
+func (f *fakeLlmGatewayServer) handleConnections(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	id := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/api/llm-gateway/admin/connections"), "/")
+	conn := f.connections[id]
+
+	switch {
+	case id == "" && r.Method == http.MethodPost:
+		f.createConnection(w, r)
+	case id == "" && r.Method == http.MethodGet:
+		items := make([]map[string]any, 0, len(f.connections))
+		for _, c := range f.connections {
+			items = append(items, connectionJSON(c))
+		}
+		_ = json.NewEncoder(w).Encode(items)
+	case conn == nil:
+		writeLlmError(w, http.StatusNotFound, fmt.Sprintf("connection {id: %s} not found", id))
+	case r.Method == http.MethodGet:
+		_ = json.NewEncoder(w).Encode(connectionJSON(conn))
+	case r.Method == http.MethodPut:
+		f.updateConnection(w, r, conn)
+	case r.Method == http.MethodDelete:
+		// BCP-3655: refuse while providers still read their key from it.
+		var users []string
+		for _, p := range f.providers {
+			if p.ConnectionID != nil && *p.ConnectionID == id {
+				users = append(users, p.Name)
+			}
+		}
+		if len(users) > 0 {
+			writeLlmError(w, http.StatusConflict, fmt.Sprintf(
+				"these credentials are in use by %d provider(s): %s", len(users), strings.Join(users, ", ")))
+			return
+		}
+		delete(f.connections, id)
+		_ = json.NewEncoder(w).Encode(map[string]any{"deleted": true})
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (f *fakeLlmGatewayServer) createConnection(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name          string          `json:"name"`
+		ModelProvider string          `json:"model_provider"`
+		AuthType      *string         `json:"auth_type"`
+		BaseURL       string          `json:"base_url"`
+		APIKey        *string         `json:"api_key"`
+		Credentials   json.RawMessage `json:"credentials"`
+		Settings      json.RawMessage `json:"settings"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeLlmError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !slices.Contains(fakeLlmModelProviders, body.ModelProvider) {
+		writeLlmError(w, http.StatusBadRequest, "unknown model provider: "+body.ModelProvider)
+		return
+	}
+	authType := fakeLlmDefaultAuthType(body.ModelProvider, body.AuthType)
+	if !validLlmBaseURL(w, body.BaseURL, body.ModelProvider, authType) {
+		return
+	}
+	settings, ok := f.fakeLlmNormalizeConnectionSettings(w, body.ModelProvider, authType, body.Settings)
+	if !ok {
+		return
+	}
+	secret, ok := fakeLlmConnectionSecret(w, authType, body.APIKey, body.Credentials)
+	if !ok {
+		return
+	}
+	c := &fakeLlmConnection{
+		ID:            f.newID("cccc"),
+		Name:          body.Name,
+		ModelProvider: body.ModelProvider,
+		AuthType:      authType,
+		BaseURL:       body.BaseURL,
+		Settings:      settings,
+		Secret:        secret,
+	}
+	f.connections[c.ID] = c
+	_ = json.NewEncoder(w).Encode(connectionJSON(c))
+}
+
+// updateConnection applies COALESCE semantics, and like production moves
+// every provider that was following the old endpoint.
+func (f *fakeLlmGatewayServer) updateConnection(w http.ResponseWriter, r *http.Request, c *fakeLlmConnection) {
+	var body struct {
+		Name        *string         `json:"name"`
+		BaseURL     *string         `json:"base_url"`
+		AuthType    *string         `json:"auth_type"`
+		APIKey      *string         `json:"api_key"`
+		Credentials json.RawMessage `json:"credentials"`
+		Settings    json.RawMessage `json:"settings"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeLlmError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updated := *c
+	if body.Name != nil {
+		updated.Name = *body.Name
+	}
+	if body.AuthType != nil {
+		updated.AuthType = *body.AuthType
+	}
+	if body.BaseURL != nil {
+		if !validLlmBaseURL(w, *body.BaseURL, c.ModelProvider, updated.AuthType) {
+			return
+		}
+		updated.BaseURL = *body.BaseURL
+	}
+	if len(body.Settings) > 0 && string(body.Settings) != "null" {
+		// Stored derived keys survive a re-save that omits them.
+		merged := fakeLlmMergeSettings(c.Settings, body.Settings)
+		settings, ok := f.fakeLlmNormalizeConnectionSettings(w, c.ModelProvider, updated.AuthType, merged)
+		if !ok {
+			return
+		}
+		updated.Settings = settings
+	}
+	if body.APIKey != nil || len(body.Credentials) > 0 {
+		secret, ok := fakeLlmConnectionSecret(w, updated.AuthType, body.APIKey, body.Credentials)
+		if !ok {
+			return
+		}
+		updated.Secret = secret
+	}
+	for _, p := range f.providers {
+		if p.ConnectionID != nil && *p.ConnectionID == c.ID && p.BaseURL == c.BaseURL {
+			p.BaseURL = updated.BaseURL
+		}
+	}
+	*c = updated
+	_ = json.NewEncoder(w).Encode(connectionJSON(c))
+}
+
+// seedConnection plants an API-key connection out-of-band.
+func (f *fakeLlmGatewayServer) seedConnection(modelProvider string) *fakeLlmConnection {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c := &fakeLlmConnection{
+		ID:            f.newID("cccc"),
+		Name:          "Seeded " + modelProvider + " key",
+		ModelProvider: modelProvider,
+		AuthType:      fakeLlmDefaultAuthType(modelProvider, nil),
+		BaseURL:       "https://upstream.example.com",
+		Settings:      json.RawMessage("{}"),
+		Secret:        "seeded-key",
+	}
+	f.connections[c.ID] = c
+	return c
+}
+
+// connectionSecret reads a connection's stored (never-echoed) secret.
+func (f *fakeLlmGatewayServer) connectionSecret(t *testing.T, id string) string {
 	t.Helper()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	p := f.findProvider(id)
-	if p == nil {
-		t.Fatalf("fake has no provider %q", id)
+	c := f.connections[id]
+	if c == nil {
+		t.Fatalf("fake has no connection %q", id)
 	}
-	return p.Credential
+	return c.Secret
+}
+
+// checkAllLlmConnectionsDeleted is the CheckDestroy for connection tests.
+func checkAllLlmConnectionsDeleted(fake *fakeLlmGatewayServer) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		for _, c := range fake.connections {
+			return fmt.Errorf("LLM connection %s (%s) was not deleted on destroy", c.ID, c.Name)
+		}
+		return nil
+	}
 }
 
 // markProviderDeleted removes a stored provider out-of-band.
@@ -534,6 +1061,8 @@ func mappingJSON(f *fakeLlmGatewayServer, m *fakeLlmModelMapping, withProvider b
 		"stream_idle_timeout_secs":   m.StreamIdleTimeoutSecs,
 		"request_timeout_secs":       m.RequestTimeoutSecs,
 	}
+	raw, _ := json.Marshal(m.Cooldown)
+	_ = json.Unmarshal(raw, &out)
 	if withProvider {
 		// The org-wide listing wraps rows with provider annotations the
 		// provider must ignore.
@@ -587,8 +1116,8 @@ func validLlmMappingRanges(w http.ResponseWriter, retryCount, retryMaxWait int64
 		writeLlmError(w, http.StatusBadRequest, "retry_on_429_max_wait_secs must be between 0 and 180")
 		return false
 	}
-	if streamIdle != nil && (*streamIdle < 1 || *streamIdle > 120) {
-		writeLlmError(w, http.StatusBadRequest, "stream_idle_timeout_secs must be between 1 and 120")
+	if streamIdle != nil && (*streamIdle < 1 || *streamIdle > 300) {
+		writeLlmError(w, http.StatusBadRequest, "stream_idle_timeout_secs must be between 1 and 300")
 		return false
 	}
 	if requestTimeout != nil && (*requestTimeout < 1 || *requestTimeout > 600) {
@@ -610,6 +1139,7 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 		BareAlias             *bool  `json:"bare_alias"`
 		StreamIdleTimeoutSecs *int64 `json:"stream_idle_timeout_secs"`
 		RequestTimeoutSecs    *int64 `json:"request_timeout_secs"`
+		fakeLlmCooldownPatch
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
@@ -658,6 +1188,13 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 	// PATCH-or-create for 1:1 rows: a second POST folds into the existing
 	// anchor instead of duplicating.
 	if alias1to1 && anchor != nil {
+		// Upsert-only for the cooldown policy: omitted keys keep the stored
+		// value rather than resetting it.
+		cooldown := anchor.Cooldown.apply(body.fakeLlmCooldownPatch)
+		if !validLlmCooldown(w, cooldown) {
+			return
+		}
+		anchor.Cooldown = cooldown
 		anchor.Enabled = enabled
 		anchor.Priority = body.Priority
 		anchor.RetryOn429Count = body.RetryOn429Count
@@ -682,6 +1219,10 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 	if body.RequestTimeoutSecs != nil {
 		requestTimeout = *body.RequestTimeoutSecs
 	}
+	cooldown := fakeLlmCooldownDefaults.apply(body.fakeLlmCooldownPatch)
+	if !validLlmCooldown(w, cooldown) {
+		return
+	}
 
 	m := &fakeLlmModelMapping{
 		ID:                    f.newID("bbbb"),
@@ -695,6 +1236,7 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 		BareAlias:             bareAlias,
 		StreamIdleTimeoutSecs: streamIdle,
 		RequestTimeoutSecs:    requestTimeout,
+		Cooldown:              cooldown,
 	}
 	f.mappings = append(f.mappings, m)
 	_ = json.NewEncoder(w).Encode(mappingJSON(f, m, false))
@@ -717,6 +1259,7 @@ func (f *fakeLlmGatewayServer) updateModelMapping(w http.ResponseWriter, r *http
 		BareAlias             *bool   `json:"bare_alias"`
 		StreamIdleTimeoutSecs *int64  `json:"stream_idle_timeout_secs"`
 		RequestTimeoutSecs    *int64  `json:"request_timeout_secs"`
+		fakeLlmCooldownPatch
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
@@ -755,6 +1298,10 @@ func (f *fakeLlmGatewayServer) updateModelMapping(w http.ResponseWriter, r *http
 	retryMaxWait := updated.RetryOn429MaxWaitSecs
 	if !validLlmMappingRanges(w, retryCount, retryMaxWait,
 		&updated.StreamIdleTimeoutSecs, &updated.RequestTimeoutSecs) {
+		return
+	}
+	updated.Cooldown = updated.Cooldown.apply(body.fakeLlmCooldownPatch)
+	if !validLlmCooldown(w, updated.Cooldown) {
 		return
 	}
 
@@ -1068,20 +1615,22 @@ func rateLimitJSON(p *fakeLlmRateLimit) map[string]any {
 		"scope_value":         p.ScopeValue,
 		"requests_per_minute": p.RequestsPerMinute,
 		"tokens_per_minute":   p.TokensPerMinute,
+		"member_of_group":     p.MemberOfGroup,
 		"traffic_type":        p.TrafficType,
 		"enabled":             p.Enabled,
 	}
 }
 
 // rateLimitScopeTaken mirrors the rate_limit_policies_scope_unique_idx
-// (org, scope_type, scope_id, scope_value, traffic_type).
-func (f *fakeLlmGatewayServer) rateLimitScopeTaken(scopeType string, scopeID, scopeValue *string, trafficType, excludeID string) bool {
+// (org, scope_type, scope_id, scope_value, traffic_type, member_of_group — V66).
+func (f *fakeLlmGatewayServer) rateLimitScopeTaken(scopeType string, scopeID, scopeValue *string, trafficType string, memberOfGroup *string, excludeID string) bool {
 	for _, p := range f.rateLimits {
 		if p.ID == excludeID {
 			continue
 		}
 		if p.ScopeType == scopeType && strPtrEq(p.ScopeID, scopeID) &&
-			strPtrEq(p.ScopeValue, scopeValue) && p.TrafficType == trafficType {
+			strPtrEq(p.ScopeValue, scopeValue) && p.TrafficType == trafficType &&
+			strPtrEq(p.MemberOfGroup, memberOfGroup) {
 			return true
 		}
 	}
@@ -1097,6 +1646,29 @@ func strPtrEq(a, b *string) bool {
 		bv = *b
 	}
 	return av == bv
+}
+
+// fakeMemberOfGroupShape mirrors production's normalize_member_of_group (trim,
+// blank means absent) and validate_member_of_group_shape (the filter is only
+// valid on a broad user-scoped rule). It writes the 400 and returns false on a
+// rejected shape.
+func fakeMemberOfGroupShape(w http.ResponseWriter, raw *string, scopeType string, scopeID, scopeValue *string) (*string, bool) {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return nil, true
+	}
+	group := strings.TrimSpace(*raw)
+	switch {
+	case scopeType != "user":
+		writeLlmError(w, http.StatusBadRequest, "member_of_group requires scope_type=user")
+		return nil, false
+	case scopeID != nil:
+		writeLlmError(w, http.StatusBadRequest, "member_of_group cannot be combined with scope_id")
+		return nil, false
+	case scopeValue != nil:
+		writeLlmError(w, http.StatusBadRequest, "member_of_group cannot be combined with scope_value")
+		return nil, false
+	}
+	return &group, true
 }
 
 func (f *fakeLlmGatewayServer) handleRateLimits(w http.ResponseWriter, r *http.Request) {
@@ -1138,6 +1710,7 @@ func (f *fakeLlmGatewayServer) createRateLimit(w http.ResponseWriter, r *http.Re
 		ScopeValue        *string `json:"scope_value"`
 		RequestsPerMinute *int64  `json:"requests_per_minute"`
 		TokensPerMinute   *int64  `json:"tokens_per_minute"`
+		MemberOfGroup     *string `json:"member_of_group"`
 		TrafficType       *string `json:"traffic_type"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -1149,12 +1722,16 @@ func (f *fakeLlmGatewayServer) createRateLimit(w http.ResponseWriter, r *http.Re
 			"at least one of requests_per_minute or tokens_per_minute is required")
 		return
 	}
+	group, ok := fakeMemberOfGroupShape(w, body.MemberOfGroup, body.ScopeType, body.ScopeID, body.ScopeValue)
+	if !ok {
+		return
+	}
 
 	trafficType := "all"
 	if body.TrafficType != nil {
 		trafficType = *body.TrafficType
 	}
-	if f.rateLimitScopeTaken(body.ScopeType, body.ScopeID, body.ScopeValue, trafficType, "") {
+	if f.rateLimitScopeTaken(body.ScopeType, body.ScopeID, body.ScopeValue, trafficType, group, "") {
 		writeLlmError(w, http.StatusConflict,
 			"A policy with this scope and traffic type already exists.")
 		return
@@ -1168,6 +1745,7 @@ func (f *fakeLlmGatewayServer) createRateLimit(w http.ResponseWriter, r *http.Re
 		ScopeValue:        body.ScopeValue,
 		RequestsPerMinute: body.RequestsPerMinute,
 		TokensPerMinute:   body.TokensPerMinute,
+		MemberOfGroup:     group,
 		TrafficType:       trafficType,
 		Enabled:           true, // create has no enabled field
 	}
@@ -1177,7 +1755,9 @@ func (f *fakeLlmGatewayServer) createRateLimit(w http.ResponseWriter, r *http.Re
 
 // updateRateLimit applies production's tri-state PATCH semantics on the two
 // metrics: an absent key keeps the current value, an explicit null clears it,
-// and a number sets it. Everything else is COALESCE.
+// and a number sets it. Everything else is COALESCE. member_of_group is not
+// part of the update contract (production drops the key), and a scope change
+// on a filtered policy is rejected (BCP-3896).
 func (f *fakeLlmGatewayServer) updateRateLimit(w http.ResponseWriter, r *http.Request, id string) {
 	p := f.findRateLimit(id)
 	if p == nil {
@@ -1238,7 +1818,15 @@ func (f *fakeLlmGatewayServer) updateRateLimit(w http.ResponseWriter, r *http.Re
 			"at least one of requests_per_minute or tokens_per_minute must be set")
 		return
 	}
-	if f.rateLimitScopeTaken(updated.ScopeType, updated.ScopeID, updated.ScopeValue, updated.TrafficType, p.ID) {
+	if updated.MemberOfGroup != nil &&
+		(updated.ScopeType != "user" || updated.ScopeID != nil || updated.ScopeValue != nil) {
+		writeLlmError(w, http.StatusBadRequest,
+			"this rate limit policy gives each member of '"+*updated.MemberOfGroup+
+				"' their own allowance, so its scope cannot be changed")
+		return
+	}
+	if f.rateLimitScopeTaken(updated.ScopeType, updated.ScopeID, updated.ScopeValue, updated.TrafficType,
+		updated.MemberOfGroup, p.ID) {
 		writeLlmError(w, http.StatusConflict,
 			"A policy with this scope and traffic type already exists.")
 		return
@@ -1297,6 +1885,7 @@ func budgetJSON(b *fakeLlmTokenBudget) map[string]any {
 		"scope_type":            b.ScopeType,
 		"scope_id":              b.ScopeID,
 		"scope_value":           b.ScopeValue,
+		"member_of_group":       b.MemberOfGroup,
 		"period":                b.Period,
 		"token_limit":           b.TokenLimit,
 		"alert_thresholds":      thresholds,
@@ -1313,14 +1902,16 @@ func budgetJSON(b *fakeLlmTokenBudget) map[string]any {
 }
 
 // budgetScopeTaken mirrors the token_budgets_scope_unique_idx
-// (org, scope_type, scope_id, scope_value, traffic_type, period).
-func (f *fakeLlmGatewayServer) budgetScopeTaken(scopeType string, scopeID, scopeValue *string, trafficType, period, excludeID string) bool {
+// (org, scope_type, scope_id, scope_value, traffic_type, period,
+// member_of_group — V65).
+func (f *fakeLlmGatewayServer) budgetScopeTaken(scopeType string, scopeID, scopeValue *string, trafficType, period string, memberOfGroup *string, excludeID string) bool {
 	for _, b := range f.budgets {
 		if b.ID == excludeID {
 			continue
 		}
 		if b.ScopeType == scopeType && strPtrEq(b.ScopeID, scopeID) &&
-			strPtrEq(b.ScopeValue, scopeValue) && b.TrafficType == trafficType && b.Period == period {
+			strPtrEq(b.ScopeValue, scopeValue) && b.TrafficType == trafficType && b.Period == period &&
+			strPtrEq(b.MemberOfGroup, memberOfGroup) {
 			return true
 		}
 	}
@@ -1364,6 +1955,7 @@ func (f *fakeLlmGatewayServer) createBudget(w http.ResponseWriter, r *http.Reque
 		ScopeType       string  `json:"scope_type"`
 		ScopeID         *string `json:"scope_id"`
 		ScopeValue      *string `json:"scope_value"`
+		MemberOfGroup   *string `json:"member_of_group"`
 		Period          string  `json:"period"`
 		TokenLimit      int64   `json:"token_limit"`
 		AlertThresholds []int64 `json:"alert_thresholds"`
@@ -1387,6 +1979,10 @@ func (f *fakeLlmGatewayServer) createBudget(w http.ResponseWriter, r *http.Reque
 		writeLlmError(w, http.StatusBadRequest, "invalid period: "+body.Period)
 		return
 	}
+	group, ok := fakeMemberOfGroupShape(w, body.MemberOfGroup, body.ScopeType, body.ScopeID, body.ScopeValue)
+	if !ok {
+		return
+	}
 
 	thresholds := body.AlertThresholds
 	if thresholds == nil {
@@ -1401,7 +1997,7 @@ func (f *fakeLlmGatewayServer) createBudget(w http.ResponseWriter, r *http.Reque
 		trafficType = *body.TrafficType
 	}
 
-	if f.budgetScopeTaken(body.ScopeType, body.ScopeID, body.ScopeValue, trafficType, body.Period, "") {
+	if f.budgetScopeTaken(body.ScopeType, body.ScopeID, body.ScopeValue, trafficType, body.Period, group, "") {
 		writeLlmError(w, http.StatusConflict,
 			"A budget with this scope, target, traffic type, and period already exists. "+
 				"Edit the existing one, or vary the scope, target, traffic type, or period.")
@@ -1414,6 +2010,7 @@ func (f *fakeLlmGatewayServer) createBudget(w http.ResponseWriter, r *http.Reque
 		ScopeType:       body.ScopeType,
 		ScopeID:         body.ScopeID,
 		ScopeValue:      body.ScopeValue,
+		MemberOfGroup:   group,
 		Period:          body.Period,
 		TokenLimit:      body.TokenLimit,
 		AlertThresholds: thresholds,
@@ -1473,7 +2070,7 @@ func (f *fakeLlmGatewayServer) updateBudget(w http.ResponseWriter, r *http.Reque
 	}
 
 	if f.budgetScopeTaken(updated.ScopeType, updated.ScopeID, updated.ScopeValue,
-		updated.TrafficType, updated.Period, b.ID) {
+		updated.TrafficType, updated.Period, updated.MemberOfGroup, b.ID) {
 		writeLlmError(w, http.StatusConflict,
 			"A budget with this scope, target, traffic type, and period already exists. "+
 				"Edit the existing one, or vary the scope, target, traffic type, or period.")
@@ -1527,11 +2124,7 @@ func (f *fakeLlmGatewayServer) handleGovernanceConfig(w http.ResponseWriter, r *
 
 	switch r.Method {
 	case http.MethodGet:
-		val := false
-		if f.governance != nil {
-			val = *f.governance
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"require_pricing_for_mappings": val})
+		_ = json.NewEncoder(w).Encode(f.governanceJSON())
 	case http.MethodPut:
 		var raw map[string]json.RawMessage
 		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
@@ -1546,10 +2139,45 @@ func (f *fakeLlmGatewayServer) handleGovernanceConfig(w http.ResponseWriter, r *
 				"missing field `require_pricing_for_mappings`", http.StatusUnprocessableEntity)
 			return
 		}
+		// The later fields are #[serde(default)]: an omitted key takes the
+		// default rather than keeping the stored value, and the row is
+		// upserted whole.
+		posture, routing := "allow", false
+		if v, ok := raw["default_model_access"]; ok {
+			_ = json.Unmarshal(v, &posture)
+		}
+		if v, ok := raw["require_routing_policy"]; ok {
+			_ = json.Unmarshal(v, &routing)
+		}
+		if !slices.Contains([]string{"allow", "deny"}, posture) {
+			http.Error(w, "Failed to deserialize the JSON body into the target type: "+
+				"default_model_access: unknown variant `"+posture+"`", http.StatusUnprocessableEntity)
+			return
+		}
 		f.governance = &val
-		_ = json.NewEncoder(w).Encode(map[string]any{"require_pricing_for_mappings": val})
+		f.defaultModelAccess = posture
+		f.requireRoutingPolicy = routing
+		_ = json.NewEncoder(w).Encode(f.governanceJSON())
 	default:
 		http.NotFound(w, r)
+	}
+}
+
+// governanceJSON renders the stored row, or the column defaults when none
+// exists. Callers hold f.mu.
+func (f *fakeLlmGatewayServer) governanceJSON() map[string]any {
+	pricing := false
+	if f.governance != nil {
+		pricing = *f.governance
+	}
+	posture := f.defaultModelAccess
+	if posture == "" {
+		posture = "allow"
+	}
+	return map[string]any{
+		"require_pricing_for_mappings": pricing,
+		"default_model_access":         posture,
+		"require_routing_policy":       f.requireRoutingPolicy,
 	}
 }
 

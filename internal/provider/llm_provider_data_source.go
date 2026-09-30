@@ -50,10 +50,14 @@ type llmProviderDataSourceModel struct {
 	Name               types.String         `tfsdk:"name"`
 	ModelProvider      types.String         `tfsdk:"model_provider"`
 	BaseURL            types.String         `tfsdk:"base_url"`
+	ConnectionID       types.String         `tfsdk:"connection_id"`
 	AuthType           types.String         `tfsdk:"auth_type"`
 	Settings           jsontypes.Normalized `tfsdk:"settings"`
 	Enabled            types.Bool           `tfsdk:"enabled"`
 	EnforceHealthCheck types.Bool           `tfsdk:"enforce_health_check"`
+	BillingMode        types.String         `tfsdk:"billing_mode"`
+	BillingReason      types.String         `tfsdk:"billing_reason"`
+	BillingNote        types.String         `tfsdk:"billing_note"`
 	HealthStatus       types.String         `tfsdk:"health_status"`
 	HealthDetail       types.String         `tfsdk:"health_detail"`
 	HealthCheckedAt    types.String         `tfsdk:"health_checked_at"`
@@ -91,14 +95,19 @@ func (d *llmProviderDataSource) Schema(_ context.Context, _ datasource.SchemaReq
 			},
 			"model_provider": schema.StringAttribute{
 				MarkdownDescription: "Upstream model-provider family, deciding the wire protocol the " +
-					"gateway speaks: `openai`, `anthropic`, `azure_openai`, `google_ai`, `bedrock`, " +
-					"`vertex`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, " +
-					"`perplexity`, `openrouter`, `deepseek`, or `custom`.",
+					"gateway speaks: `openai`, `anthropic`, `azure_openai`, `azure_foundry`, `google_ai`, " +
+					"`bedrock`, `vertex`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, " +
+					"`perplexity`, `openrouter`, `deepseek`, `typesafe`, or `custom`.",
 				Computed: true,
 			},
 			"base_url": schema.StringAttribute{
-				MarkdownDescription: "Upstream API base URL, e.g. `https://api.openai.com/v1`.",
+				MarkdownDescription: "Upstream API base URL, e.g. `https://api.openai.com`.",
 				Computed:            true,
+			},
+			"connection_id": schema.StringAttribute{
+				MarkdownDescription: "UUID of the LLM connection the provider reads its upstream secret from; " +
+					"null for a request-scoped OAuth passthrough provider.",
+				Computed: true,
 			},
 			"auth_type": schema.StringAttribute{
 				MarkdownDescription: "How the gateway authenticates upstream (e.g. `bearer_api_key`, " +
@@ -118,6 +127,21 @@ func (d *llmProviderDataSource) Schema(_ context.Context, _ datasource.SchemaReq
 			},
 			"enforce_health_check": schema.BoolAttribute{
 				MarkdownDescription: "Whether routing gates on the connectivity health probe.",
+				Computed:            true,
+			},
+			"billing_mode": schema.StringAttribute{
+				MarkdownDescription: "Whether Barndoor calculates and reports a per-token cost for this " +
+					"provider's traffic: `per_token` or `not_metered` (token usage still counted, token cost " +
+					"recorded as $0).",
+				Computed: true,
+			},
+			"billing_reason": schema.StringAttribute{
+				MarkdownDescription: "How the vendor bills this provider: `subscription`, `local`, " +
+					"`external`, or `other`; null when unset. Always set on a `not_metered` provider.",
+				Computed: true,
+			},
+			"billing_note": schema.StringAttribute{
+				MarkdownDescription: "Free-text context for the billing arrangement; null when unset.",
 				Computed:            true,
 			},
 			"health_status": schema.StringAttribute{
@@ -227,10 +251,14 @@ func (d *llmProviderDataSource) Read(ctx context.Context, req datasource.ReadReq
 		Name:               state.Name,
 		ModelProvider:      state.ModelProvider,
 		BaseURL:            state.BaseURL,
+		ConnectionID:       state.ConnectionID,
 		AuthType:           state.AuthType,
 		Settings:           state.Settings,
 		Enabled:            state.Enabled,
 		EnforceHealthCheck: state.EnforceHealthCheck,
+		BillingMode:        state.BillingMode,
+		BillingReason:      state.BillingReason,
+		BillingNote:        state.BillingNote,
 		HealthStatus:       state.HealthStatus,
 		HealthDetail:       state.HealthDetail,
 		HealthCheckedAt:    state.HealthCheckedAt,

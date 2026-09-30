@@ -419,6 +419,80 @@ func llmReplaceWhenCleared(_ context.Context, req planmodifier.StringRequest, re
 	}
 }
 
+// llmMemberOfGroupAttribute builds the member_of_group attribute shared by
+// the token-budget and rate-limit resources; what names the resource kind
+// ("budget", "rate limit"). Neither update API accepts the field, so it is
+// create-only: a change forces replacement rather than a PUT the platform
+// would silently ignore (reporting success while the next plan shows the same
+// diff).
+func llmMemberOfGroupAttribute(what string) schema.StringAttribute {
+	return schema.StringAttribute{
+		MarkdownDescription: "IdP group name that narrows a broad per-user " + what + " to the members of " +
+			"that group. Each member gets their **own, independent** allowance from this single rule, and a " +
+			"user who joins the group picks it up on their next request with no admin action. This is the " +
+			"opposite of `scope_type = \"group\"` (with the group name in `scope_value`), which is **one " +
+			"allowance pooled** across every member, so the first heavy user can exhaust it for everyone.\n\n" +
+			"Only valid with `scope_type = \"user\"` and neither `scope_id` nor `scope_value` set. Changing " +
+			"it forces a new " + what + " (the API cannot update it).",
+		Optional: true,
+		Validators: []validator.String{
+			noSurroundingWhitespace,
+		},
+		PlanModifiers: []planmodifier.String{
+			stringplanmodifier.RequiresReplace(),
+		},
+	}
+}
+
+// llmMemberOfGroupShapeValidator mirrors the platform's member_of_group shape
+// rule (the V65–V67 CHECKs and `validate_member_of_group_shape`): the filter
+// only means something on a broad per-user rule, whose counter is already
+// keyed per user and which does not name one entity. Checking it at plan time
+// turns an apply-time 400 into a plan error, and — because member_of_group
+// forces replacement — also stops an in-place scope change on a filtered rate
+// limit, which the platform rejects.
+type llmMemberOfGroupShapeValidator struct {
+	what string
+}
+
+func (v llmMemberOfGroupShapeValidator) Description(_ context.Context) string {
+	return "member_of_group requires scope_type = \"user\" with neither scope_id nor scope_value set"
+}
+
+func (v llmMemberOfGroupShapeValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (v llmMemberOfGroupShapeValidator) ValidateResource(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var group, scopeType, scopeID, scopeValue types.String
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("member_of_group"), &group)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("scope_type"), &scopeType)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("scope_id"), &scopeID)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("scope_value"), &scopeValue)...)
+	if resp.Diagnostics.HasError() || group.IsNull() || group.IsUnknown() {
+		return
+	}
+
+	attr := path.Root("member_of_group")
+	if st, ok := knownString(scopeType); ok && st != "user" {
+		resp.Diagnostics.AddAttributeError(attr, "member_of_group requires scope_type = \"user\"",
+			fmt.Sprintf("member_of_group gives each member of the group their own %s, which only works "+
+				"where the counter is keyed per user. For one %s pooled across the group, use "+
+				"scope_type = \"group\" with the group name in scope_value instead.", v.what, v.what))
+	}
+	if _, ok := knownString(scopeID); ok {
+		resp.Diagnostics.AddAttributeError(attr, "member_of_group cannot be combined with scope_id",
+			fmt.Sprintf("A %s with scope_id already names one user. Leave scope_id unset to cover every "+
+				"member of the group.", v.what))
+	}
+	if _, ok := knownString(scopeValue); ok {
+		resp.Diagnostics.AddAttributeError(attr, "member_of_group cannot be combined with scope_value",
+			fmt.Sprintf("A %s with scope_value names one entity, so the platform would treat it as a "+
+				"specific override rather than a per-member rule. Leave scope_value unset to cover every "+
+				"member of the group.", v.what))
+	}
+}
+
 // llmTrafficTypeAttribute builds the traffic_type attribute shared by the
 // governance policy resources; def names the server default.
 func llmTrafficTypeAttribute(defaultValue string, def defaults.String) schema.StringAttribute {
