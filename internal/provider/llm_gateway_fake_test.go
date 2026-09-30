@@ -321,7 +321,7 @@ func writeLlmError(w http.ResponseWriter, status int, message string) {
 var fakeLlmModelProviders = []string{
 	"openai", "anthropic", "azure_openai", "azure_foundry", "google_ai", "bedrock",
 	"vertex", "groq", "together", "mistral", "cohere", "xai", "fireworks",
-	"perplexity", "openrouter", "deepseek", "custom",
+	"perplexity", "openrouter", "deepseek", "typesafe", "custom",
 }
 
 // fakeLlmDefaultAuthType mirrors production's default_auth_type.
@@ -478,7 +478,7 @@ var fakeLlmRequestScopedAuth = []string{"claude_oauth", "codex_oauth"}
 // fakeLlmVersionedBaseFamilies mirrors forwards_gateway_version_prefix.
 var fakeLlmVersionedBaseFamilies = []string{
 	"openai", "anthropic", "groq", "together", "mistral", "cohere", "xai",
-	"fireworks", "perplexity", "openrouter", "deepseek", "custom",
+	"fireworks", "perplexity", "openrouter", "deepseek", "typesafe", "custom",
 }
 
 // validLlmBaseURL mirrors validate_base_url's /v1 rule, applied only to a

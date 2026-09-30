@@ -324,3 +324,44 @@ resource "barndoor_llm_provider" "test" {
 		},
 	})
 }
+
+// TypeSafe (Jev, served on /v1/systemone) is an API-key family whose adapter
+// appends the whole path, so its base stops at the host.
+func TestLlmProviderResource_typesafe(t *testing.T) {
+	fake := setupLlmGatewayTest(t)
+	config := func(baseURL string) string {
+		return fmt.Sprintf(`
+resource "barndoor_llm_connection" "typesafe" {
+  name           = "TypeSafe key"
+  model_provider = "typesafe"
+  base_url       = %q
+  api_key        = "ts-key"
+}
+
+resource "barndoor_llm_provider" "test" {
+  name           = "TypeSafe Jev"
+  model_provider = "typesafe"
+  connection_id  = barndoor_llm_connection.typesafe.id
+}
+`, baseURL)
+	}
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllLlmProvidersDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				Config:      config("https://api.typesafe.ai/v1"),
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`base_url must not end in /v1`),
+			},
+			{
+				Config: config("https://api.typesafe.ai"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(llmBillingResourceName, "model_provider", "typesafe"),
+					resource.TestCheckResourceAttr(llmBillingResourceName, "auth_type", "bearer_api_key"),
+					resource.TestCheckResourceAttr(llmBillingResourceName, "base_url", "https://api.typesafe.ai"),
+				),
+			},
+		},
+	})
+}

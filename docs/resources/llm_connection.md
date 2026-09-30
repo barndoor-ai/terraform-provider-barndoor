@@ -60,7 +60,7 @@ variable "openai_api_key" {
 ### Required
 
 - `base_url` (String) Upstream API base URL, for example `https://api.openai.com` or an Azure resource endpoint. For the OpenAI-compatible families it must **not** end in `/v1`: the gateway appends the version itself.
-- `model_provider` (String) Upstream model-provider family the credential is for: `openai` / `anthropic` / `azure_openai` / `azure_foundry` / `google_ai` / `bedrock` / `vertex` / `groq` / `together` / `mistral` / `cohere` / `xai` / `fireworks` / `perplexity` / `openrouter` / `deepseek` / `custom`. Changing it forces a new connection (the API has no update for it).
+- `model_provider` (String) Upstream model-provider family the credential is for: `openai` / `anthropic` / `azure_openai` / `azure_foundry` / `google_ai` / `bedrock` / `vertex` / `groq` / `together` / `mistral` / `cohere` / `xai` / `fireworks` / `perplexity` / `openrouter` / `deepseek` / `typesafe` / `custom`. Changing it forces a new connection (the API has no update for it).
 - `name` (String) Human-readable display name of the connection.
 
 ### Optional

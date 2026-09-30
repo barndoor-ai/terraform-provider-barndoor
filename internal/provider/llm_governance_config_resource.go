@@ -113,7 +113,9 @@ func (r *llmGovernanceConfigResource) Schema(_ context.Context, _ resource.Schem
 			},
 			"require_routing_policy": schema.BoolAttribute{
 				MarkdownDescription: "Whether callers must address a routing policy rather than naming a " +
-					"model directly. The platform default is `false`. Keeps the stored value when unset.",
+					"model directly on the chat surfaces. `/v1/systemone` (TypeSafe Jev) is exempt, because a " +
+					"routing policy only chooses between chat models. Model access, budgets, rate limits and " +
+					"DLP still apply there. The platform default is `false`. Keeps the stored value when unset.",
 				Optional: true,
 				Computed: true,
 				PlanModifiers: []planmodifier.Bool{

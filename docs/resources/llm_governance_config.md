@@ -38,7 +38,7 @@ resource "barndoor_llm_governance_config" "org" {
 ### Optional
 
 - `default_model_access` (String) What happens to a request for a model that no model-access policy mentions: `allow` (the platform default) or `deny`. Setting `deny` requires at least one enabled allowlist, so switching over cannot lock the organization out; the API rejects it otherwise. Allowlists narrow access and never grant it on their own, so `deny` is what makes them a closed list. Keeps the stored value when unset.
-- `require_routing_policy` (Boolean) Whether callers must address a routing policy rather than naming a model directly. The platform default is `false`. Keeps the stored value when unset.
+- `require_routing_policy` (Boolean) Whether callers must address a routing policy rather than naming a model directly on the chat surfaces. `/v1/systemone` (TypeSafe Jev) is exempt, because a routing policy only chooses between chat models. Model access, budgets, rate limits and DLP still apply there. The platform default is `false`. Keeps the stored value when unset.
 
 ### Read-Only
 

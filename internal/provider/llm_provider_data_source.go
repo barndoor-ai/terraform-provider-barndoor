@@ -97,7 +97,7 @@ func (d *llmProviderDataSource) Schema(_ context.Context, _ datasource.SchemaReq
 				MarkdownDescription: "Upstream model-provider family, deciding the wire protocol the " +
 					"gateway speaks: `openai`, `anthropic`, `azure_openai`, `azure_foundry`, `google_ai`, " +
 					"`bedrock`, `vertex`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, " +
-					"`perplexity`, `openrouter`, `deepseek`, or `custom`.",
+					"`perplexity`, `openrouter`, `deepseek`, `typesafe`, or `custom`.",
 				Computed: true,
 			},
 			"base_url": schema.StringAttribute{

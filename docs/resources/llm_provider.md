@@ -84,7 +84,7 @@ variable "anthropic_api_key" {
 
 ### Required
 
-- `model_provider` (String) Upstream model-provider family, deciding the wire protocol the gateway speaks: `openai`, `anthropic`, `azure_openai`, `azure_foundry`, `google_ai`, `bedrock`, `vertex`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, `perplexity`, `openrouter`, `deepseek`, or `custom`. Changing it forces a new provider (the API has no update for it).
+- `model_provider` (String) Upstream model-provider family, deciding the wire protocol the gateway speaks: `openai`, `anthropic`, `azure_openai`, `azure_foundry`, `google_ai`, `bedrock`, `vertex`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, `perplexity`, `openrouter`, `deepseek`, `typesafe`, or `custom`. Changing it forces a new provider (the API has no update for it).
 - `name` (String) Human-readable display name of the provider.
 
 ### Optional

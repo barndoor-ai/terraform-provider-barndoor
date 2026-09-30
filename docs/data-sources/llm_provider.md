@@ -55,7 +55,7 @@ output "openai_health_status" {
 - `health_checked_at` (String) When the last connectivity probe ran (RFC 3339); null until the first probe.
 - `health_detail` (String) Human-readable reason for the last `unhealthy` probe; null otherwise.
 - `health_status` (String) Observed upstream reachability recorded by the platform's connectivity probes: `unverified`, `healthy`, or `unhealthy`.
-- `model_provider` (String) Upstream model-provider family, deciding the wire protocol the gateway speaks: `openai`, `anthropic`, `azure_openai`, `azure_foundry`, `google_ai`, `bedrock`, `vertex`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, `perplexity`, `openrouter`, `deepseek`, or `custom`.
+- `model_provider` (String) Upstream model-provider family, deciding the wire protocol the gateway speaks: `openai`, `anthropic`, `azure_openai`, `azure_foundry`, `google_ai`, `bedrock`, `vertex`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, `perplexity`, `openrouter`, `deepseek`, `typesafe`, or `custom`.
 - `org_id` (String) Organization the provider belongs to.
 - `settings` (String) Provider-specific settings as a JSON object, e.g. `region` for Bedrock or `api_version` for Azure OpenAI; null when the provider has none.
 - `updated_at` (String) When the provider was last updated (RFC 3339).

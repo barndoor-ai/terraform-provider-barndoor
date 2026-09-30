@@ -130,7 +130,7 @@ func int64FromInt32Ptr(p *int32) types.Int64 {
 // `codex_oauth`.
 var llmVersionedBaseFamilies = []string{
 	"openai", "anthropic", "groq", "together", "mistral", "cohere", "xai",
-	"fireworks", "perplexity", "openrouter", "deepseek", "custom",
+	"fireworks", "perplexity", "openrouter", "deepseek", "typesafe", "custom",
 }
 
 // llmRedundantVersionSuffix mirrors the platform's `redundant_version_suffix`:

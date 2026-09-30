@@ -30,7 +30,7 @@ import (
 var llmModelProviders = []string{
 	"openai", "anthropic", "azure_openai", "azure_foundry", "google_ai", "bedrock",
 	"vertex", "groq", "together", "mistral", "cohere", "xai", "fireworks",
-	"perplexity", "openrouter", "deepseek", "custom",
+	"perplexity", "openrouter", "deepseek", "typesafe", "custom",
 }
 
 // llmBillingModes / llmBillingReasons are the BillingMode / BillingReason
@@ -138,7 +138,7 @@ func (r *llmProviderResource) Schema(_ context.Context, _ resource.SchemaRequest
 				MarkdownDescription: "Upstream model-provider family, deciding the wire protocol the " +
 					"gateway speaks: `openai`, `anthropic`, `azure_openai`, `azure_foundry`, `google_ai`, " +
 					"`bedrock`, `vertex`, `groq`, `together`, `mistral`, `cohere`, `xai`, `fireworks`, " +
-					"`perplexity`, `openrouter`, `deepseek`, or `custom`. Changing it forces a new " +
+					"`perplexity`, `openrouter`, `deepseek`, `typesafe`, or `custom`. Changing it forces a new " +
 					"provider (the API has no update for it).",
 				Required: true,
 				Validators: []validator.String{
