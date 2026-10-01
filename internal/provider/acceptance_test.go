@@ -768,6 +768,9 @@ resource "barndoor_mcp_server_publication" "test" {
 				ImportStateIdFunc:                    accServerIDFromState(serverName),
 				ImportStateVerify:                    true,
 				ImportStateVerifyIdentifierAttribute: "mcp_server_id",
+				// policy_ids is ordering-only config with no API counterpart,
+				// so it reads back null after import by design.
+				ImportStateVerifyIgnore: []string{"policy_ids"},
 			},
 			{
 				// Removing the publication must not unpublish and must not
