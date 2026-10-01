@@ -369,6 +369,17 @@ func (r *mcpServerResource) Update(ctx context.Context, req resource.UpdateReque
 		return
 	}
 
+	// The PUT response is the stored record only: it omits the per-read
+	// attention_tier / publish_blockers, which would land in state as null
+	// until the next refresh. Re-read for the full object, like Create.
+	// On a failed re-read the update still happened, so keep the PUT's view.
+	var fresh mcpServerResponse
+	if err := doJSON(ctx, r.client, http.MethodGet, registryAPIPrefix+"/servers/"+plan.ID.ValueString(), nil, &fresh); err != nil {
+		resp.Diagnostics.AddError("Failed to read the MCP server after update", err.Error())
+	} else {
+		server = fresh
+	}
+
 	newState, err := applyMcpServerResponse(ctx, &server, &plan)
 	if err != nil {
 		resp.Diagnostics.AddError("Failed to map the registry API response", err.Error())

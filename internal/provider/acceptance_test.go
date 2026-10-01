@@ -717,10 +717,13 @@ resource "barndoor_policy" "test" {
   status        = "ACTIVE"
   tags          = ["tf-acc"]
 
+  # The platform rejects wildcard actions on a rule without a condition
+  # (BCP-3369). The publish gate needs only an ACTIVE policy, not a grant on
+  # any particular tool, so one enumerated tool name is enough.
   rules = [{
-    name    = "allow all"
+    name    = "allow one tool"
     effect  = "ALLOW"
-    actions = ["*"]
+    actions = ["tools/call:tf_acc_placeholder"]
     roles   = ["*"]
   }]
 }

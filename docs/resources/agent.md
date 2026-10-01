@@ -30,7 +30,7 @@ resource "barndoor_policy" "claude_github" {
 
   rules = [{
     effect  = "ALLOW"
-    actions = ["*"]
+    actions = ["tools/call:get_file_contents", "tools/call:search_code"]
     roles   = ["*"]
   }]
 }

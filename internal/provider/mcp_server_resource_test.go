@@ -87,6 +87,9 @@ type fakeRegistryServer struct {
 	// resets itself, so a test can drive the narrow window where create
 	// succeeded but the follow-up read did not.
 	failNextServerGet bool
+	// failGetAfterPut arms failNextServerGet from inside the next PUT, so the
+	// failure hits Update's re-read rather than the plan's refresh.
+	failGetAfterPut bool
 
 	// agents backs the /agents endpoints; see agent_resource_test.go.
 	nextAgentID int
@@ -313,7 +316,17 @@ func (f *fakeRegistryServer) updateServer(w http.ResponseWriter, r *http.Request
 		s.Status = "active"
 	}
 
-	_ = json.NewEncoder(w).Encode(s)
+	if f.failGetAfterPut {
+		f.failGetAfterPut = false
+		f.failNextServerGet = true
+	}
+
+	// Production returns the stored record, without the per-read publish-gate
+	// fields; only GET computes them.
+	echo := *s
+	echo.AttentionTier = nil
+	echo.PublishBlockers = nil
+	_ = json.NewEncoder(w).Encode(&echo)
 }
 
 // fakePublishedAtFor is the deterministic stamp the fake's publish endpoint
@@ -414,6 +427,14 @@ func (f *fakeRegistryServer) failServerGetOnce() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failNextServerGet = true
+}
+
+// failServerGetAfterNextUpdate arms a one-shot 500 on the GET that follows
+// the next PUT /servers/{id}.
+func (f *fakeRegistryServer) failServerGetAfterNextUpdate() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failGetAfterPut = true
 }
 
 // serverPublishedAt returns the stored publish stamp (nil = unpublished).
@@ -1115,9 +1136,10 @@ data "barndoor_mcp_server" "gate" {
 				),
 			},
 			{
-				// Blocked, and changing during a real Update (the rename), so
-				// the mapping is exercised off the PUT response too: the reasons
-				// arrive in the gate's order.
+				// Blocked, and changing during a real Update (the rename). The
+				// fake's PUT, like production's, omits both fields, so this
+				// only passes if Update re-reads the server. The reasons arrive
+				// in the gate's order.
 				PreConfig: func() {
 					fake.setServerAttention(t, serverID, &connectionError, &twoBlockers)
 				},
@@ -1172,6 +1194,34 @@ func TestMcpServerResource_createReadFailureNullsUnknownComputed(t *testing.T) {
 				Config:    mcpServerConfig("tf-test-create-read-fail", ""),
 				ExpectError: regexp.MustCompile(
 					`(?s)\AError running apply[^\n]*\n+Error: Failed to read the MCP server after create`),
+			},
+		},
+	})
+}
+
+// TestMcpServerResource_updateReadFailureKeepsTheUpdate covers a PUT that
+// succeeded followed by a re-read that did not: the error surfaces, but the
+// update is recorded in state, so the next plan is empty rather than
+// re-sending the rename.
+func TestMcpServerResource_updateReadFailureKeepsTheUpdate(t *testing.T) {
+	fake := setupRegistryTest(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllServersDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: mcpServerConfig("tf-test-update-read-fail", ""),
+			},
+			{
+				PreConfig: func() { fake.failServerGetAfterNextUpdate() },
+				Config:    mcpServerConfig("tf-test-update-read-fail-renamed", ""),
+				ExpectError: regexp.MustCompile(
+					`(?s)\AError running apply[^\n]*\n+Error: Failed to read the MCP server after update`),
+			},
+			{
+				Config:   mcpServerConfig("tf-test-update-read-fail-renamed", ""),
+				PlanOnly: true,
 			},
 		},
 	})
