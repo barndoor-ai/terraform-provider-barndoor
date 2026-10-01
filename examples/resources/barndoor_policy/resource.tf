@@ -33,8 +33,8 @@ resource "barndoor_policy" "salesforce_read_only" {
       effect = "ALLOW"
 
       # actions and roles are required: the API would default an omitted
-      # list to ["*"] (everything), so say it explicitly when you mean it.
-      # Each action is "*" or a tools/call:-prefixed tool name.
+      # list to ["*"] (everything). Each action is "*" or a tools/call:-prefixed
+      # tool name; a wildcard is accepted only on a rule with a condition.
       actions = ["tools/call:search", "tools/call:get_record", "tools/call:list_records"]
       roles   = ["role:analyst", "group:data-team"]
 

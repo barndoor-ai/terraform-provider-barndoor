@@ -12,7 +12,7 @@ resource "barndoor_policy" "claude_guardrails" {
 
   rules = [{
     effect  = "ALLOW"
-    actions = ["*"]
+    actions = ["tools/call:search", "tools/call:get_record"]
     roles   = ["*"]
   }]
 }

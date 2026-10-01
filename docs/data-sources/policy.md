@@ -32,7 +32,7 @@ resource "barndoor_policy" "sales_guardrails_v2" {
 
   rules = [{
     effect  = "ALLOW"
-    actions = ["*"]
+    actions = ["tools/call:search", "tools/call:get_record"]
     roles   = ["group:sales"]
   }]
 }

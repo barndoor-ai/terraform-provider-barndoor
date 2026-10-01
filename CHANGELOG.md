@@ -19,6 +19,8 @@ BUG FIXES:
 * resource/`barndoor_llm_model_mapping`: `stream_idle_timeout_secs` accepted only 1–120, but the platform allows 1–300 and writes 180 by default. A mapping created with the platform default therefore held a value its own configuration could not express. The validator now matches the platform.
 * resource/`barndoor_llm_provider`, resource/`barndoor_llm_connection`: `model_provider` accepts `typesafe` (TypeSafe Jev, a classifier served on `/v1/systemone`; bdai-platform BCP-4530 / #8199). As with the other API-key families, its `base_url` stops at the host (`https://api.typesafe.ai`), because the gateway appends the whole path. `require_routing_policy` exempts `/v1/systemone`, and the attribute's documentation now says so.
 * resource/`barndoor_llm_provider`: `model_provider` now accepts `azure_foundry`, which the platform supports, and the `auth_type` documentation lists the real per-provider defaults (`bedrock` → `aws_role`, `vertex` → `google_adc`, `azure_foundry` → `azure_foundry_api_key`).
+* resource/`barndoor_mcp_server`: after an in-place update, `attention_tier` and `publish_blockers` were null in state until the next refresh. The registry's update response omits both fields, which it computes only on read, so the resource now re-reads the server after an update, as it already did after create.
+* docs: the `barndoor_agent`, `barndoor_policy` and `barndoor_mcp_server_publication` examples used `actions = ["*"]` on rules without a `condition`, which the platform now rejects (bdai-platform BCP-3369). They now enumerate tools, and the `actions` documentation states the rule.
 
 ENHANCEMENTS:
 

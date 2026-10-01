@@ -29,9 +29,9 @@ resource "barndoor_policy" "github" {
   status        = "ACTIVE"
 
   rules = [{
-    name    = "allow all"
+    name    = "allow reads"
     effect  = "ALLOW"
-    actions = ["*"]
+    actions = ["tools/call:get_file_contents", "tools/call:search_code"]
     roles   = ["*"]
   }]
 }
