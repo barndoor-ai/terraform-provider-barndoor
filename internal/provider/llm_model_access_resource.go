@@ -21,19 +21,21 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 
 	"github.com/barndoor-ai/terraform-provider-barndoor/internal/client"
 )
 
 // llmModelAccessTargetKinds are the target discriminators of a model-access
 // policy (the ModelAccessTarget enum's `kind` tags).
-var llmModelAccessTargetKinds = []string{"model_alias", "model", "provider", "provider_model"}
+var llmModelAccessTargetKinds = []string{"model_alias", "model", "provider", "provider_model", "route_group"}
 
 // Ensure the resource satisfies the framework interfaces it relies on.
 var (
-	_ resource.Resource                = &llmModelAccessResource{}
-	_ resource.ResourceWithConfigure   = &llmModelAccessResource{}
-	_ resource.ResourceWithImportState = &llmModelAccessResource{}
+	_ resource.Resource                   = &llmModelAccessResource{}
+	_ resource.ResourceWithConfigure      = &llmModelAccessResource{}
+	_ resource.ResourceWithImportState    = &llmModelAccessResource{}
+	_ resource.ResourceWithValidateConfig = &llmModelAccessResource{}
 )
 
 // NewLlmModelAccessResource returns a new barndoor_llm_model_access resource.
@@ -68,6 +70,7 @@ type llmModelAccessTargetModel struct {
 	Alias      types.String `tfsdk:"alias"`
 	Model      types.String `tfsdk:"model"`
 	ProviderID types.String `tfsdk:"provider_id"`
+	GroupID    types.String `tfsdk:"group_id"`
 }
 
 func (r *llmModelAccessResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -80,7 +83,9 @@ func (r *llmModelAccessResource) Schema(_ context.Context, _ resource.SchemaRequ
 			"models and providers, applied to an identity scope (the organization, a user, an IdP group, " +
 			"…).\n\n" +
 			"`scope_type`/`scope_id`/`scope_value` answer *who* the policy applies to; the `targets` " +
-			"list answers *what* is allowed or denied and is OR-ed when matching. A cleared `scope_id` " +
+			"list answers *what* is allowed or denied and is OR-ed when matching. A `route_group` target " +
+			"stands for the current members of a `barndoor_llm_model_route_group`, so editing the group " +
+			"changes what the policy covers without an edit to the policy. A cleared `scope_id` " +
 			"or `scope_value` cannot be unset through the update API, so removing one forces a new policy.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
@@ -136,8 +141,9 @@ func llmModelAccessTargetNestedObject() schema.NestedAttributeObject {
 			"kind": schema.StringAttribute{
 				MarkdownDescription: "Target dimension: `model_alias` (matches the caller-facing alias; " +
 					"requires `alias`), `model` (matches the resolved upstream model; requires `model`), " +
-					"`provider` (any model on the provider; requires `provider_id`), or `provider_model` " +
-					"(an alias on a specific provider; requires `provider_id` and `model`).",
+					"`provider` (any model on the provider; requires `provider_id`), `provider_model` " +
+					"(an alias on a specific provider; requires `provider_id` and `model`), or `route_group` " +
+					"(every route alias in a `barndoor_llm_model_route_group`; requires `group_id`).",
 				Required: true,
 				Validators: []validator.String{
 					stringvalidator.OneOf(llmModelAccessTargetKinds...),
@@ -159,7 +165,43 @@ func llmModelAccessTargetNestedObject() schema.NestedAttributeObject {
 					"`provider_model` targets).",
 				Optional: true,
 			},
+			"group_id": schema.StringAttribute{
+				MarkdownDescription: "UUID of the `barndoor_llm_model_route_group` whose members to match " +
+					"(`route_group` targets). The target expands to one `model_alias` target per member " +
+					"when the policy is evaluated. The platform does not check that the group exists: an " +
+					"empty group, or one that has been deleted, expands to no targets. An `allowlist` whose " +
+					"only target is such a group therefore denies every model to its scope.",
+				Optional: true,
+			},
 		},
+	}
+}
+
+// ValidateConfig checks each target's shape at plan time, so a kind missing
+// its field (or carrying another kind's) fails before any API call. Fields
+// that are still unknown (for example a group_id from a route group created
+// in the same apply) count as set.
+func (r *llmModelAccessResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var targets types.List
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("targets"), &targets)...)
+	if resp.Diagnostics.HasError() || targets.IsNull() || targets.IsUnknown() {
+		return
+	}
+
+	for i, elem := range targets.Elements() {
+		obj, ok := elem.(types.Object)
+		if !ok || obj.IsNull() || obj.IsUnknown() {
+			continue
+		}
+		var t llmModelAccessTargetModel
+		resp.Diagnostics.Append(obj.As(ctx, &t, basetypes.ObjectAsOptions{})...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if t.Kind.IsNull() || t.Kind.IsUnknown() {
+			continue
+		}
+		checkLlmModelAccessTargetShape(i, t, func(v types.String) bool { return !v.IsNull() }, &resp.Diagnostics)
 	}
 }
 
@@ -542,6 +584,7 @@ type llmModelAccessTargetPayload struct {
 	Alias      *string `json:"alias,omitempty"`
 	Model      *string `json:"model,omitempty"`
 	ProviderID *string `json:"provider_id,omitempty"`
+	GroupID    *string `json:"group_id,omitempty"`
 }
 
 // llmModelAccessCreateRequest mirrors the llm-gateway CreateModelAccessRequest
@@ -587,67 +630,80 @@ type llmModelAccessResponse struct {
 // buildLlmModelAccessTargets converts the planned targets to the API shape,
 // validating that each entry carries exactly the fields its kind requires —
 // a mismatched shape would otherwise surface as an opaque deserialization
-// error from the API.
+// error from the API. ValidateConfig runs the same check at plan time; this
+// one also covers values that were unknown then.
 func buildLlmModelAccessTargets(targets []llmModelAccessTargetModel, diags *diag.Diagnostics) []llmModelAccessTargetPayload {
 	out := make([]llmModelAccessTargetPayload, 0, len(targets))
 	for i, t := range targets {
-		kind := t.Kind.ValueString()
-		alias, hasAlias := knownString(t.Alias)
-		model, hasModel := knownString(t.Model)
-		providerID, hasProviderID := knownString(t.ProviderID)
-
-		requireShape := func(needAlias, needModel, needProviderID bool) bool {
-			ok := hasAlias == needAlias && hasModel == needModel && hasProviderID == needProviderID
-			if !ok {
-				diags.AddAttributeError(
-					path.Root("targets").AtListIndex(i),
-					"Invalid model-access target shape",
-					fmt.Sprintf("kind = %q requires %s", kind, llmTargetShapeHint(kind)),
-				)
-			}
+		if !checkLlmModelAccessTargetShape(i, t, func(v types.String) bool {
+			_, ok := knownString(v)
 			return ok
+		}, diags) {
+			continue
 		}
 
-		payload := llmModelAccessTargetPayload{Kind: kind}
-		switch kind {
-		case "model_alias":
-			if !requireShape(true, false, false) {
-				continue
-			}
-			payload.Alias = &alias
-		case "model":
-			if !requireShape(false, true, false) {
-				continue
-			}
-			payload.Model = &model
-		case "provider":
-			if !requireShape(false, false, true) {
-				continue
-			}
-			payload.ProviderID = &providerID
-		case "provider_model":
-			if !requireShape(false, true, true) {
-				continue
-			}
-			payload.Model = &model
-			payload.ProviderID = &providerID
+		payload := llmModelAccessTargetPayload{Kind: t.Kind.ValueString()}
+		if v, ok := knownString(t.Alias); ok {
+			payload.Alias = &v
+		}
+		if v, ok := knownString(t.Model); ok {
+			payload.Model = &v
+		}
+		if v, ok := knownString(t.ProviderID); ok {
+			payload.ProviderID = &v
+		}
+		if v, ok := knownString(t.GroupID); ok {
+			payload.GroupID = &v
 		}
 		out = append(out, payload)
 	}
 	return out
 }
 
+// llmModelAccessTargetFields lists, per target kind, which of alias / model /
+// provider_id / group_id the kind requires; every other field is forbidden.
+var llmModelAccessTargetFields = map[string][4]bool{
+	"model_alias":    {true, false, false, false},
+	"model":          {false, true, false, false},
+	"provider":       {false, false, true, false},
+	"provider_model": {false, true, true, false},
+	"route_group":    {false, false, false, true},
+}
+
+// checkLlmModelAccessTargetShape reports, against targets[index], a target
+// whose fields do not match its kind. isSet decides whether a field counts as
+// present. An unrecognized kind is left to the kind attribute's validator.
+func checkLlmModelAccessTargetShape(index int, t llmModelAccessTargetModel, isSet func(types.String) bool, diags *diag.Diagnostics) bool {
+	kind := t.Kind.ValueString()
+	want, known := llmModelAccessTargetFields[kind]
+	if !known {
+		return true
+	}
+	have := [4]bool{isSet(t.Alias), isSet(t.Model), isSet(t.ProviderID), isSet(t.GroupID)}
+	if have != want {
+		diags.AddAttributeError(
+			path.Root("targets").AtListIndex(index),
+			"Invalid model-access target shape",
+			fmt.Sprintf("kind = %q requires %s", kind, llmTargetShapeHint(kind)),
+		)
+		return false
+	}
+	return true
+}
+
 // llmTargetShapeHint names the fields a target kind requires.
 func llmTargetShapeHint(kind string) string {
 	switch kind {
 	case "model_alias":
-		return "`alias` (and neither `model` nor `provider_id`)"
+		return "`alias` (and none of `model`, `provider_id` or `group_id`)"
 	case "model":
-		return "`model` (and neither `alias` nor `provider_id`)"
+		return "`model` (and none of `alias`, `provider_id` or `group_id`)"
 	case "provider":
-		return "`provider_id` (and neither `alias` nor `model`)"
+		return "`provider_id` (and none of `alias`, `model` or `group_id`)"
+	case "route_group":
+		return "`group_id` (and none of `alias`, `model` or `provider_id`)"
 	default:
-		return "`provider_id` and `model` (and not `alias`)"
+		return "`provider_id` and `model` (and neither `alias` nor `group_id`)"
 	}
 }
 
@@ -662,6 +718,7 @@ func applyLlmModelAccessResponse(policy *llmModelAccessResponse, prior *llmModel
 			Alias:      stringFromPtr(t.Alias),
 			Model:      stringFromPtr(t.Model),
 			ProviderID: stringFromPtr(t.ProviderID),
+			GroupID:    stringFromPtr(t.GroupID),
 		})
 	}
 

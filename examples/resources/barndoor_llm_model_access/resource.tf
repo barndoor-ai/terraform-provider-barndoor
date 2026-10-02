@@ -24,3 +24,17 @@ resource "barndoor_llm_model_access" "engineering_denylist" {
 
   traffic_type = "all"
 }
+
+# Allow a route group's members for one team. An empty or deleted group
+# expands to no targets, so an allowlist whose only target is that group
+# denies every model.
+resource "barndoor_llm_model_access" "research_routes" {
+  name        = "Research routes"
+  scope_type  = "group"
+  scope_value = "research"
+  policy_type = "allowlist"
+
+  targets = [
+    { kind = "route_group", group_id = "22222222-2222-2222-2222-222222222222" }, # a barndoor_llm_model_route_group id
+  ]
+}
