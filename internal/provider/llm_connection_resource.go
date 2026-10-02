@@ -59,6 +59,7 @@ type llmConnectionResourceModel struct {
 	EffectiveSettings jsontypes.Normalized `tfsdk:"effective_settings"`
 	KeyLast4          types.String         `tfsdk:"key_last4"`
 	StoresKeyMaterial types.Bool           `tfsdk:"stores_key_material"`
+	ChangeNote        types.String         `tfsdk:"change_note"`
 	CreatedAt         types.String         `tfsdk:"created_at"`
 	UpdatedAt         types.String         `tfsdk:"updated_at"`
 }
@@ -194,6 +195,7 @@ func (r *llmConnectionResource) Schema(_ context.Context, _ resource.SchemaReque
 				MarkdownDescription: "When the connection was last updated (RFC 3339).",
 				Computed:            true,
 			},
+			"change_note": llmChangeNoteAttribute("connection"),
 		},
 	}
 }
@@ -371,6 +373,7 @@ type llmConnectionRequest struct {
 	APIKey        *string         `json:"api_key,omitempty"`
 	Credentials   json.RawMessage `json:"credentials,omitempty"`
 	Settings      json.RawMessage `json:"settings,omitempty"`
+	ChangeNote    *string         `json:"change_note,omitempty"`
 }
 
 // llmConnectionResponse mirrors the llm-gateway Connection response. The
@@ -409,6 +412,7 @@ func buildLlmConnectionRequest(plan *llmConnectionResourceModel, create bool) (*
 		APIKey:      stringPtrIfKnown(plan.APIKey),
 		Credentials: credentials,
 		Settings:    settings,
+		ChangeNote:  stringPtrIfKnown(plan.ChangeNote),
 	}
 	if create {
 		body.ModelProvider = plan.ModelProvider.ValueString()
@@ -446,6 +450,7 @@ func applyLlmConnectionResponse(conn *llmConnectionResponse, prior *llmConnectio
 		EffectiveSettings: effective,
 		KeyLast4:          optionalStringFromPtr(conn.KeyLast4, types.StringNull()),
 		StoresKeyMaterial: types.BoolValue(conn.StoresKeyMaterial),
+		ChangeNote:        prior.ChangeNote, // write-only; see llmChangeNoteAttribute
 		CreatedAt:         types.StringValue(conn.CreatedAt),
 		UpdatedAt:         types.StringValue(conn.UpdatedAt),
 	}

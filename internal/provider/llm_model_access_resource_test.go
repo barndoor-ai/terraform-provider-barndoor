@@ -81,6 +81,14 @@ func TestBuildLlmModelAccessTargets_RejectsMismatchedShapes(t *testing.T) {
 			Kind:       types.StringValue("provider_model"),
 			ProviderID: types.StringValue("aaaa0000-0000-0000-0000-000000000001"),
 		}},
+		{"route_group without group_id", llmModelAccessTargetModel{
+			Kind: types.StringValue("route_group"),
+		}},
+		{"model with stray group_id", llmModelAccessTargetModel{
+			Kind:    types.StringValue("model"),
+			Model:   types.StringValue("gpt-4o"),
+			GroupID: types.StringValue("abab0000-0000-0000-0000-000000000001"),
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

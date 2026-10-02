@@ -58,6 +58,7 @@ resource "barndoor_llm_model_mapping" "fast" {
 ### Optional
 
 - `bare_alias` (Boolean) Whether the row participates in bare-name resolution (a request naming the alias alone, without the `<provider>/` prefix). Inferred when unset: custom aliases default to `true`, 1:1 enablements to `false`.
+- `change_note` (String) Optional note explaining the change ("Raise cap for Q4 launch"), recorded on the model route and in the audit trail (at most 500 characters). It describes the write Terraform makes, not the model route: the platform clears the previous note on any update that does not send one, and the value is not refreshed from the platform. Changing only the note makes an in-place update that records it.
 - `cooldown_429_default_secs` (Number) Cooldown after an upstream 429 that carries no usable `Retry-After` header, in seconds (1–3600, and at most `cooldown_max_secs`). Defaults to `30`.
 - `cooldown_base_secs` (Number) First cooldown once the threshold trips, in seconds (1–3600, and at most `cooldown_max_secs`). Doubled on each failed recovery probe, up to `cooldown_max_secs`. Defaults to `30`.
 - `cooldown_failure_threshold` (Number) Upstream failures within `cooldown_window_secs` that cool the route (0–100). Defaults to `10`. `0` disables every cooldown of the shared route (rolling failures, 429 and 529); per-user credential cooldowns on passthrough routes still apply.

@@ -10,6 +10,7 @@ import (
 	"net/http"
 
 	"github.com/hashicorp/terraform-plugin-framework-jsontypes/jsontypes"
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -38,6 +39,7 @@ var llmModelProviders = []string{
 // required only when the mode is not_metered.
 var (
 	llmBillingModes   = []string{"per_token", "not_metered"}
+	llmModelSyncModes = []string{"off", "additive", "full"}
 	llmBillingReasons = []string{"subscription", "local", "external", "other"}
 )
 
@@ -86,6 +88,11 @@ type llmProviderResourceModel struct {
 	BillingMode        types.String         `tfsdk:"billing_mode"`
 	BillingReason      types.String         `tfsdk:"billing_reason"`
 	BillingNote        types.String         `tfsdk:"billing_note"`
+	CatalogID          types.String         `tfsdk:"catalog_id"`
+	ModelSyncMode      types.String         `tfsdk:"model_sync_mode"`
+	RequestTimeout     types.Int64          `tfsdk:"request_timeout_secs"`
+	StreamIdleTimeout  types.Int64          `tfsdk:"stream_idle_timeout_secs"`
+	ChangeNote         types.String         `tfsdk:"change_note"`
 	HealthStatus       types.String         `tfsdk:"health_status"`
 	HealthDetail       types.String         `tfsdk:"health_detail"`
 	HealthCheckedAt    types.String         `tfsdk:"health_checked_at"`
@@ -282,6 +289,57 @@ func (r *llmProviderResource) Schema(_ context.Context, _ resource.SchemaRequest
 					llmClearIfPreviouslyConfigured{},
 				},
 			},
+			"catalog_id": schema.StringAttribute{
+				MarkdownDescription: "UUID of the provider-catalog entry the provider was created from. " +
+					"The platform uses the entry's default endpoint when `base_url` and the connection " +
+					"leave it unset, and catalog model sync (`model_sync_mode`) requires one. Set only on " +
+					"create: changing it forces a new provider. Providers created from the catalog in the " +
+					"app import with it set.",
+				Optional: true,
+				Computed: true,
+				Validators: []validator.String{
+					noSurroundingWhitespace,
+				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"model_sync_mode": schema.StringAttribute{
+				MarkdownDescription: "Whether the platform keeps the provider's model routes in step with " +
+					"its catalog entry: `off` (the default), `additive` (enable models the catalog adds), " +
+					"or `full` (also retire models the catalog drops). Anything but `off` requires " +
+					"`catalog_id`. Unset keeps the stored mode.\n\n" +
+					"Under Terraform, prefer `off`: routes the sync creates are not in your configuration, " +
+					"and `full` can retire a route a `barndoor_llm_model_mapping` manages.",
+				Optional: true,
+				Computed: true,
+				Validators: []validator.String{
+					stringvalidator.OneOf(llmModelSyncModes...),
+				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"request_timeout_secs": schema.Int64Attribute{
+				MarkdownDescription: "Provider-wide cap on a whole upstream request, in seconds " +
+					"(1–600). A model mapping's own `request_timeout_secs` takes precedence. Unset uses " +
+					"the gateway default of 120 seconds; removing it clears the override.",
+				Optional: true,
+				Validators: []validator.Int64{
+					int64validator.Between(1, 600),
+				},
+			},
+			"stream_idle_timeout_secs": schema.Int64Attribute{
+				MarkdownDescription: "Provider-wide limit on the silence between streamed chunks, in " +
+					"seconds (1–300). A model mapping's own `stream_idle_timeout_secs` takes precedence. " +
+					"Unset uses the gateway default of 180 seconds; removing it clears the override.",
+				Optional: true,
+				Validators: []validator.Int64{
+					int64validator.Between(1, 300),
+				},
+			},
+			"change_note": llmChangeNoteAttribute("provider"),
 			"health_status": schema.StringAttribute{
 				MarkdownDescription: "Observed upstream reachability recorded by the platform's " +
 					"connectivity probes: `unverified`, `healthy`, or `unhealthy`. Refreshed on every " +
@@ -505,6 +563,25 @@ func (r *llmProviderResource) ModifyPlan(ctx context.Context, req resource.Modif
 			"A provider cannot stop recording cost without saying why. Set billing_reason to one of "+
 				"\"subscription\", \"local\", \"external\" or \"other\".")
 	}
+
+	// Catalog sync needs a catalog entry to sync from. The provider has one
+	// when the configuration sets catalog_id or, after create, the platform
+	// stored one (an imported catalog provider).
+	var syncMode, cfgCatalog, stateCatalog types.String
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("model_sync_mode"), &syncMode)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("catalog_id"), &cfgCatalog)...)
+	if !req.State.Raw.IsNull() {
+		resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("catalog_id"), &stateCatalog)...)
+	}
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if m, ok := knownString(syncMode); ok && m != "off" && cfgCatalog.IsNull() && stateCatalog.IsNull() {
+		resp.Diagnostics.AddAttributeError(path.Root("model_sync_mode"),
+			"model_sync_mode requires catalog_id",
+			fmt.Sprintf("model_sync_mode %q keeps the provider's routes in step with its catalog entry, and "+
+				"this provider has none. Set catalog_id (it forces a new provider), or use \"off\".", m))
+	}
 }
 
 // llmClearIfPreviouslyConfigured is the plan modifier for the clearable
@@ -653,6 +730,11 @@ type llmProviderCreateRequest struct {
 	BillingMode        *string         `json:"billing_mode,omitempty"`
 	BillingReason      *string         `json:"billing_reason,omitempty"`
 	BillingNote        *string         `json:"billing_note,omitempty"`
+	CatalogID          *string         `json:"catalog_id,omitempty"`
+	ModelSyncMode      *string         `json:"model_sync_mode,omitempty"`
+	RequestTimeout     *int32          `json:"request_timeout_secs,omitempty"`
+	StreamIdleTimeout  *int32          `json:"stream_idle_timeout_secs,omitempty"`
+	ChangeNote         *string         `json:"change_note,omitempty"`
 }
 
 // llmProviderUpdateRequest mirrors the llm-gateway UpdateProviderRequest body.
@@ -673,6 +755,11 @@ type llmProviderUpdateRequest struct {
 	BillingMode        *string         `json:"billing_mode,omitempty"`
 	BillingReason      *string         `json:"billing_reason"`
 	BillingNote        *string         `json:"billing_note"`
+	ModelSyncMode      *string         `json:"model_sync_mode,omitempty"`
+	// The timeouts are tri-state: a null clears the override.
+	RequestTimeout    *int32  `json:"request_timeout_secs"`
+	StreamIdleTimeout *int32  `json:"stream_idle_timeout_secs"`
+	ChangeNote        *string `json:"change_note,omitempty"`
 }
 
 // llmProviderResponse mirrors the llm-gateway Provider response. The stored
@@ -695,6 +782,10 @@ type llmProviderResponse struct {
 	BillingMode        string          `json:"billing_mode"`
 	BillingReason      *string         `json:"billing_reason"`
 	BillingNote        *string         `json:"billing_note"`
+	CatalogID          *string         `json:"catalog_id"`
+	ModelSyncMode      string          `json:"model_sync_mode"`
+	RequestTimeout     *int32          `json:"request_timeout_secs"`
+	StreamIdleTimeout  *int32          `json:"stream_idle_timeout_secs"`
 	HealthStatus       string          `json:"health_status"`
 	HealthDetail       *string         `json:"health_detail"`
 	HealthCheckedAt    *string         `json:"health_checked_at"`
@@ -740,6 +831,11 @@ func buildLlmProviderCreateRequest(plan *llmProviderResourceModel) (*llmProvider
 	body.BillingMode = stringPtrIfKnown(plan.BillingMode)
 	body.BillingReason = stringPtrIfKnown(plan.BillingReason)
 	body.BillingNote = stringPtrIfKnown(plan.BillingNote)
+	body.CatalogID = stringPtrIfKnown(plan.CatalogID)
+	body.ModelSyncMode = stringPtrIfKnown(plan.ModelSyncMode)
+	body.RequestTimeout = int32PtrFromInt64(plan.RequestTimeout)
+	body.StreamIdleTimeout = int32PtrFromInt64(plan.StreamIdleTimeout)
+	body.ChangeNote = stringPtrIfKnown(plan.ChangeNote)
 	return body, nil
 }
 
@@ -785,6 +881,10 @@ func buildLlmProviderUpdateRequest(plan *llmProviderResourceModel) (*llmProvider
 	body.BillingMode = stringPtrIfKnown(plan.BillingMode)
 	body.BillingReason = stringPtrIfKnown(plan.BillingReason)
 	body.BillingNote = stringPtrIfKnown(plan.BillingNote)
+	body.ModelSyncMode = stringPtrIfKnown(plan.ModelSyncMode)
+	body.RequestTimeout = int32PtrFromInt64(plan.RequestTimeout)
+	body.StreamIdleTimeout = int32PtrFromInt64(plan.StreamIdleTimeout)
+	body.ChangeNote = stringPtrIfKnown(plan.ChangeNote)
 	return body, nil
 }
 
@@ -812,10 +912,24 @@ func applyLlmProviderResponse(provider *llmProviderResponse, prior *llmProviderR
 		BillingMode:        types.StringValue(provider.BillingMode),
 		BillingReason:      optionalStringFromPtr(provider.BillingReason, prior.BillingReason),
 		BillingNote:        optionalStringFromPtr(provider.BillingNote, prior.BillingNote),
+		CatalogID:          optionalStringFromPtr(provider.CatalogID, prior.CatalogID),
+		ModelSyncMode:      types.StringValue(llmModelSyncModeOrOff(provider.ModelSyncMode)),
+		RequestTimeout:     int64FromInt32Ptr(provider.RequestTimeout),
+		StreamIdleTimeout:  int64FromInt32Ptr(provider.StreamIdleTimeout),
+		ChangeNote:         prior.ChangeNote, // write-only; see llmChangeNoteAttribute
 		HealthStatus:       types.StringValue(provider.HealthStatus),
 		HealthDetail:       optionalStringFromPtr(provider.HealthDetail, prior.HealthDetail),
 		HealthCheckedAt:    optionalStringFromPtr(provider.HealthCheckedAt, prior.HealthCheckedAt),
 		CreatedAt:          types.StringValue(provider.CreatedAt),
 		UpdatedAt:          types.StringValue(provider.UpdatedAt),
 	}
+}
+
+// llmModelSyncModeOrOff defaults an absent model_sync_mode (a platform that
+// predates catalog sync) to the column default.
+func llmModelSyncModeOrOff(mode string) string {
+	if mode == "" {
+		return "off"
+	}
+	return mode
 }

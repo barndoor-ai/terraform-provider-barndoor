@@ -6,6 +6,7 @@ package provider
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -24,7 +25,8 @@ import (
 //
 // fakeLlmGatewayServer emulates the llm-gateway admin REST surface the
 // provider binds (`/api/llm-gateway/admin/connections|providers|model-mappings|
-// model-access|rate-limits|budgets|model-pricing|governance-config`)
+// model-access|model-route-groups|rate-limits|budgets|model-pricing|
+// governance-config|routing-policies|routing-rules`)
 // faithfully enough to drive real plan/apply cycles: write-only connection
 // secrets (stored, never echoed), providers bound to connections with inline
 // keys rejected (BCP-3647), per-model-provider auth_type
@@ -34,7 +36,8 @@ import (
 // budgets, the rate-limit tri-state metric PATCH, the scope-uniqueness 409s
 // of rate limits and budgets, the append-only versioned pricing store
 // (scheduled changes, skip-on-no-op, archive tombstones, per-instant
-// uniqueness), and the governance-config singleton upsert. Errors use the
+// uniqueness), route groups with the membership sweeps that mapping renames
+// and deletes trigger, and the governance-config singleton upsert. Errors use the
 // service's OpenAI envelope (`{"error": {"message": ...}}`).
 
 // fakeLlmOrgID matches the BARNDOOR_ORGANIZATION_ID set by setupLlmGatewayTest.
@@ -62,6 +65,37 @@ type fakeLlmProvider struct {
 	BillingReason      *string
 	BillingNote        *string
 	ConnectionID       *string
+	CatalogID          *string
+	ModelSyncMode      string
+	RequestTimeout     *int64
+	StreamIdleTimeout  *int64
+	LastChangeNote     *string
+}
+
+// fakeLlmCatalogID is the one provider_catalog entry the fake knows, and
+// fakeLlmCatalogBaseURL its default endpoint.
+const (
+	fakeLlmCatalogID      = "c0c0c0c0-0000-0000-0000-000000000001"
+	fakeLlmCatalogBaseURL = "https://catalog-default.example.com"
+)
+
+// validLlmProviderSync mirrors the handler's catalog-sync and
+// validate_provider_timeouts checks.
+func validLlmProviderSync(w http.ResponseWriter, p *fakeLlmProvider) bool {
+	if p.ModelSyncMode != "off" && p.CatalogID == nil {
+		writeLlmError(w, http.StatusBadRequest,
+			"catalog model sync requires a provider created from the catalog (catalog_id)")
+		return false
+	}
+	if p.RequestTimeout != nil && (*p.RequestTimeout < 1 || *p.RequestTimeout > 600) {
+		writeLlmError(w, http.StatusBadRequest, "request_timeout_secs must be between 1 and 600")
+		return false
+	}
+	if p.StreamIdleTimeout != nil && (*p.StreamIdleTimeout < 1 || *p.StreamIdleTimeout > 300) {
+		writeLlmError(w, http.StatusBadRequest, "stream_idle_timeout_secs must be between 1 and 300")
+		return false
+	}
+	return true
 }
 
 type fakeLlmModelMapping struct {
@@ -77,6 +111,7 @@ type fakeLlmModelMapping struct {
 	StreamIdleTimeoutSecs int64
 	RequestTimeoutSecs    int64
 	Cooldown              fakeLlmCooldown
+	LastChangeNote        *string
 }
 
 // fakeLlmCooldown is a route's passive cooldown policy (BCP-2671 H5): six NOT
@@ -149,15 +184,16 @@ func validLlmCooldown(w http.ResponseWriter, c fakeLlmCooldown) bool {
 }
 
 type fakeLlmModelAccessPolicy struct {
-	ID          string
-	Name        string
-	ScopeType   string
-	ScopeID     *string
-	ScopeValue  *string
-	PolicyType  string
-	Targets     []json.RawMessage
-	TrafficType string
-	Enabled     bool
+	ID             string
+	Name           string
+	ScopeType      string
+	ScopeID        *string
+	ScopeValue     *string
+	PolicyType     string
+	Targets        []json.RawMessage
+	TrafficType    string
+	Enabled        bool
+	LastChangeNote *string
 }
 
 type fakeLlmRateLimit struct {
@@ -171,6 +207,59 @@ type fakeLlmRateLimit struct {
 	MemberOfGroup     *string
 	TrafficType       string
 	Enabled           bool
+	Targets           fakeLlmTargets
+	LastChangeNote    *string
+}
+
+// fakeLlmTargets are the governance target columns (BCP-2813, BCP-4053),
+// shared by budgets and rate limits.
+type fakeLlmTargets struct {
+	ProviderID    *string `json:"target_provider_id"`
+	UpstreamModel *string `json:"target_upstream_model"`
+	ModelAlias    *string `json:"target_model_alias"`
+	McpServerID   *string `json:"target_mcp_server_id"`
+}
+
+func (t fakeLlmTargets) eq(o fakeLlmTargets) bool {
+	return strPtrEq(t.ProviderID, o.ProviderID) && strPtrEq(t.UpstreamModel, o.UpstreamModel) &&
+		strPtrEq(t.ModelAlias, o.ModelAlias) && strPtrEq(t.McpServerID, o.McpServerID)
+}
+
+// validLlmTargetShape mirrors governance_shape::validate_target_shape, in
+// production's order.
+func validLlmTargetShape(w http.ResponseWriter, t fakeLlmTargets, trafficType string) bool {
+	llm := t.ProviderID != nil || t.UpstreamModel != nil || t.ModelAlias != nil
+	var msg string
+	switch {
+	case t.ModelAlias != nil && (t.ProviderID != nil || t.UpstreamModel != nil):
+		msg = "target_model_alias cannot be combined with target_provider_id or target_upstream_model"
+	case t.UpstreamModel != nil && t.ProviderID == nil:
+		msg = "target_upstream_model requires target_provider_id"
+	case llm && trafficType == "mcp":
+		msg = "an LLM target cannot be combined with traffic_type mcp"
+	case t.McpServerID != nil && llm:
+		msg = "target_mcp_server_id cannot be combined with an LLM target"
+	case t.McpServerID != nil && trafficType == "llm":
+		msg = "target_mcp_server_id requires traffic_type mcp or all"
+	default:
+		return true
+	}
+	writeLlmError(w, http.StatusBadRequest, msg)
+	return false
+}
+
+// fakeLlmChangeNote mirrors normalize_change_note: trim, blank means none,
+// at most 500 characters. It writes the 400 and returns false when too long.
+func fakeLlmChangeNote(w http.ResponseWriter, raw *string) (*string, bool) {
+	if raw == nil || strings.TrimSpace(*raw) == "" {
+		return nil, true
+	}
+	note := strings.TrimSpace(*raw)
+	if len([]rune(note)) > 500 {
+		writeLlmError(w, http.StatusBadRequest, "change_note must be at most 500 characters")
+		return nil, false
+	}
+	return &note, true
 }
 
 type fakeLlmTokenBudget struct {
@@ -182,10 +271,19 @@ type fakeLlmTokenBudget struct {
 	MemberOfGroup   *string
 	Period          string
 	TokenLimit      int64
+	CostLimit       *float64
+	Currency        string
 	AlertThresholds []int64
 	ActionOnExhaust string
 	TrafficType     string
 	Enabled         bool
+	Targets         fakeLlmTargets
+	LastChangeNote  *string
+}
+
+// fakeLlmDecimal4 rounds like the DECIMAL(12, 4) cost_limit column.
+func fakeLlmDecimal4(v float64) float64 {
+	return math.Round(v*10000) / 10000
 }
 
 // fakeLlmPricingVersion is one row of the append-only, versioned
@@ -201,6 +299,7 @@ type fakeLlmPricingVersion struct {
 	OutputCost       float64
 	CacheRead        *float64
 	CacheWrite       *float64
+	LongContext      *fakeLlmLongContext
 	EffectiveFrom    time.Time
 	EffectiveFromRaw string // exact wire echo, like chrono round-tripping the input
 	ProviderID       *string
@@ -224,6 +323,12 @@ type fakeLlmGatewayServer struct {
 	rateLimits  []*fakeLlmRateLimit
 	budgets     []*fakeLlmTokenBudget
 	pricing     []*fakeLlmPricingVersion
+	routeGroups []*fakeLlmRouteGroup
+
+	// routingPolicies and routingRules back the routing surface; see
+	// llm_gateway_fake_routing_test.go.
+	routingPolicies []*fakeLlmRoutingPolicy
+	routingRules    []*fakeLlmRoutingRule
 
 	// governance is the org's singleton governance_config row; nil means no
 	// row yet (the API then reports the column defaults).
@@ -260,6 +365,8 @@ func (f *fakeLlmGatewayServer) handler() http.HandlerFunc {
 			f.handleConnections(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/model-mappings"):
 			f.handleModelMappings(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/model-route-groups"):
+			f.handleRouteGroups(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/model-access"):
 			f.handleModelAccess(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/rate-limits"):
@@ -268,6 +375,10 @@ func (f *fakeLlmGatewayServer) handler() http.HandlerFunc {
 			f.handleBudgets(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/model-pricing"):
 			f.handleModelPricing(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/routing-policies"):
+			f.handleRoutingPolicies(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/routing-rules"):
+			f.handleRoutingRules(w, r)
 		case r.URL.Path == "/api/llm-gateway/admin/governance-config":
 			f.handleGovernanceConfig(w, r)
 		default:
@@ -372,21 +483,25 @@ func providerJSON(p *fakeLlmProvider) map[string]any {
 	out := map[string]any{
 		"id":             p.ID,
 		"org_id":         fakeLlmOrgID,
-		"catalog_id":     nil,
+		"catalog_id":     p.CatalogID,
 		"connection_id":  p.ConnectionID,
 		"name":           p.Name,
 		"model_provider": p.ModelProvider,
 		"auth_type":      p.AuthType,
 		"base_url":       p.BaseURL,
 		// The secret lives on the connection; only its path is echoed.
-		"secret_path":          "pending",
-		"enabled":              p.Enabled,
-		"settings":             p.Settings,
-		"created_at":           fakeLlmTime,
-		"updated_at":           fakeLlmTime,
-		"health_status":        "unverified",
-		"enforce_health_check": p.EnforceHealthCheck,
-		"billing_mode":         p.BillingMode,
+		"secret_path":              "pending",
+		"enabled":                  p.Enabled,
+		"settings":                 p.Settings,
+		"created_at":               fakeLlmTime,
+		"updated_at":               fakeLlmTime,
+		"health_status":            "unverified",
+		"enforce_health_check":     p.EnforceHealthCheck,
+		"billing_mode":             p.BillingMode,
+		"model_sync_mode":          p.ModelSyncMode,
+		"request_timeout_secs":     p.RequestTimeout,
+		"stream_idle_timeout_secs": p.StreamIdleTimeout,
+		"last_change_note":         p.LastChangeNote,
 	}
 	// Omitted when null, like production's skip_serializing_if.
 	if p.BillingReason != nil {
@@ -525,9 +640,25 @@ func (f *fakeLlmGatewayServer) createProvider(w http.ResponseWriter, r *http.Req
 		BillingMode        *string         `json:"billing_mode"`
 		BillingReason      *string         `json:"billing_reason"`
 		BillingNote        *string         `json:"billing_note"`
+		CatalogID          *string         `json:"catalog_id"`
+		ModelSyncMode      *string         `json:"model_sync_mode"`
+		RequestTimeout     *int64          `json:"request_timeout_secs"`
+		StreamIdleTimeout  *int64          `json:"stream_idle_timeout_secs"`
+		ChangeNote         *string         `json:"change_note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
+	if !ok {
+		return
+	}
+	// catalog_id has an FK to provider_catalog and no handler check, so an
+	// unknown id fails the insert as a 500.
+	if body.CatalogID != nil && *body.CatalogID != fakeLlmCatalogID {
+		writeLlmError(w, http.StatusInternalServerError, `insert or update on table "providers" violates `+
+			`foreign key constraint "providers_catalog_id_fkey"`)
 		return
 	}
 	if !slices.Contains(fakeLlmModelProviders, body.ModelProvider) {
@@ -568,6 +699,9 @@ func (f *fakeLlmGatewayServer) createProvider(w http.ResponseWriter, r *http.Req
 			baseURL = conn.BaseURL
 		}
 	}
+	if strings.TrimSpace(baseURL) == "" && body.CatalogID != nil {
+		baseURL = fakeLlmCatalogBaseURL
+	}
 	if body.BaseURL != "" && !validLlmBaseURL(w, body.BaseURL, body.ModelProvider, authType) {
 		return
 	}
@@ -580,6 +714,10 @@ func (f *fakeLlmGatewayServer) createProvider(w http.ResponseWriter, r *http.Req
 	billingMode := "per_token" // never inferred server-side
 	if body.BillingMode != nil {
 		billingMode = *body.BillingMode
+	}
+	syncMode := "off"
+	if body.ModelSyncMode != nil {
+		syncMode = *body.ModelSyncMode
 	}
 
 	p := &fakeLlmProvider{
@@ -595,8 +733,13 @@ func (f *fakeLlmGatewayServer) createProvider(w http.ResponseWriter, r *http.Req
 		BillingMode:        billingMode,
 		BillingReason:      body.BillingReason,
 		BillingNote:        fakeLlmBillingNote(body.BillingNote),
+		CatalogID:          body.CatalogID,
+		ModelSyncMode:      syncMode,
+		RequestTimeout:     body.RequestTimeout,
+		StreamIdleTimeout:  body.StreamIdleTimeout,
+		LastChangeNote:     note,
 	}
-	if !validLlmBilling(w, p) {
+	if !validLlmBilling(w, p) || !validLlmProviderSync(w, p) {
 		return
 	}
 	f.providers = append(f.providers, p)
@@ -621,16 +764,36 @@ func (f *fakeLlmGatewayServer) updateProvider(w http.ResponseWriter, r *http.Req
 		EnforceHealthCheck *bool           `json:"enforce_health_check"`
 		BillingMode        *string         `json:"billing_mode"`
 		// Tri-state keys: absent keeps, null clears, a value sets.
-		ConnectionID  json.RawMessage `json:"connection_id"`
-		BillingReason json.RawMessage `json:"billing_reason"`
-		BillingNote   json.RawMessage `json:"billing_note"`
+		ConnectionID      json.RawMessage `json:"connection_id"`
+		BillingReason     json.RawMessage `json:"billing_reason"`
+		BillingNote       json.RawMessage `json:"billing_note"`
+		RequestTimeout    json.RawMessage `json:"request_timeout_secs"`
+		StreamIdleTimeout json.RawMessage `json:"stream_idle_timeout_secs"`
+		ModelSyncMode     *string         `json:"model_sync_mode"`
+		ChangeNote        *string         `json:"change_note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
+	if !ok {
+		return
+	}
 
 	updated := *p
+	updated.LastChangeNote = note
+	if body.ModelSyncMode != nil {
+		updated.ModelSyncMode = *body.ModelSyncMode
+	}
+	for raw, dst := range map[*json.RawMessage]**int64{
+		&body.RequestTimeout: &updated.RequestTimeout, &body.StreamIdleTimeout: &updated.StreamIdleTimeout,
+	} {
+		if *raw != nil {
+			*dst = nil
+			_ = json.Unmarshal(*raw, dst)
+		}
+	}
 	if body.Name != nil {
 		updated.Name = *body.Name
 	}
@@ -705,7 +868,7 @@ func (f *fakeLlmGatewayServer) updateProvider(w http.ResponseWriter, r *http.Req
 		_ = json.Unmarshal(body.BillingNote, &note)
 		updated.BillingNote = fakeLlmBillingNote(note)
 	}
-	if !validLlmBilling(w, &updated) {
+	if !validLlmBilling(w, &updated) || !validLlmProviderSync(w, &updated) {
 		return
 	}
 
@@ -730,6 +893,7 @@ func (f *fakeLlmGatewayServer) seedProvider() *fakeLlmProvider {
 		Enabled:            true,
 		EnforceHealthCheck: true,
 		BillingMode:        "per_token",
+		ModelSyncMode:      "off",
 	}
 	f.providers = append(f.providers, p)
 	return p
@@ -746,7 +910,8 @@ type fakeLlmConnection struct {
 	Settings      json.RawMessage
 	// Secret is the last api_key / credentials written. Stored to let tests
 	// assert the write-only round trip; never rendered into a response.
-	Secret string
+	Secret         string
+	LastChangeNote *string
 }
 
 func connectionJSON(c *fakeLlmConnection) map[string]any {
@@ -763,6 +928,7 @@ func connectionJSON(c *fakeLlmConnection) map[string]any {
 		"stores_key_material": fakeLlmStoresKeyMaterial(c.AuthType),
 		"created_at":          fakeLlmTime,
 		"updated_at":          fakeLlmTime,
+		"last_change_note":    c.LastChangeNote,
 	}
 	if out["stores_key_material"] == true && len(c.Secret) >= 4 {
 		out["key_last4"] = c.Secret[len(c.Secret)-4:]
@@ -882,9 +1048,14 @@ func (f *fakeLlmGatewayServer) createConnection(w http.ResponseWriter, r *http.R
 		APIKey        *string         `json:"api_key"`
 		Credentials   json.RawMessage `json:"credentials"`
 		Settings      json.RawMessage `json:"settings"`
+		ChangeNote    *string         `json:"change_note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
+	if !ok {
 		return
 	}
 	if !slices.Contains(fakeLlmModelProviders, body.ModelProvider) {
@@ -904,13 +1075,14 @@ func (f *fakeLlmGatewayServer) createConnection(w http.ResponseWriter, r *http.R
 		return
 	}
 	c := &fakeLlmConnection{
-		ID:            f.newID("cccc"),
-		Name:          body.Name,
-		ModelProvider: body.ModelProvider,
-		AuthType:      authType,
-		BaseURL:       body.BaseURL,
-		Settings:      settings,
-		Secret:        secret,
+		ID:             f.newID("cccc"),
+		Name:           body.Name,
+		ModelProvider:  body.ModelProvider,
+		AuthType:       authType,
+		BaseURL:        body.BaseURL,
+		Settings:       settings,
+		Secret:         secret,
+		LastChangeNote: note,
 	}
 	f.connections[c.ID] = c
 	_ = json.NewEncoder(w).Encode(connectionJSON(c))
@@ -926,12 +1098,18 @@ func (f *fakeLlmGatewayServer) updateConnection(w http.ResponseWriter, r *http.R
 		APIKey      *string         `json:"api_key"`
 		Credentials json.RawMessage `json:"credentials"`
 		Settings    json.RawMessage `json:"settings"`
+		ChangeNote  *string         `json:"change_note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
+	if !ok {
+		return
+	}
 	updated := *c
+	updated.LastChangeNote = note
 	if body.Name != nil {
 		updated.Name = *body.Name
 	}
@@ -1060,6 +1238,7 @@ func mappingJSON(f *fakeLlmGatewayServer, m *fakeLlmModelMapping, withProvider b
 		"bare_alias":                 m.BareAlias,
 		"stream_idle_timeout_secs":   m.StreamIdleTimeoutSecs,
 		"request_timeout_secs":       m.RequestTimeoutSecs,
+		"last_change_note":           m.LastChangeNote,
 	}
 	raw, _ := json.Marshal(m.Cooldown)
 	_ = json.Unmarshal(raw, &out)
@@ -1097,6 +1276,7 @@ func (f *fakeLlmGatewayServer) handleModelMappings(w http.ResponseWriter, r *htt
 		for i, m := range f.mappings {
 			if m.ID == id {
 				f.mappings = append(f.mappings[:i], f.mappings[i+1:]...)
+				f.forgetRouteGroupAliasIfGone(m.ModelAlias)
 				_ = json.NewEncoder(w).Encode(map[string]any{"deleted": true})
 				return
 			}
@@ -1129,20 +1309,25 @@ func validLlmMappingRanges(w http.ResponseWriter, retryCount, retryMaxWait int64
 
 func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ProviderID            string `json:"provider_id"`
-		ModelAlias            string `json:"model_alias"`
-		UpstreamModel         string `json:"upstream_model"`
-		Enabled               *bool  `json:"enabled"`
-		Priority              int64  `json:"priority"`
-		RetryOn429Count       int64  `json:"retry_on_429_count"`
-		RetryOn429MaxWaitSecs int64  `json:"retry_on_429_max_wait_secs"`
-		BareAlias             *bool  `json:"bare_alias"`
-		StreamIdleTimeoutSecs *int64 `json:"stream_idle_timeout_secs"`
-		RequestTimeoutSecs    *int64 `json:"request_timeout_secs"`
+		ProviderID            string  `json:"provider_id"`
+		ModelAlias            string  `json:"model_alias"`
+		UpstreamModel         string  `json:"upstream_model"`
+		Enabled               *bool   `json:"enabled"`
+		Priority              int64   `json:"priority"`
+		RetryOn429Count       int64   `json:"retry_on_429_count"`
+		RetryOn429MaxWaitSecs int64   `json:"retry_on_429_max_wait_secs"`
+		BareAlias             *bool   `json:"bare_alias"`
+		StreamIdleTimeoutSecs *int64  `json:"stream_idle_timeout_secs"`
+		RequestTimeoutSecs    *int64  `json:"request_timeout_secs"`
+		ChangeNote            *string `json:"change_note"`
 		fakeLlmCooldownPatch
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
+	if !ok {
 		return
 	}
 	if !validLlmMappingRanges(w, body.RetryOn429Count, body.RetryOn429MaxWaitSecs,
@@ -1195,6 +1380,7 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 			return
 		}
 		anchor.Cooldown = cooldown
+		anchor.LastChangeNote = note
 		anchor.Enabled = enabled
 		anchor.Priority = body.Priority
 		anchor.RetryOn429Count = body.RetryOn429Count
@@ -1237,6 +1423,7 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 		StreamIdleTimeoutSecs: streamIdle,
 		RequestTimeoutSecs:    requestTimeout,
 		Cooldown:              cooldown,
+		LastChangeNote:        note,
 	}
 	f.mappings = append(f.mappings, m)
 	_ = json.NewEncoder(w).Encode(mappingJSON(f, m, false))
@@ -1259,14 +1446,20 @@ func (f *fakeLlmGatewayServer) updateModelMapping(w http.ResponseWriter, r *http
 		BareAlias             *bool   `json:"bare_alias"`
 		StreamIdleTimeoutSecs *int64  `json:"stream_idle_timeout_secs"`
 		RequestTimeoutSecs    *int64  `json:"request_timeout_secs"`
+		ChangeNote            *string `json:"change_note"`
 		fakeLlmCooldownPatch
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
+	if !ok {
+		return
+	}
 
 	updated := *m
+	updated.LastChangeNote = note
 	if body.ModelAlias != nil {
 		updated.ModelAlias = *body.ModelAlias
 	}
@@ -1305,7 +1498,9 @@ func (f *fakeLlmGatewayServer) updateModelMapping(w http.ResponseWriter, r *http
 		return
 	}
 
+	previousAlias := m.ModelAlias
 	*m = updated
+	f.renameRouteGroupAlias(previousAlias, m.ModelAlias)
 	_ = json.NewEncoder(w).Encode(mappingJSON(f, m, false))
 }
 
@@ -1317,6 +1512,7 @@ func (f *fakeLlmGatewayServer) markMappingDeleted(t *testing.T, id string) {
 	for i, m := range f.mappings {
 		if m.ID == id {
 			f.mappings = append(f.mappings[:i], f.mappings[i+1:]...)
+			f.forgetRouteGroupAliasIfGone(m.ModelAlias)
 			return
 		}
 	}
@@ -1357,16 +1553,17 @@ func modelAccessJSON(p *fakeLlmModelAccessPolicy) map[string]any {
 		targets = []json.RawMessage{}
 	}
 	return map[string]any{
-		"id":           p.ID,
-		"org_id":       fakeLlmOrgID,
-		"name":         p.Name,
-		"scope_type":   p.ScopeType,
-		"scope_id":     p.ScopeID,
-		"scope_value":  p.ScopeValue,
-		"policy_type":  p.PolicyType,
-		"targets":      targets,
-		"traffic_type": p.TrafficType,
-		"enabled":      p.Enabled,
+		"id":               p.ID,
+		"org_id":           fakeLlmOrgID,
+		"name":             p.Name,
+		"scope_type":       p.ScopeType,
+		"scope_id":         p.ScopeID,
+		"scope_value":      p.ScopeValue,
+		"policy_type":      p.PolicyType,
+		"targets":          targets,
+		"traffic_type":     p.TrafficType,
+		"enabled":          p.Enabled,
+		"last_change_note": p.LastChangeNote,
 	}
 }
 
@@ -1384,6 +1581,7 @@ func validLlmModelAccessTargets(w http.ResponseWriter, targets []json.RawMessage
 			Alias      *string `json:"alias"`
 			Model      *string `json:"model"`
 			ProviderID *string `json:"provider_id"`
+			GroupID    *string `json:"group_id"`
 		}
 		if err := json.Unmarshal(raw, &t); err != nil {
 			writeLlmError(w, http.StatusBadRequest, "malformed target: "+err.Error())
@@ -1392,6 +1590,13 @@ func validLlmModelAccessTargets(w http.ResponseWriter, targets []json.RawMessage
 		if t.ProviderID != nil && !fakeLlmUUIDRe.MatchString(*t.ProviderID) {
 			http.Error(w, fmt.Sprintf(
 				"Failed to deserialize the JSON body into the target type: targets[%d].provider_id: UUID parsing failed", i),
+				http.StatusUnprocessableEntity)
+			return false
+		}
+		// group_id is a Uuid too; like provider_id, existence is not checked.
+		if t.GroupID != nil && !fakeLlmUUIDRe.MatchString(*t.GroupID) {
+			http.Error(w, fmt.Sprintf(
+				"Failed to deserialize the JSON body into the target type: targets[%d].group_id: UUID parsing failed", i),
 				http.StatusUnprocessableEntity)
 			return false
 		}
@@ -1405,6 +1610,8 @@ func validLlmModelAccessTargets(w http.ResponseWriter, targets []json.RawMessage
 			ok = t.ProviderID != nil
 		case "provider_model":
 			ok = t.ProviderID != nil && t.Model != nil
+		case "route_group":
+			ok = t.GroupID != nil
 		}
 		if !ok {
 			writeLlmError(w, http.StatusBadRequest,
@@ -1455,9 +1662,14 @@ func (f *fakeLlmGatewayServer) createModelAccess(w http.ResponseWriter, r *http.
 		PolicyType  string            `json:"policy_type"`
 		Targets     []json.RawMessage `json:"targets"`
 		TrafficType *string           `json:"traffic_type"`
+		ChangeNote  *string           `json:"change_note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
+	if !ok {
 		return
 	}
 	if len(body.Targets) == 0 {
@@ -1484,15 +1696,16 @@ func (f *fakeLlmGatewayServer) createModelAccess(w http.ResponseWriter, r *http.
 	}
 
 	p := &fakeLlmModelAccessPolicy{
-		ID:          f.newID("cccc"),
-		Name:        body.Name,
-		ScopeType:   body.ScopeType,
-		ScopeID:     body.ScopeID,
-		ScopeValue:  body.ScopeValue,
-		PolicyType:  body.PolicyType,
-		Targets:     body.Targets,
-		TrafficType: trafficType,
-		Enabled:     true, // create has no enabled field
+		ID:             f.newID("cccc"),
+		Name:           body.Name,
+		ScopeType:      body.ScopeType,
+		ScopeID:        body.ScopeID,
+		ScopeValue:     body.ScopeValue,
+		PolicyType:     body.PolicyType,
+		Targets:        body.Targets,
+		TrafficType:    trafficType,
+		Enabled:        true, // create has no enabled field
+		LastChangeNote: note,
 	}
 	f.policies = append(f.policies, p)
 	_ = json.NewEncoder(w).Encode(modelAccessJSON(p))
@@ -1514,9 +1727,14 @@ func (f *fakeLlmGatewayServer) updateModelAccess(w http.ResponseWriter, r *http.
 		Targets     *[]json.RawMessage `json:"targets"`
 		TrafficType *string            `json:"traffic_type"`
 		Enabled     *bool              `json:"enabled"`
+		ChangeNote  *string            `json:"change_note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
+	if !ok {
 		return
 	}
 	if body.ScopeType != nil && !slices.Contains(fakeLlmModelAccessScopeTypes, *body.ScopeType) {
@@ -1565,6 +1783,7 @@ func (f *fakeLlmGatewayServer) updateModelAccess(w http.ResponseWriter, r *http.
 		p.Enabled = *body.Enabled
 	}
 
+	p.LastChangeNote = note
 	_ = json.NewEncoder(w).Encode(modelAccessJSON(p))
 }
 
@@ -1607,30 +1826,36 @@ func (f *fakeLlmGatewayServer) findRateLimit(id string) *fakeLlmRateLimit {
 
 func rateLimitJSON(p *fakeLlmRateLimit) map[string]any {
 	return map[string]any{
-		"id":                  p.ID,
-		"org_id":              fakeLlmOrgID,
-		"name":                p.Name,
-		"scope_type":          p.ScopeType,
-		"scope_id":            p.ScopeID,
-		"scope_value":         p.ScopeValue,
-		"requests_per_minute": p.RequestsPerMinute,
-		"tokens_per_minute":   p.TokensPerMinute,
-		"member_of_group":     p.MemberOfGroup,
-		"traffic_type":        p.TrafficType,
-		"enabled":             p.Enabled,
+		"id":                    p.ID,
+		"org_id":                fakeLlmOrgID,
+		"name":                  p.Name,
+		"scope_type":            p.ScopeType,
+		"scope_id":              p.ScopeID,
+		"scope_value":           p.ScopeValue,
+		"requests_per_minute":   p.RequestsPerMinute,
+		"tokens_per_minute":     p.TokensPerMinute,
+		"member_of_group":       p.MemberOfGroup,
+		"traffic_type":          p.TrafficType,
+		"enabled":               p.Enabled,
+		"target_provider_id":    p.Targets.ProviderID,
+		"target_upstream_model": p.Targets.UpstreamModel,
+		"target_model_alias":    p.Targets.ModelAlias,
+		"target_mcp_server_id":  p.Targets.McpServerID,
+		"last_change_note":      p.LastChangeNote,
 	}
 }
 
 // rateLimitScopeTaken mirrors the rate_limit_policies_scope_unique_idx
-// (org, scope_type, scope_id, scope_value, traffic_type, member_of_group — V66).
-func (f *fakeLlmGatewayServer) rateLimitScopeTaken(scopeType string, scopeID, scopeValue *string, trafficType string, memberOfGroup *string, excludeID string) bool {
+// (org, scope_type, scope_id, scope_value, traffic_type, member_of_group, the
+// four targets — V74).
+func (f *fakeLlmGatewayServer) rateLimitScopeTaken(scopeType string, scopeID, scopeValue *string, trafficType string, memberOfGroup *string, targets fakeLlmTargets, excludeID string) bool {
 	for _, p := range f.rateLimits {
 		if p.ID == excludeID {
 			continue
 		}
 		if p.ScopeType == scopeType && strPtrEq(p.ScopeID, scopeID) &&
 			strPtrEq(p.ScopeValue, scopeValue) && p.TrafficType == trafficType &&
-			strPtrEq(p.MemberOfGroup, memberOfGroup) {
+			strPtrEq(p.MemberOfGroup, memberOfGroup) && p.Targets.eq(targets) {
 			return true
 		}
 	}
@@ -1712,6 +1937,8 @@ func (f *fakeLlmGatewayServer) createRateLimit(w http.ResponseWriter, r *http.Re
 		TokensPerMinute   *int64  `json:"tokens_per_minute"`
 		MemberOfGroup     *string `json:"member_of_group"`
 		TrafficType       *string `json:"traffic_type"`
+		ChangeNote        *string `json:"change_note"`
+		fakeLlmTargets
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
@@ -1731,7 +1958,14 @@ func (f *fakeLlmGatewayServer) createRateLimit(w http.ResponseWriter, r *http.Re
 	if body.TrafficType != nil {
 		trafficType = *body.TrafficType
 	}
-	if f.rateLimitScopeTaken(body.ScopeType, body.ScopeID, body.ScopeValue, trafficType, group, "") {
+	if !validLlmTargetShape(w, body.fakeLlmTargets, trafficType) {
+		return
+	}
+	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
+	if !ok {
+		return
+	}
+	if f.rateLimitScopeTaken(body.ScopeType, body.ScopeID, body.ScopeValue, trafficType, group, body.fakeLlmTargets, "") {
 		writeLlmError(w, http.StatusConflict,
 			"A policy with this scope and traffic type already exists.")
 		return
@@ -1748,6 +1982,8 @@ func (f *fakeLlmGatewayServer) createRateLimit(w http.ResponseWriter, r *http.Re
 		MemberOfGroup:     group,
 		TrafficType:       trafficType,
 		Enabled:           true, // create has no enabled field
+		Targets:           body.fakeLlmTargets,
+		LastChangeNote:    note,
 	}
 	f.rateLimits = append(f.rateLimits, p)
 	_ = json.NewEncoder(w).Encode(rateLimitJSON(p))
@@ -1804,6 +2040,30 @@ func (f *fakeLlmGatewayServer) updateRateLimit(w http.ResponseWriter, r *http.Re
 	if v, ok := raw["enabled"]; ok && string(v) != "null" {
 		_ = json.Unmarshal(v, &updated.Enabled)
 	}
+	// The targets are tri-state like the metrics (deserialize_explicit_null).
+	for key, dst := range map[string]**string{
+		"target_provider_id":    &updated.Targets.ProviderID,
+		"target_upstream_model": &updated.Targets.UpstreamModel,
+		"target_model_alias":    &updated.Targets.ModelAlias,
+		"target_mcp_server_id":  &updated.Targets.McpServerID,
+	} {
+		if v, ok := raw[key]; ok {
+			*dst = nil
+			if string(v) != "null" {
+				_ = json.Unmarshal(v, dst)
+			}
+		}
+	}
+	// change_note is a plain Option: an omitted note clears the last one.
+	var notePtr *string
+	if v, ok := raw["change_note"]; ok && string(v) != "null" {
+		_ = json.Unmarshal(v, &notePtr)
+	}
+	note, ok := fakeLlmChangeNote(w, notePtr)
+	if !ok {
+		return
+	}
+	updated.LastChangeNote = note
 
 	if updated.RequestsPerMinute != nil && *updated.RequestsPerMinute < 0 {
 		writeLlmError(w, http.StatusBadRequest, "requests_per_minute cannot be negative")
@@ -1825,8 +2085,11 @@ func (f *fakeLlmGatewayServer) updateRateLimit(w http.ResponseWriter, r *http.Re
 				"' their own allowance, so its scope cannot be changed")
 		return
 	}
+	if !validLlmTargetShape(w, updated.Targets, updated.TrafficType) {
+		return
+	}
 	if f.rateLimitScopeTaken(updated.ScopeType, updated.ScopeID, updated.ScopeValue, updated.TrafficType,
-		updated.MemberOfGroup, p.ID) {
+		updated.MemberOfGroup, updated.Targets, p.ID) {
 		writeLlmError(w, http.StatusConflict,
 			"A policy with this scope and traffic type already exists.")
 		return
@@ -1892,26 +2155,28 @@ func budgetJSON(b *fakeLlmTokenBudget) map[string]any {
 		"action_on_exhaust":     b.ActionOnExhaust,
 		"traffic_type":          b.TrafficType,
 		"enabled":               b.Enabled,
-		"cost_limit":            nil,
-		"currency":              "USD",
-		"target_provider_id":    nil,
-		"target_upstream_model": nil,
-		"target_model_alias":    nil,
+		"cost_limit":            b.CostLimit,
+		"currency":              b.Currency,
+		"target_provider_id":    b.Targets.ProviderID,
+		"target_upstream_model": b.Targets.UpstreamModel,
+		"target_model_alias":    b.Targets.ModelAlias,
+		"target_mcp_server_id":  b.Targets.McpServerID,
+		"last_change_note":      b.LastChangeNote,
 		"created_at":            fakeLlmTime,
 	}
 }
 
 // budgetScopeTaken mirrors the token_budgets_scope_unique_idx
 // (org, scope_type, scope_id, scope_value, traffic_type, period,
-// member_of_group — V65).
-func (f *fakeLlmGatewayServer) budgetScopeTaken(scopeType string, scopeID, scopeValue *string, trafficType, period string, memberOfGroup *string, excludeID string) bool {
+// member_of_group, the four targets — V73).
+func (f *fakeLlmGatewayServer) budgetScopeTaken(scopeType string, scopeID, scopeValue *string, trafficType, period string, memberOfGroup *string, targets fakeLlmTargets, excludeID string) bool {
 	for _, b := range f.budgets {
 		if b.ID == excludeID {
 			continue
 		}
 		if b.ScopeType == scopeType && strPtrEq(b.ScopeID, scopeID) &&
 			strPtrEq(b.ScopeValue, scopeValue) && b.TrafficType == trafficType && b.Period == period &&
-			strPtrEq(b.MemberOfGroup, memberOfGroup) {
+			strPtrEq(b.MemberOfGroup, memberOfGroup) && b.Targets.eq(targets) {
 			return true
 		}
 	}
@@ -1951,26 +2216,38 @@ func (f *fakeLlmGatewayServer) handleBudgets(w http.ResponseWriter, r *http.Requ
 
 func (f *fakeLlmGatewayServer) createBudget(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name            string  `json:"name"`
-		ScopeType       string  `json:"scope_type"`
-		ScopeID         *string `json:"scope_id"`
-		ScopeValue      *string `json:"scope_value"`
-		MemberOfGroup   *string `json:"member_of_group"`
-		Period          string  `json:"period"`
-		TokenLimit      int64   `json:"token_limit"`
-		AlertThresholds []int64 `json:"alert_thresholds"`
-		ActionOnExhaust *string `json:"action_on_exhaust"`
-		TrafficType     *string `json:"traffic_type"`
+		Name            string   `json:"name"`
+		ScopeType       string   `json:"scope_type"`
+		ScopeID         *string  `json:"scope_id"`
+		ScopeValue      *string  `json:"scope_value"`
+		MemberOfGroup   *string  `json:"member_of_group"`
+		Period          string   `json:"period"`
+		TokenLimit      *int64   `json:"token_limit"`
+		CostLimit       *float64 `json:"cost_limit"`
+		Currency        *string  `json:"currency"`
+		AlertThresholds []int64  `json:"alert_thresholds"`
+		ActionOnExhaust *string  `json:"action_on_exhaust"`
+		TrafficType     *string  `json:"traffic_type"`
+		ChangeNote      *string  `json:"change_note"`
+		fakeLlmTargets
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if body.TokenLimit < 0 {
+	// token_limit is a required i64 in CreateBudgetRequest: a missing key is
+	// an axum Json rejection (plain-text 422), not a defaulted 0.
+	if body.TokenLimit == nil {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte("Failed to deserialize the JSON body into the target type: missing field `token_limit`"))
+		return
+	}
+	tokenLimit := *body.TokenLimit
+	if tokenLimit < 0 {
 		writeLlmError(w, http.StatusBadRequest, "token_limit must be non-negative")
 		return
 	}
-	if body.TokenLimit == 0 {
+	if tokenLimit == 0 && (body.CostLimit == nil || *body.CostLimit <= 0) {
 		writeLlmError(w, http.StatusBadRequest,
 			"At least one limit is required: token_limit or cost_limit")
 		return
@@ -1996,8 +2273,25 @@ func (f *fakeLlmGatewayServer) createBudget(w http.ResponseWriter, r *http.Reque
 	if body.TrafficType != nil {
 		trafficType = *body.TrafficType
 	}
+	if !validLlmTargetShape(w, body.fakeLlmTargets, trafficType) {
+		return
+	}
+	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
+	if !ok {
+		return
+	}
+	currency := "USD"
+	if body.Currency != nil {
+		currency = *body.Currency
+	}
+	var costLimit *float64
+	if body.CostLimit != nil {
+		c := fakeLlmDecimal4(*body.CostLimit)
+		costLimit = &c
+	}
 
-	if f.budgetScopeTaken(body.ScopeType, body.ScopeID, body.ScopeValue, trafficType, body.Period, group, "") {
+	if f.budgetScopeTaken(body.ScopeType, body.ScopeID, body.ScopeValue, trafficType, body.Period, group,
+		body.fakeLlmTargets, "") {
 		writeLlmError(w, http.StatusConflict,
 			"A budget with this scope, target, traffic type, and period already exists. "+
 				"Edit the existing one, or vary the scope, target, traffic type, or period.")
@@ -2012,19 +2306,26 @@ func (f *fakeLlmGatewayServer) createBudget(w http.ResponseWriter, r *http.Reque
 		ScopeValue:      body.ScopeValue,
 		MemberOfGroup:   group,
 		Period:          body.Period,
-		TokenLimit:      body.TokenLimit,
+		TokenLimit:      tokenLimit,
+		CostLimit:       costLimit,
+		Currency:        currency,
 		AlertThresholds: thresholds,
 		ActionOnExhaust: action,
 		TrafficType:     trafficType,
 		Enabled:         true, // create has no enabled field
+		Targets:         body.fakeLlmTargets,
+		LastChangeNote:  note,
 	}
 	f.budgets = append(f.budgets, b)
 	_ = json.NewEncoder(w).Encode(budgetJSON(b))
 }
 
 // updateBudget applies production's COALESCE semantics: present non-null
-// keys overwrite, everything else keeps. The scope columns are not part of
-// the update contract at all.
+// keys overwrite, everything else keeps, and cost_limit 0 clears. The scope,
+// currency and target columns are not part of the update contract at all,
+// and — like production — nothing but the change note is validated: a
+// traffic_type that contradicts a stored target trips the V54/V73 CHECK,
+// which surfaces as a 500.
 func (f *fakeLlmGatewayServer) updateBudget(w http.ResponseWriter, r *http.Request, id string) {
 	b := f.findBudget(id)
 	if b == nil {
@@ -2033,20 +2334,35 @@ func (f *fakeLlmGatewayServer) updateBudget(w http.ResponseWriter, r *http.Reque
 	}
 
 	var body struct {
-		Name            *string `json:"name"`
-		TokenLimit      *int64  `json:"token_limit"`
-		AlertThresholds []int64 `json:"alert_thresholds"`
-		Enabled         *bool   `json:"enabled"`
-		Period          *string `json:"period"`
-		ActionOnExhaust *string `json:"action_on_exhaust"`
-		TrafficType     *string `json:"traffic_type"`
+		Name            *string  `json:"name"`
+		TokenLimit      *int64   `json:"token_limit"`
+		AlertThresholds []int64  `json:"alert_thresholds"`
+		Enabled         *bool    `json:"enabled"`
+		Period          *string  `json:"period"`
+		ActionOnExhaust *string  `json:"action_on_exhaust"`
+		TrafficType     *string  `json:"traffic_type"`
+		CostLimit       *float64 `json:"cost_limit"`
+		ChangeNote      *string  `json:"change_note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
+	if !ok {
+		return
+	}
 
 	updated := *b
+	updated.LastChangeNote = note
+	if body.CostLimit != nil {
+		if *body.CostLimit == 0 {
+			updated.CostLimit = nil
+		} else {
+			c := fakeLlmDecimal4(*body.CostLimit)
+			updated.CostLimit = &c
+		}
+	}
 	if body.Name != nil {
 		updated.Name = *body.Name
 	}
@@ -2068,9 +2384,14 @@ func (f *fakeLlmGatewayServer) updateBudget(w http.ResponseWriter, r *http.Reque
 	if body.TrafficType != nil {
 		updated.TrafficType = *body.TrafficType
 	}
+	if !validLlmTargetShape(httptest.NewRecorder(), updated.Targets, updated.TrafficType) {
+		writeLlmError(w, http.StatusInternalServerError,
+			"error returned from database: new row for relation \"token_budgets\" violates check constraint")
+		return
+	}
 
 	if f.budgetScopeTaken(updated.ScopeType, updated.ScopeID, updated.ScopeValue,
-		updated.TrafficType, updated.Period, updated.MemberOfGroup, b.ID) {
+		updated.TrafficType, updated.Period, updated.MemberOfGroup, updated.Targets, b.ID) {
 		writeLlmError(w, http.StatusConflict,
 			"A budget with this scope, target, traffic type, and period already exists. "+
 				"Edit the existing one, or vary the scope, target, traffic type, or period.")
@@ -2301,6 +2622,7 @@ func pricingJSON(v *fakeLlmPricingVersion) map[string]any {
 		"catalog_slug":                        v.CatalogSlug,
 		"cache_read_cost_per_million_tokens":  v.CacheRead,
 		"cache_write_cost_per_million_tokens": v.CacheWrite,
+		"long_context":                        v.LongContext,
 		"sync_mode":                           v.SyncMode,
 		"change_source":                       v.ChangeSource,
 		"change_reason":                       v.ChangeReason,
@@ -2308,6 +2630,47 @@ func pricingJSON(v *fakeLlmPricingVersion) map[string]any {
 		"created_by_email":                    "admin@example.com",
 		"is_archived":                         v.IsArchived,
 	}
+}
+
+// fakeLlmLongContext is a version's long-context tier (BCP-3904): five
+// columns that are all set or all null, rendered as one nested object.
+type fakeLlmLongContext struct {
+	ThresholdPromptTokens int64    `json:"threshold_prompt_tokens"`
+	InputCost             float64  `json:"input_cost_per_million_tokens"`
+	OutputCost            float64  `json:"output_cost_per_million_tokens"`
+	CacheRead             *float64 `json:"cache_read_cost_per_million_tokens"`
+	CacheWrite            *float64 `json:"cache_write_cost_per_million_tokens"`
+}
+
+func (t *fakeLlmLongContext) eq(o *fakeLlmLongContext) bool {
+	if (t == nil) != (o == nil) {
+		return false
+	}
+	return t == nil || (t.ThresholdPromptTokens == o.ThresholdPromptTokens && t.InputCost == o.InputCost &&
+		t.OutputCost == o.OutputCost && floatPtrEq(t.CacheRead, o.CacheRead) && floatPtrEq(t.CacheWrite, o.CacheWrite))
+}
+
+// validLlmLongContext mirrors LongContextTierRequest::validate.
+func validLlmLongContext(w http.ResponseWriter, t *fakeLlmLongContext) bool {
+	if t == nil {
+		return true
+	}
+	if t.ThresholdPromptTokens <= 0 {
+		writeLlmError(w, http.StatusBadRequest, fmt.Sprintf(
+			"long_context.threshold_prompt_tokens must be greater than 0, got %d", t.ThresholdPromptTokens))
+		return false
+	}
+	for name, v := range map[string]*float64{
+		"input_cost_per_million_tokens": &t.InputCost, "output_cost_per_million_tokens": &t.OutputCost,
+		"cache_read_cost_per_million_tokens": t.CacheRead, "cache_write_cost_per_million_tokens": t.CacheWrite,
+	} {
+		if v != nil && (math.IsNaN(*v) || *v < 0) {
+			writeLlmError(w, http.StatusBadRequest, fmt.Sprintf(
+				"long_context.%s must be a number greater than or equal to 0, got %v", name, *v))
+			return false
+		}
+	}
+	return true
 }
 
 func floatPtrEq(a, b *float64) bool {
@@ -2319,21 +2682,25 @@ func floatPtrEq(a, b *float64) bool {
 
 func (f *fakeLlmGatewayServer) createPricing(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ModelProvider *string  `json:"model_provider"`
-		ModelPattern  string   `json:"model_pattern"`
-		InputCost     float64  `json:"input_cost_per_million_tokens"`
-		OutputCost    float64  `json:"output_cost_per_million_tokens"`
-		EffectiveFrom *string  `json:"effective_from"`
-		ProviderID    *string  `json:"provider_id"`
-		CatalogSlug   *string  `json:"catalog_slug"`
-		SyncMode      *string  `json:"sync_mode"`
-		ChangeReason  *string  `json:"change_reason"`
-		CacheRead     *float64 `json:"cache_read_cost_per_million_tokens"`
-		CacheWrite    *float64 `json:"cache_write_cost_per_million_tokens"`
+		ModelProvider *string             `json:"model_provider"`
+		ModelPattern  string              `json:"model_pattern"`
+		InputCost     float64             `json:"input_cost_per_million_tokens"`
+		OutputCost    float64             `json:"output_cost_per_million_tokens"`
+		EffectiveFrom *string             `json:"effective_from"`
+		ProviderID    *string             `json:"provider_id"`
+		CatalogSlug   *string             `json:"catalog_slug"`
+		SyncMode      *string             `json:"sync_mode"`
+		ChangeReason  *string             `json:"change_reason"`
+		CacheRead     *float64            `json:"cache_read_cost_per_million_tokens"`
+		CacheWrite    *float64            `json:"cache_write_cost_per_million_tokens"`
+		LongContext   *fakeLlmLongContext `json:"long_context"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "Failed to parse the request body as JSON: "+err.Error(),
 			http.StatusUnprocessableEntity)
+		return
+	}
+	if !validLlmLongContext(w, body.LongContext) {
 		return
 	}
 
@@ -2374,12 +2741,12 @@ func (f *fakeLlmGatewayServer) createPricing(w http.ResponseWriter, r *http.Requ
 	current := pricingCurrentOf(group, now)
 
 	// Skip-on-no-op: a non-future write matching the current effective
-	// version (costs, cache rates, sync mode; not archived) returns the
-	// current row without inserting.
+	// version (costs, cache rates, long-context tier, sync mode; not
+	// archived) returns the current row without inserting.
 	if !isFuture && current != nil && !current.IsArchived &&
 		current.InputCost == body.InputCost && current.OutputCost == body.OutputCost &&
 		floatPtrEq(current.CacheRead, body.CacheRead) && floatPtrEq(current.CacheWrite, body.CacheWrite) &&
-		current.SyncMode == syncMode {
+		current.LongContext.eq(body.LongContext) && current.SyncMode == syncMode {
 		_ = json.NewEncoder(w).Encode(pricingJSON(current))
 		return
 	}
@@ -2402,13 +2769,16 @@ func (f *fakeLlmGatewayServer) createPricing(w http.ResponseWriter, r *http.Requ
 	}
 
 	v := &fakeLlmPricingVersion{
-		ID:               f.newID("ffff"),
-		ModelProvider:    modelProvider,
-		ModelPattern:     body.ModelPattern,
-		InputCost:        body.InputCost,
-		OutputCost:       body.OutputCost,
-		CacheRead:        body.CacheRead,
-		CacheWrite:       body.CacheWrite,
+		ID:            f.newID("ffff"),
+		ModelProvider: modelProvider,
+		ModelPattern:  body.ModelPattern,
+		InputCost:     body.InputCost,
+		OutputCost:    body.OutputCost,
+		CacheRead:     body.CacheRead,
+		CacheWrite:    body.CacheWrite,
+		// Like production, a new version takes the tier from the request
+		// alone: nothing is inherited from the version it supersedes.
+		LongContext:      body.LongContext,
 		EffectiveFrom:    eff,
 		EffectiveFromRaw: raw,
 		ProviderID:       body.ProviderID,
@@ -2525,6 +2895,15 @@ func (f *fakeLlmGatewayServer) updatePricing(w http.ResponseWriter, r *http.Requ
 			updated.CacheWrite = nil
 		} else {
 			_ = json.Unmarshal(field, &updated.CacheWrite)
+		}
+	}
+	if field, ok := raw["long_context"]; ok {
+		updated.LongContext = nil
+		if string(field) != "null" {
+			_ = json.Unmarshal(field, &updated.LongContext)
+			if !validLlmLongContext(w, updated.LongContext) {
+				return
+			}
 		}
 	}
 

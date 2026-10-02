@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/float64validator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -21,6 +23,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 
 	"github.com/barndoor-ai/terraform-provider-barndoor/internal/client"
 )
@@ -95,6 +98,7 @@ type llmModelPricingResourceModel struct {
 	OutputCost    types.Float64 `tfsdk:"output_cost_per_million_tokens"`
 	CacheRead     types.Float64 `tfsdk:"cache_read_cost_per_million_tokens"`
 	CacheWrite    types.Float64 `tfsdk:"cache_write_cost_per_million_tokens"`
+	LongContext   types.Object  `tfsdk:"long_context"`
 	SyncMode      types.String  `tfsdk:"sync_mode"`
 	EffectiveFrom types.String  `tfsdk:"effective_from"`
 	ChangeReason  types.String  `tfsdk:"change_reason"`
@@ -213,6 +217,45 @@ func (r *llmModelPricingResource) Schema(_ context.Context, _ resource.SchemaReq
 					float64validator.AtLeast(0),
 				},
 			},
+			"long_context": schema.SingleNestedAttribute{
+				MarkdownDescription: "Higher rates billed when a request's prompt exceeds a size " +
+					"threshold, for models whose vendor prices long contexts separately (BCP-3904). " +
+					"A request over `threshold_prompt_tokens` bills **all** its tokens at these rates. " +
+					"Unset means one rate set at every prompt size.\n\n" +
+					"The tier belongs to each pricing version, so it is re-sent with every price change. " +
+					"A tier set in the app on a rule Terraform manages therefore shows up as a diff " +
+					"rather than being dropped by the next price change.",
+				Optional: true,
+				Attributes: map[string]schema.Attribute{
+					"threshold_prompt_tokens": schema.Int64Attribute{
+						MarkdownDescription: "Prompt size, in tokens, above which the tier applies.",
+						Required:            true,
+						Validators: []validator.Int64{
+							int64validator.AtLeast(1),
+						},
+					},
+					"input_cost_per_million_tokens": schema.Float64Attribute{
+						MarkdownDescription: "Cost per million input tokens above the threshold.",
+						Required:            true,
+						Validators:          []validator.Float64{float64validator.AtLeast(0)},
+					},
+					"output_cost_per_million_tokens": schema.Float64Attribute{
+						MarkdownDescription: "Cost per million output tokens above the threshold.",
+						Required:            true,
+						Validators:          []validator.Float64{float64validator.AtLeast(0)},
+					},
+					"cache_read_cost_per_million_tokens": schema.Float64Attribute{
+						MarkdownDescription: "Cost per million cached input tokens above the threshold.",
+						Optional:            true,
+						Validators:          []validator.Float64{float64validator.AtLeast(0)},
+					},
+					"cache_write_cost_per_million_tokens": schema.Float64Attribute{
+						MarkdownDescription: "Cost per million cache-write tokens above the threshold.",
+						Optional:            true,
+						Validators:          []validator.Float64{float64validator.AtLeast(0)},
+					},
+				},
+			},
 			"sync_mode": schema.StringAttribute{
 				MarkdownDescription: "How the rule reacts to Barndoor's default pricing updates: " +
 					"`pinned` (org-managed, never touched by any sync — the platform default for " +
@@ -322,6 +365,10 @@ func (r *llmModelPricingResource) Create(ctx context.Context, req resource.Creat
 	}
 
 	body := llmPricingCreateBodyFromPlan(&plan)
+	body.LongContext, resp.Diagnostics = llmPricingLongContextWireFrom(ctx, plan.LongContext, resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 	if v, ok := knownString(plan.EffectiveFrom); ok {
 		body.EffectiveFrom = &v
 	}
@@ -337,7 +384,8 @@ func (r *llmModelPricingResource) Create(ctx context.Context, req resource.Creat
 		return
 	}
 
-	newState := applyLlmPricingVersionResponse(&version, &plan)
+	newState, diags := applyLlmPricingVersionResponse(ctx, &version, &plan)
+	resp.Diagnostics.Append(diags...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
 
@@ -371,7 +419,8 @@ func (r *llmModelPricingResource) Read(ctx context.Context, req resource.ReadReq
 		return
 	}
 
-	newState := applyLlmPricingVersionResponse(managed, &state)
+	newState, diags := applyLlmPricingVersionResponse(ctx, managed, &state)
+	resp.Diagnostics.Append(diags...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
 
@@ -405,6 +454,12 @@ func (r *llmModelPricingResource) Update(ctx context.Context, req resource.Updat
 	// the *previous* version's timestamp, and re-posting it would collide
 	// with that version.
 	body := llmPricingCreateBodyFromPlan(&plan)
+	// The tier is per version and a new version copies nothing from its
+	// predecessor, so it must ride along on every price change.
+	body.LongContext, resp.Diagnostics = llmPricingLongContextWireFrom(ctx, plan.LongContext, resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 	if cfgEff, ok := knownString(config.EffectiveFrom); ok {
 		if t, err := llmPricingParseTime(cfgEff); err == nil && !t.After(time.Now()) {
 			if stateEff, ok := knownString(state.EffectiveFrom); ok && llmPricingSameInstant(cfgEff, stateEff) {
@@ -429,7 +484,8 @@ func (r *llmModelPricingResource) Update(ctx context.Context, req resource.Updat
 		return
 	}
 
-	newState := applyLlmPricingVersionResponse(&version, &plan)
+	newState, diags := applyLlmPricingVersionResponse(ctx, &version, &plan)
+	resp.Diagnostics.Append(diags...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
 
@@ -530,9 +586,9 @@ func (r *llmModelPricingResource) stateVersionIsScheduled(ctx context.Context, s
 }
 
 // updateScheduledInPlace PUTs the plan onto the still-pending scheduled
-// version. The cache-cost keys are always present in the body (explicit null
-// clears — the endpoint's double-Option semantics), everything else is
-// COALESCE.
+// version. The cache-cost and long_context keys are always present in the
+// body (explicit null clears — the endpoint's double-Option semantics),
+// everything else is COALESCE.
 func (r *llmModelPricingResource) updateScheduledInPlace(ctx context.Context, plan, state *llmModelPricingResourceModel, resp *resource.UpdateResponse) {
 	input := plan.InputCost.ValueFloat64()
 	output := plan.OutputCost.ValueFloat64()
@@ -541,6 +597,10 @@ func (r *llmModelPricingResource) updateScheduledInPlace(ctx context.Context, pl
 		OutputCost: &output,
 		CacheRead:  float64PtrFromFloat64(plan.CacheRead),
 		CacheWrite: float64PtrFromFloat64(plan.CacheWrite),
+	}
+	body.LongContext, resp.Diagnostics = llmPricingLongContextWireFrom(ctx, plan.LongContext, resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
 	}
 	if v, ok := knownString(plan.EffectiveFrom); ok {
 		body.EffectiveFrom = &v
@@ -560,7 +620,8 @@ func (r *llmModelPricingResource) updateScheduledInPlace(ctx context.Context, pl
 		return
 	}
 
-	newState := applyLlmPricingVersionResponse(&version, plan)
+	newState, diags := applyLlmPricingVersionResponse(ctx, &version, plan)
+	resp.Diagnostics.Append(diags...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
 
@@ -683,6 +744,7 @@ func llmPricingVersionWriteChanges(plan, state *llmModelPricingResourceModel) bo
 		!plan.OutputCost.Equal(state.OutputCost) ||
 		!plan.CacheRead.Equal(state.CacheRead) ||
 		!plan.CacheWrite.Equal(state.CacheWrite) ||
+		!plan.LongContext.Equal(state.LongContext) ||
 		!plan.SyncMode.Equal(state.SyncMode) ||
 		!plan.EffectiveFrom.Equal(state.EffectiveFrom)
 }
@@ -746,6 +808,7 @@ func (llmPricingEffectiveFromPlanModifier) PlanModifyString(ctx context.Context,
 		!plan.OutputCost.Equal(state.OutputCost) ||
 		!plan.CacheRead.Equal(state.CacheRead) ||
 		!plan.CacheWrite.Equal(state.CacheWrite) ||
+		!plan.LongContext.Equal(state.LongContext) ||
 		!plan.SyncMode.Equal(state.SyncMode) {
 		resp.PlanValue = types.StringUnknown()
 	}
@@ -782,17 +845,18 @@ func (llmPricingRFC3339Validator) ValidateString(_ context.Context, req validato
 // sync_mode is omitted when unset — the platform defaults admin-authored rows
 // to `pinned`.
 type llmPricingCreateRequest struct {
-	ModelProvider *string  `json:"model_provider,omitempty"`
-	ModelPattern  string   `json:"model_pattern"`
-	InputCost     float64  `json:"input_cost_per_million_tokens"`
-	OutputCost    float64  `json:"output_cost_per_million_tokens"`
-	EffectiveFrom *string  `json:"effective_from,omitempty"`
-	ProviderID    *string  `json:"provider_id,omitempty"`
-	CatalogSlug   *string  `json:"catalog_slug,omitempty"`
-	SyncMode      *string  `json:"sync_mode,omitempty"`
-	ChangeReason  *string  `json:"change_reason,omitempty"`
-	CacheRead     *float64 `json:"cache_read_cost_per_million_tokens,omitempty"`
-	CacheWrite    *float64 `json:"cache_write_cost_per_million_tokens,omitempty"`
+	ModelProvider *string                    `json:"model_provider,omitempty"`
+	ModelPattern  string                     `json:"model_pattern"`
+	InputCost     float64                    `json:"input_cost_per_million_tokens"`
+	OutputCost    float64                    `json:"output_cost_per_million_tokens"`
+	EffectiveFrom *string                    `json:"effective_from,omitempty"`
+	ProviderID    *string                    `json:"provider_id,omitempty"`
+	CatalogSlug   *string                    `json:"catalog_slug,omitempty"`
+	SyncMode      *string                    `json:"sync_mode,omitempty"`
+	ChangeReason  *string                    `json:"change_reason,omitempty"`
+	CacheRead     *float64                   `json:"cache_read_cost_per_million_tokens,omitempty"`
+	CacheWrite    *float64                   `json:"cache_write_cost_per_million_tokens,omitempty"`
+	LongContext   *llmPricingLongContextWire `json:"long_context,omitempty"`
 }
 
 // llmPricingUpdateRequest mirrors the llm-gateway UpdatePricingRequest body
@@ -802,13 +866,75 @@ type llmPricingCreateRequest struct {
 // from an explicit null (clear the override), and Terraform's plan is the
 // full desired state — a nil pointer must clear.
 type llmPricingUpdateRequest struct {
-	InputCost     *float64 `json:"input_cost_per_million_tokens,omitempty"`
-	OutputCost    *float64 `json:"output_cost_per_million_tokens,omitempty"`
-	EffectiveFrom *string  `json:"effective_from,omitempty"`
-	SyncMode      *string  `json:"sync_mode,omitempty"`
-	ChangeReason  *string  `json:"change_reason,omitempty"`
-	CacheRead     *float64 `json:"cache_read_cost_per_million_tokens"`
-	CacheWrite    *float64 `json:"cache_write_cost_per_million_tokens"`
+	InputCost     *float64                   `json:"input_cost_per_million_tokens,omitempty"`
+	OutputCost    *float64                   `json:"output_cost_per_million_tokens,omitempty"`
+	EffectiveFrom *string                    `json:"effective_from,omitempty"`
+	SyncMode      *string                    `json:"sync_mode,omitempty"`
+	ChangeReason  *string                    `json:"change_reason,omitempty"`
+	CacheRead     *float64                   `json:"cache_read_cost_per_million_tokens"`
+	CacheWrite    *float64                   `json:"cache_write_cost_per_million_tokens"`
+	LongContext   *llmPricingLongContextWire `json:"long_context"`
+}
+
+// llmPricingLongContextWire mirrors LongContextTierRequest, and the nested
+// long_context object the platform returns.
+type llmPricingLongContextWire struct {
+	ThresholdPromptTokens int64    `json:"threshold_prompt_tokens"`
+	InputCost             float64  `json:"input_cost_per_million_tokens"`
+	OutputCost            float64  `json:"output_cost_per_million_tokens"`
+	CacheRead             *float64 `json:"cache_read_cost_per_million_tokens"`
+	CacheWrite            *float64 `json:"cache_write_cost_per_million_tokens"`
+}
+
+// llmPricingLongContextModel is the long_context attribute's object model.
+type llmPricingLongContextModel struct {
+	ThresholdPromptTokens types.Int64   `tfsdk:"threshold_prompt_tokens"`
+	InputCost             types.Float64 `tfsdk:"input_cost_per_million_tokens"`
+	OutputCost            types.Float64 `tfsdk:"output_cost_per_million_tokens"`
+	CacheRead             types.Float64 `tfsdk:"cache_read_cost_per_million_tokens"`
+	CacheWrite            types.Float64 `tfsdk:"cache_write_cost_per_million_tokens"`
+}
+
+var llmPricingLongContextAttrTypes = map[string]attr.Type{
+	"threshold_prompt_tokens":             types.Int64Type,
+	"input_cost_per_million_tokens":       types.Float64Type,
+	"output_cost_per_million_tokens":      types.Float64Type,
+	"cache_read_cost_per_million_tokens":  types.Float64Type,
+	"cache_write_cost_per_million_tokens": types.Float64Type,
+}
+
+// llmPricingLongContextWireFrom converts the planned tier; null converts to
+// nil (no tier). It threads diags so callers can assign both results.
+func llmPricingLongContextWireFrom(ctx context.Context, obj types.Object, diags diag.Diagnostics) (*llmPricingLongContextWire, diag.Diagnostics) {
+	if obj.IsNull() || obj.IsUnknown() {
+		return nil, diags
+	}
+	var m llmPricingLongContextModel
+	diags.Append(obj.As(ctx, &m, basetypes.ObjectAsOptions{})...)
+	if diags.HasError() {
+		return nil, diags
+	}
+	return &llmPricingLongContextWire{
+		ThresholdPromptTokens: m.ThresholdPromptTokens.ValueInt64(),
+		InputCost:             m.InputCost.ValueFloat64(),
+		OutputCost:            m.OutputCost.ValueFloat64(),
+		CacheRead:             float64PtrFromFloat64(m.CacheRead),
+		CacheWrite:            float64PtrFromFloat64(m.CacheWrite),
+	}, diags
+}
+
+// llmPricingLongContextObject maps the platform's tier onto state.
+func llmPricingLongContextObject(ctx context.Context, w *llmPricingLongContextWire) (types.Object, diag.Diagnostics) {
+	if w == nil {
+		return types.ObjectNull(llmPricingLongContextAttrTypes), nil
+	}
+	return types.ObjectValueFrom(ctx, llmPricingLongContextAttrTypes, llmPricingLongContextModel{
+		ThresholdPromptTokens: types.Int64Value(w.ThresholdPromptTokens),
+		InputCost:             types.Float64Value(w.InputCost),
+		OutputCost:            types.Float64Value(w.OutputCost),
+		CacheRead:             float64FromPtr(w.CacheRead),
+		CacheWrite:            float64FromPtr(w.CacheWrite),
+	})
 }
 
 // llmPricingVersionResponse mirrors the llm-gateway AdminModelPricing wire
@@ -816,21 +942,22 @@ type llmPricingUpdateRequest struct {
 // versioning metadata. The actor fields (created_by_user_id/email) and
 // provider_name are decoded but not surfaced as attributes.
 type llmPricingVersionResponse struct {
-	ID            string   `json:"id"`
-	OrgID         string   `json:"org_id"`
-	ModelProvider *string  `json:"model_provider"`
-	ModelPattern  string   `json:"model_pattern"`
-	InputCost     float64  `json:"input_cost_per_million_tokens"`
-	OutputCost    float64  `json:"output_cost_per_million_tokens"`
-	EffectiveFrom string   `json:"effective_from"`
-	ProviderID    *string  `json:"provider_id"`
-	CatalogSlug   *string  `json:"catalog_slug"`
-	CacheRead     *float64 `json:"cache_read_cost_per_million_tokens"`
-	CacheWrite    *float64 `json:"cache_write_cost_per_million_tokens"`
-	SyncMode      string   `json:"sync_mode"`
-	ChangeSource  string   `json:"change_source"`
-	ChangeReason  *string  `json:"change_reason"`
-	IsArchived    bool     `json:"is_archived"`
+	ID            string                     `json:"id"`
+	OrgID         string                     `json:"org_id"`
+	ModelProvider *string                    `json:"model_provider"`
+	ModelPattern  string                     `json:"model_pattern"`
+	InputCost     float64                    `json:"input_cost_per_million_tokens"`
+	OutputCost    float64                    `json:"output_cost_per_million_tokens"`
+	EffectiveFrom string                     `json:"effective_from"`
+	ProviderID    *string                    `json:"provider_id"`
+	CatalogSlug   *string                    `json:"catalog_slug"`
+	CacheRead     *float64                   `json:"cache_read_cost_per_million_tokens"`
+	CacheWrite    *float64                   `json:"cache_write_cost_per_million_tokens"`
+	LongContext   *llmPricingLongContextWire `json:"long_context"`
+	SyncMode      string                     `json:"sync_mode"`
+	ChangeSource  string                     `json:"change_source"`
+	ChangeReason  *string                    `json:"change_reason"`
+	IsArchived    bool                       `json:"is_archived"`
 }
 
 // llmPricingCreateBodyFromPlan builds the POST body shared by Create and the
@@ -868,11 +995,12 @@ func llmPricingCreateBodyFromPlan(plan *llmModelPricingResourceModel) *llmPricin
 // echoes the previous version's reason), and a configured effective_from
 // string is kept verbatim when it denotes the same instant the platform
 // echoed back.
-func applyLlmPricingVersionResponse(version *llmPricingVersionResponse, prior *llmModelPricingResourceModel) llmModelPricingResourceModel {
+func applyLlmPricingVersionResponse(ctx context.Context, version *llmPricingVersionResponse, prior *llmModelPricingResourceModel) (llmModelPricingResourceModel, diag.Diagnostics) {
 	effectiveFrom := types.StringValue(version.EffectiveFrom)
 	if v, ok := knownString(prior.EffectiveFrom); ok && llmPricingSameInstant(v, version.EffectiveFrom) {
 		effectiveFrom = prior.EffectiveFrom
 	}
+	longContext, diags := llmPricingLongContextObject(ctx, version.LongContext)
 	return llmModelPricingResourceModel{
 		ID:            types.StringValue(version.ID),
 		OrgID:         types.StringValue(version.OrgID),
@@ -884,11 +1012,12 @@ func applyLlmPricingVersionResponse(version *llmPricingVersionResponse, prior *l
 		OutputCost:    types.Float64Value(version.OutputCost),
 		CacheRead:     float64FromPtr(version.CacheRead),
 		CacheWrite:    float64FromPtr(version.CacheWrite),
+		LongContext:   longContext,
 		SyncMode:      types.StringValue(version.SyncMode),
 		EffectiveFrom: effectiveFrom,
 		ChangeReason:  prior.ChangeReason,
 		ChangeSource:  types.StringValue(version.ChangeSource),
-	}
+	}, diags
 }
 
 // --- small value helpers -------------------------------------------------------

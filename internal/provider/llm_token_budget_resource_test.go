@@ -38,20 +38,21 @@ func TestLlmTokenBudgetResource_Schema(t *testing.T) {
 
 	for _, attr := range []string{
 		"id", "org_id", "name", "scope_type", "scope_id", "scope_value", "period",
-		"token_limit", "alert_thresholds", "action_on_exhaust", "traffic_type",
-		"enabled", "created_at",
+		"token_limit", "cost_limit", "currency", "alert_thresholds", "action_on_exhaust",
+		"traffic_type", "enabled", "change_note", "target_provider_id", "target_upstream_model",
+		"target_model_alias", "target_mcp_server_id", "created_at",
 	} {
 		if _, ok := resp.Schema.Attributes[attr]; !ok {
 			t.Errorf("schema missing attribute %q", attr)
 		}
 	}
-	for _, required := range []string{"name", "scope_type", "period", "token_limit"} {
+	for _, required := range []string{"name", "scope_type", "period"} {
 		if !resp.Schema.Attributes[required].IsRequired() {
 			t.Errorf("%s should be Required", required)
 		}
 	}
 	for _, computed := range []string{
-		"id", "org_id", "alert_thresholds", "action_on_exhaust", "traffic_type",
+		"id", "org_id", "currency", "alert_thresholds", "action_on_exhaust", "traffic_type",
 		"enabled", "created_at",
 	} {
 		if !resp.Schema.Attributes[computed].IsComputed() {

@@ -6,6 +6,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net/http"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
@@ -55,6 +56,8 @@ type llmRateLimitResourceModel struct {
 	MemberOfGroup     types.String `tfsdk:"member_of_group"`
 	TrafficType       types.String `tfsdk:"traffic_type"`
 	Enabled           types.Bool   `tfsdk:"enabled"`
+	ChangeNote        types.String `tfsdk:"change_note"`
+	llmTargetsModel
 }
 
 func (r *llmRateLimitResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -62,61 +65,68 @@ func (r *llmRateLimitResource) Metadata(_ context.Context, req resource.Metadata
 }
 
 func (r *llmRateLimitResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
+	attributes := map[string]schema.Attribute{
+		"id": schema.StringAttribute{
+			MarkdownDescription: "Policy UUID assigned by the API; also the `terraform import` key.",
+			Computed:            true,
+			PlanModifiers: []planmodifier.String{
+				stringplanmodifier.UseStateForUnknown(),
+			},
+		},
+		"org_id": schema.StringAttribute{
+			MarkdownDescription: "Organization the policy belongs to, resolved from the provider " +
+				"credential's token claims.",
+			Computed: true,
+			PlanModifiers: []planmodifier.String{
+				stringplanmodifier.UseStateForUnknown(),
+			},
+		},
+		"name": schema.StringAttribute{
+			MarkdownDescription: "Human-readable policy name.",
+			Required:            true,
+		},
+		"scope_type": llmScopeTypeAttribute(llmGatewayRateLimitScopeTypes, false),
+		"scope_id":   llmScopeIDAttribute(),
+		"scope_value": llmScopeValueAttribute("e.g. a role or IdP group name for `role`/`group` " +
+			"scopes"),
+		"member_of_group": llmMemberOfGroupAttribute("rate limit"),
+		"requests_per_minute": schema.Int64Attribute{
+			MarkdownDescription: "Requests allowed per rolling 60-second window. Omit to enforce " +
+				"tokens only.",
+			Optional: true,
+			Validators: []validator.Int64{
+				int64validator.AtLeast(0),
+			},
+		},
+		"tokens_per_minute": schema.Int64Attribute{
+			MarkdownDescription: "Tokens allowed per rolling 60-second window. Omit to enforce " +
+				"requests only.",
+			Optional: true,
+			Validators: []validator.Int64{
+				int64validator.AtLeast(0),
+			},
+		},
+		"traffic_type": llmTrafficTypeAttribute("all", stringdefault.StaticString("all")),
+		"enabled":      llmEnabledAttribute(),
+		"change_note":  llmChangeNoteAttribute("rate limit"),
+	}
+	maps.Copy(attributes, llmTargetAttributes("rate limit", false))
+
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "Manages an LLM Gateway rate-limit policy: a per-minute request and/or " +
-			"token ceiling applied to an identity scope (the organization, a user, an IdP group, …).\n\n" +
+			"token ceiling applied to an identity scope (the organization, a user, an IdP group, …), " +
+			"optionally narrowed to one provider, upstream model, model alias or MCP server.\n\n" +
 			"At least one of `requests_per_minute` / `tokens_per_minute` must be set; removing one from " +
-			"configuration clears that metric on the platform. The platform allows one policy per " +
-			"`(scope, traffic_type)` combination and answers 409 on duplicates.",
-		Attributes: map[string]schema.Attribute{
-			"id": schema.StringAttribute{
-				MarkdownDescription: "Policy UUID assigned by the API; also the `terraform import` key.",
-				Computed:            true,
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
-			},
-			"org_id": schema.StringAttribute{
-				MarkdownDescription: "Organization the policy belongs to, resolved from the provider " +
-					"credential's token claims.",
-				Computed: true,
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
-			},
-			"name": schema.StringAttribute{
-				MarkdownDescription: "Human-readable policy name.",
-				Required:            true,
-			},
-			"scope_type": llmScopeTypeAttribute(llmGatewayRateLimitScopeTypes, false),
-			"scope_id":   llmScopeIDAttribute(),
-			"scope_value": llmScopeValueAttribute("e.g. a role or IdP group name for `role`/`group` " +
-				"scopes"),
-			"member_of_group": llmMemberOfGroupAttribute("rate limit"),
-			"requests_per_minute": schema.Int64Attribute{
-				MarkdownDescription: "Requests allowed per rolling 60-second window. Omit to enforce " +
-					"tokens only.",
-				Optional: true,
-				Validators: []validator.Int64{
-					int64validator.AtLeast(0),
-				},
-			},
-			"tokens_per_minute": schema.Int64Attribute{
-				MarkdownDescription: "Tokens allowed per rolling 60-second window. Omit to enforce " +
-					"requests only.",
-				Optional: true,
-				Validators: []validator.Int64{
-					int64validator.AtLeast(0),
-				},
-			},
-			"traffic_type": llmTrafficTypeAttribute("all", stringdefault.StaticString("all")),
-			"enabled":      llmEnabledAttribute(),
-		},
+			"configuration clears that metric on the platform, and the same goes for a target. The " +
+			"platform allows one policy per `(scope, member_of_group, targets, traffic_type)` " +
+			"combination and answers 409 on duplicates.",
+		Attributes: attributes,
 	}
 }
 
 // ConfigValidators enforces the API invariants that a policy carries at least
-// one metric and that a member_of_group filter sits on a broad per-user scope.
+// one metric, that a member_of_group filter sits on a broad per-user scope,
+// and that its targets form a valid shape.
 func (r *llmRateLimitResource) ConfigValidators(_ context.Context) []resource.ConfigValidator {
 	return []resource.ConfigValidator{
 		resourcevalidator.AtLeastOneOf(
@@ -124,6 +134,7 @@ func (r *llmRateLimitResource) ConfigValidators(_ context.Context) []resource.Co
 			path.MatchRoot("tokens_per_minute"),
 		),
 		llmMemberOfGroupShapeValidator{what: "rate limit"},
+		llmTargetShapeValidator{},
 	}
 }
 
@@ -159,6 +170,10 @@ func (r *llmRateLimitResource) Create(ctx context.Context, req resource.CreateRe
 		ScopeType:         plan.ScopeType.ValueString(),
 		RequestsPerMinute: int32PtrFromInt64(plan.RequestsPerMinute),
 		TokensPerMinute:   int32PtrFromInt64(plan.TokensPerMinute),
+		llmTargetsWire:    plan.wire(),
+	}
+	if v, ok := knownString(plan.ChangeNote); ok {
+		body.ChangeNote = &v
 	}
 	if v, ok := knownString(plan.ScopeID); ok {
 		body.ScopeID = &v
@@ -259,6 +274,11 @@ func (r *llmRateLimitResource) Update(ctx context.Context, req resource.UpdateRe
 		RequestsPerMinute: int32PtrFromInt64(plan.RequestsPerMinute),
 		TokensPerMinute:   int32PtrFromInt64(plan.TokensPerMinute),
 		Enabled:           boolPtrFromBool(plan.Enabled),
+		// The targets are tri-state like the metrics: a null clears.
+		llmTargetsWire: plan.wire(),
+	}
+	if v, ok := knownString(plan.ChangeNote); ok {
+		body.ChangeNote = &v
 	}
 	if v, ok := knownString(plan.ScopeID); ok {
 		body.ScopeID = &v
@@ -329,10 +349,13 @@ type llmRateLimitCreateRequest struct {
 	TokensPerMinute   *int32  `json:"tokens_per_minute,omitempty"`
 	MemberOfGroup     *string `json:"member_of_group,omitempty"`
 	TrafficType       *string `json:"traffic_type,omitempty"`
+	ChangeNote        *string `json:"change_note,omitempty"`
+	llmTargetsWire
 }
 
 // llmRateLimitUpdateRequest mirrors the llm-gateway UpdateRateLimitRequest
-// body, which has no member_of_group (it is RequiresReplace). The two metric keys are deliberately **not** omitempty: the API's
+// body, which has no member_of_group (it is RequiresReplace). The two metric
+// keys, like the embedded target keys, are deliberately **not** omitempty: the API's
 // tri-state PATCH semantics distinguish an absent key (keep the current
 // value) from an explicit null (clear the metric), and Terraform's plan is
 // the full desired state — a nil pointer must clear.
@@ -345,6 +368,8 @@ type llmRateLimitUpdateRequest struct {
 	TokensPerMinute   *int32  `json:"tokens_per_minute"`
 	TrafficType       *string `json:"traffic_type,omitempty"`
 	Enabled           *bool   `json:"enabled,omitempty"`
+	ChangeNote        *string `json:"change_note,omitempty"`
+	llmTargetsWire
 }
 
 // llmRateLimitResponse mirrors the ai_governance RateLimitPolicy response.
@@ -360,6 +385,7 @@ type llmRateLimitResponse struct {
 	MemberOfGroup     *string `json:"member_of_group"`
 	TrafficType       string  `json:"traffic_type"`
 	Enabled           bool    `json:"enabled"`
+	llmTargetsWire
 }
 
 // applyLlmRateLimitResponse maps the server's view onto a state model. prior
@@ -378,5 +404,7 @@ func applyLlmRateLimitResponse(policy *llmRateLimitResponse, prior *llmRateLimit
 		MemberOfGroup:     optionalStringFromPtr(policy.MemberOfGroup, prior.MemberOfGroup),
 		TrafficType:       types.StringValue(policy.TrafficType),
 		Enabled:           types.BoolValue(policy.Enabled),
+		ChangeNote:        prior.ChangeNote, // write-only; see llmChangeNoteAttribute
+		llmTargetsModel:   policy.model(prior.llmTargetsModel),
 	}
 }

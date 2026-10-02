@@ -64,6 +64,8 @@ type llmModelMappingResourceModel struct {
 	CooldownMaxSecs          types.Int64 `tfsdk:"cooldown_max_secs"`
 	Cooldown429DefaultSecs   types.Int64 `tfsdk:"cooldown_429_default_secs"`
 	CooldownOverloadedSecs   types.Int64 `tfsdk:"cooldown_overloaded_secs"`
+
+	ChangeNote types.String `tfsdk:"change_note"`
 }
 
 func (r *llmModelMappingResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -209,6 +211,7 @@ func (r *llmModelMappingResource) Schema(_ context.Context, _ resource.SchemaReq
 				"Flat cooldown after an upstream 529 (\"overloaded\") with no usable `Retry-After`, in "+
 					"seconds (0–3600, and at most `cooldown_max_secs` unless `0`). Defaults to `10`. `0` "+
 					"counts a 529 as an ordinary failure instead.", 0, 3600),
+			"change_note": llmChangeNoteAttribute("model route"),
 		},
 	}
 }
@@ -312,7 +315,7 @@ func (r *llmModelMappingResource) Create(ctx context.Context, req resource.Creat
 		return
 	}
 
-	state := applyLlmModelMappingResponse(&mapping)
+	state := applyLlmModelMappingResponse(&mapping, plan.ChangeNote)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -337,7 +340,7 @@ func (r *llmModelMappingResource) Read(ctx context.Context, req resource.ReadReq
 
 	for i := range mappings {
 		if mappings[i].ID == state.ID.ValueString() {
-			newState := applyLlmModelMappingResponse(&mappings[i])
+			newState := applyLlmModelMappingResponse(&mappings[i], state.ChangeNote)
 			resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 			return
 		}
@@ -367,7 +370,7 @@ func (r *llmModelMappingResource) Update(ctx context.Context, req resource.Updat
 		return
 	}
 
-	newState := applyLlmModelMappingResponse(&mapping)
+	newState := applyLlmModelMappingResponse(&mapping, plan.ChangeNote)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
 
@@ -411,16 +414,17 @@ func (r *llmModelMappingResource) requireClient(diags *diag.Diagnostics) bool {
 // llmModelMappingCreateRequest mirrors the llm-gateway CreateModelMappingRequest
 // body.
 type llmModelMappingCreateRequest struct {
-	ProviderID            string `json:"provider_id"`
-	ModelAlias            string `json:"model_alias"`
-	UpstreamModel         string `json:"upstream_model"`
-	Enabled               *bool  `json:"enabled,omitempty"`
-	Priority              *int32 `json:"priority,omitempty"`
-	RetryOn429Count       *int32 `json:"retry_on_429_count,omitempty"`
-	RetryOn429MaxWaitSecs *int32 `json:"retry_on_429_max_wait_secs,omitempty"`
-	BareAlias             *bool  `json:"bare_alias,omitempty"`
-	StreamIdleTimeoutSecs *int32 `json:"stream_idle_timeout_secs,omitempty"`
-	RequestTimeoutSecs    *int32 `json:"request_timeout_secs,omitempty"`
+	ProviderID            string  `json:"provider_id"`
+	ModelAlias            string  `json:"model_alias"`
+	UpstreamModel         string  `json:"upstream_model"`
+	Enabled               *bool   `json:"enabled,omitempty"`
+	Priority              *int32  `json:"priority,omitempty"`
+	RetryOn429Count       *int32  `json:"retry_on_429_count,omitempty"`
+	RetryOn429MaxWaitSecs *int32  `json:"retry_on_429_max_wait_secs,omitempty"`
+	BareAlias             *bool   `json:"bare_alias,omitempty"`
+	StreamIdleTimeoutSecs *int32  `json:"stream_idle_timeout_secs,omitempty"`
+	RequestTimeoutSecs    *int32  `json:"request_timeout_secs,omitempty"`
+	ChangeNote            *string `json:"change_note,omitempty"`
 	llmCooldownFields
 }
 
@@ -438,6 +442,7 @@ type llmModelMappingUpdateRequest struct {
 	BareAlias             *bool   `json:"bare_alias,omitempty"`
 	StreamIdleTimeoutSecs *int32  `json:"stream_idle_timeout_secs,omitempty"`
 	RequestTimeoutSecs    *int32  `json:"request_timeout_secs,omitempty"`
+	ChangeNote            *string `json:"change_note,omitempty"`
 	llmCooldownFields
 }
 
@@ -515,6 +520,7 @@ func buildLlmModelMappingCreateRequest(plan *llmModelMappingResourceModel) *llmM
 		BareAlias:             boolPtrFromBool(plan.BareAlias),
 		StreamIdleTimeoutSecs: int32PtrFromInt64(plan.StreamIdleTimeoutSecs),
 		RequestTimeoutSecs:    int32PtrFromInt64(plan.RequestTimeoutSecs),
+		ChangeNote:            stringPtrIfKnown(plan.ChangeNote),
 		llmCooldownFields:     plannedCooldown(plan),
 	}
 }
@@ -534,14 +540,16 @@ func buildLlmModelMappingUpdateRequest(plan *llmModelMappingResourceModel) *llmM
 		BareAlias:             boolPtrFromBool(plan.BareAlias),
 		StreamIdleTimeoutSecs: int32PtrFromInt64(plan.StreamIdleTimeoutSecs),
 		RequestTimeoutSecs:    int32PtrFromInt64(plan.RequestTimeoutSecs),
+		ChangeNote:            stringPtrIfKnown(plan.ChangeNote),
 		llmCooldownFields:     plannedCooldown(plan),
 	}
 }
 
 // applyLlmModelMappingResponse maps the server's view onto a state model.
 // Every attribute is authoritative in the response (the server materializes
-// defaults at insert), so no null settling against a prior is needed.
-func applyLlmModelMappingResponse(mapping *llmModelMappingResponse) llmModelMappingResourceModel {
+// defaults at insert), so no null settling against a prior is needed — except
+// the write-only change_note, which settles from the plan or prior state.
+func applyLlmModelMappingResponse(mapping *llmModelMappingResponse, changeNote types.String) llmModelMappingResourceModel {
 	return llmModelMappingResourceModel{
 		ID:                    types.StringValue(mapping.ID),
 		ProviderID:            types.StringValue(mapping.ProviderID),
@@ -561,5 +569,7 @@ func applyLlmModelMappingResponse(mapping *llmModelMappingResponse) llmModelMapp
 		CooldownMaxSecs:          types.Int64Value(int64(mapping.CooldownMaxSecs)),
 		Cooldown429DefaultSecs:   types.Int64Value(int64(mapping.Cooldown429DefaultSecs)),
 		CooldownOverloadedSecs:   types.Int64Value(int64(mapping.CooldownOverloadedSecs)),
+
+		ChangeNote: changeNote,
 	}
 }

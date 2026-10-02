@@ -27,3 +27,20 @@ resource "barndoor_llm_model_pricing" "claude_sonnet" {
   effective_from = "2030-01-01T00:00:00Z"
   change_reason  = "Negotiated 2030 rates"
 }
+
+# A model whose vendor charges more above a prompt-size threshold: a request
+# whose prompt exceeds 200,000 tokens bills all its tokens at the
+# long_context rates.
+resource "barndoor_llm_model_pricing" "gemini_pro" {
+  model_pattern  = "gemini-2.5-pro"
+  model_provider = "google_ai"
+
+  input_cost_per_million_tokens  = 1.25
+  output_cost_per_million_tokens = 10
+
+  long_context = {
+    threshold_prompt_tokens        = 200000
+    input_cost_per_million_tokens  = 2.5
+    output_cost_per_million_tokens = 15
+  }
+}
