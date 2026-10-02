@@ -24,7 +24,8 @@ import (
 //
 // fakeLlmGatewayServer emulates the llm-gateway admin REST surface the
 // provider binds (`/api/llm-gateway/admin/connections|providers|model-mappings|
-// model-access|rate-limits|budgets|model-pricing|governance-config`)
+// model-access|rate-limits|budgets|model-pricing|governance-config|
+// routing-policies|routing-rules`)
 // faithfully enough to drive real plan/apply cycles: write-only connection
 // secrets (stored, never echoed), providers bound to connections with inline
 // keys rejected (BCP-3647), per-model-provider auth_type
@@ -225,6 +226,11 @@ type fakeLlmGatewayServer struct {
 	budgets     []*fakeLlmTokenBudget
 	pricing     []*fakeLlmPricingVersion
 
+	// routingPolicies and routingRules back the routing surface; see
+	// llm_gateway_fake_routing_test.go.
+	routingPolicies []*fakeLlmRoutingPolicy
+	routingRules    []*fakeLlmRoutingRule
+
 	// governance is the org's singleton governance_config row; nil means no
 	// row yet (the API then reports the column defaults).
 	governance *bool
@@ -268,6 +274,10 @@ func (f *fakeLlmGatewayServer) handler() http.HandlerFunc {
 			f.handleBudgets(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/model-pricing"):
 			f.handleModelPricing(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/routing-policies"):
+			f.handleRoutingPolicies(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/routing-rules"):
+			f.handleRoutingRules(w, r)
 		case r.URL.Path == "/api/llm-gateway/admin/governance-config":
 			f.handleGovernanceConfig(w, r)
 		default:

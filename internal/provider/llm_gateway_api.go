@@ -47,8 +47,11 @@ var llmGatewayRateLimitScopeTypes = []string{
 // llmGatewayErrorDetail extracts the human-readable message from an
 // llm-gateway error body. The service renders errors in the OpenAI envelope
 // (`{"error": {"message": "...", "type": "..."}}`), whose nested object the
-// generic jsonErrorMessage helper cannot unwrap; fall back to the bounded
-// raw body when the envelope is absent.
+// generic jsonErrorMessage helper cannot unwrap. The routing-rule endpoints
+// instead answer validation failures with a flat `{"error": "..."}`, which
+// fails the envelope decode and is picked up by displayBody's
+// jsonErrorMessage fallback, as is any other flat message; otherwise the
+// bounded raw body is shown.
 func llmGatewayErrorDetail(apiErr *apiError) string {
 	body := strings.TrimSpace(apiErr.body)
 	if body != "" && body[0] == '{' {
@@ -77,8 +80,9 @@ func addLlmGatewayAPIError(diags *diag.Diagnostics, what, action string, err err
 	}
 
 	switch apiErr.status {
-	case http.StatusBadRequest:
-		// The API's validation message is the most specific thing we can
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		// 422 is the routing-rule endpoints' validation status. The API's
+		// validation message is the most specific thing we can
 		// show; surface it verbatim.
 		diags.AddError(what+" rejected by the LLM Gateway API", llmGatewayErrorDetail(apiErr))
 	case http.StatusConflict:
