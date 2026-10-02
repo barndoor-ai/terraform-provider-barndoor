@@ -24,7 +24,8 @@ import (
 //
 // fakeLlmGatewayServer emulates the llm-gateway admin REST surface the
 // provider binds (`/api/llm-gateway/admin/connections|providers|model-mappings|
-// model-access|rate-limits|budgets|model-pricing|governance-config`)
+// model-access|model-route-groups|rate-limits|budgets|model-pricing|
+// governance-config`)
 // faithfully enough to drive real plan/apply cycles: write-only connection
 // secrets (stored, never echoed), providers bound to connections with inline
 // keys rejected (BCP-3647), per-model-provider auth_type
@@ -34,7 +35,8 @@ import (
 // budgets, the rate-limit tri-state metric PATCH, the scope-uniqueness 409s
 // of rate limits and budgets, the append-only versioned pricing store
 // (scheduled changes, skip-on-no-op, archive tombstones, per-instant
-// uniqueness), and the governance-config singleton upsert. Errors use the
+// uniqueness), route groups with the membership sweeps that mapping renames
+// and deletes trigger, and the governance-config singleton upsert. Errors use the
 // service's OpenAI envelope (`{"error": {"message": ...}}`).
 
 // fakeLlmOrgID matches the BARNDOOR_ORGANIZATION_ID set by setupLlmGatewayTest.
@@ -224,6 +226,7 @@ type fakeLlmGatewayServer struct {
 	rateLimits  []*fakeLlmRateLimit
 	budgets     []*fakeLlmTokenBudget
 	pricing     []*fakeLlmPricingVersion
+	routeGroups []*fakeLlmRouteGroup
 
 	// governance is the org's singleton governance_config row; nil means no
 	// row yet (the API then reports the column defaults).
@@ -260,6 +263,8 @@ func (f *fakeLlmGatewayServer) handler() http.HandlerFunc {
 			f.handleConnections(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/model-mappings"):
 			f.handleModelMappings(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/model-route-groups"):
+			f.handleRouteGroups(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/model-access"):
 			f.handleModelAccess(w, r)
 		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/rate-limits"):
@@ -1097,6 +1102,7 @@ func (f *fakeLlmGatewayServer) handleModelMappings(w http.ResponseWriter, r *htt
 		for i, m := range f.mappings {
 			if m.ID == id {
 				f.mappings = append(f.mappings[:i], f.mappings[i+1:]...)
+				f.forgetRouteGroupAliasIfGone(m.ModelAlias)
 				_ = json.NewEncoder(w).Encode(map[string]any{"deleted": true})
 				return
 			}
@@ -1305,7 +1311,9 @@ func (f *fakeLlmGatewayServer) updateModelMapping(w http.ResponseWriter, r *http
 		return
 	}
 
+	previousAlias := m.ModelAlias
 	*m = updated
+	f.renameRouteGroupAlias(previousAlias, m.ModelAlias)
 	_ = json.NewEncoder(w).Encode(mappingJSON(f, m, false))
 }
 
@@ -1317,6 +1325,7 @@ func (f *fakeLlmGatewayServer) markMappingDeleted(t *testing.T, id string) {
 	for i, m := range f.mappings {
 		if m.ID == id {
 			f.mappings = append(f.mappings[:i], f.mappings[i+1:]...)
+			f.forgetRouteGroupAliasIfGone(m.ModelAlias)
 			return
 		}
 	}
@@ -1384,6 +1393,7 @@ func validLlmModelAccessTargets(w http.ResponseWriter, targets []json.RawMessage
 			Alias      *string `json:"alias"`
 			Model      *string `json:"model"`
 			ProviderID *string `json:"provider_id"`
+			GroupID    *string `json:"group_id"`
 		}
 		if err := json.Unmarshal(raw, &t); err != nil {
 			writeLlmError(w, http.StatusBadRequest, "malformed target: "+err.Error())
@@ -1392,6 +1402,13 @@ func validLlmModelAccessTargets(w http.ResponseWriter, targets []json.RawMessage
 		if t.ProviderID != nil && !fakeLlmUUIDRe.MatchString(*t.ProviderID) {
 			http.Error(w, fmt.Sprintf(
 				"Failed to deserialize the JSON body into the target type: targets[%d].provider_id: UUID parsing failed", i),
+				http.StatusUnprocessableEntity)
+			return false
+		}
+		// group_id is a Uuid too; like provider_id, existence is not checked.
+		if t.GroupID != nil && !fakeLlmUUIDRe.MatchString(*t.GroupID) {
+			http.Error(w, fmt.Sprintf(
+				"Failed to deserialize the JSON body into the target type: targets[%d].group_id: UUID parsing failed", i),
 				http.StatusUnprocessableEntity)
 			return false
 		}
@@ -1405,6 +1422,8 @@ func validLlmModelAccessTargets(w http.ResponseWriter, targets []json.RawMessage
 			ok = t.ProviderID != nil
 		case "provider_model":
 			ok = t.ProviderID != nil && t.Model != nil
+		case "route_group":
+			ok = t.GroupID != nil
 		}
 		if !ok {
 			writeLlmError(w, http.StatusBadRequest,
