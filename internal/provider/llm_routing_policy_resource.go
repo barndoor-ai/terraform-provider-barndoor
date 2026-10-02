@@ -125,7 +125,9 @@ func (r *llmRoutingPolicyResource) Schema(_ context.Context, _ resource.SchemaRe
 			"determiner model reads the request (and any `barndoor_llm_routing_rule` attached to the " +
 			"policy) and chooses a slot; `context_breakpoints` force larger-context slots as the " +
 			"request grows.\n\n" +
-			"Slots are ordered cheapest/weakest first. Each slot `model_alias` must already resolve to " +
+			"List slots from cheapest to strongest: rules and breakpoints refer to slots by index, " +
+			"and that ordering makes \"at least slot 1\" mean \"at least the mid tier\". The platform " +
+			"does not check it against prices. Each slot `model_alias` must already resolve to " +
 			"enabled routes: a bare-callable alias (a custom `barndoor_llm_model_mapping` alias, or a " +
 			"1:1 enablement with `bare_alias = true`), or the provider-scoped form " +
 			"`<provider name>/<model>` of a 1:1 enablement. The policy's own `model_alias` must not " +
