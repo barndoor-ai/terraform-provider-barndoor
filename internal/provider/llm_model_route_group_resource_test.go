@@ -340,7 +340,7 @@ func TestLlmModelRouteGroupResource_planTimeRejections(t *testing.T) {
 		{"empty alias", "name = \"Frontier\"\n  model_aliases = [\"\"]",
 			`must not be empty or have\s+leading/trailing\s+whitespace`},
 		{"long change_note", fmt.Sprintf("name = \"Frontier\"\n  change_note = %q", strings.Repeat("n", 501)),
-			`string length must be at\s+most\s+500`},
+			`character count must be at\s+most\s+500`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

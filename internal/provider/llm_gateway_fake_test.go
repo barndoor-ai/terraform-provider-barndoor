@@ -184,15 +184,16 @@ func validLlmCooldown(w http.ResponseWriter, c fakeLlmCooldown) bool {
 }
 
 type fakeLlmModelAccessPolicy struct {
-	ID          string
-	Name        string
-	ScopeType   string
-	ScopeID     *string
-	ScopeValue  *string
-	PolicyType  string
-	Targets     []json.RawMessage
-	TrafficType string
-	Enabled     bool
+	ID             string
+	Name           string
+	ScopeType      string
+	ScopeID        *string
+	ScopeValue     *string
+	PolicyType     string
+	Targets        []json.RawMessage
+	TrafficType    string
+	Enabled        bool
+	LastChangeNote *string
 }
 
 type fakeLlmRateLimit struct {
@@ -1543,16 +1544,17 @@ func modelAccessJSON(p *fakeLlmModelAccessPolicy) map[string]any {
 		targets = []json.RawMessage{}
 	}
 	return map[string]any{
-		"id":           p.ID,
-		"org_id":       fakeLlmOrgID,
-		"name":         p.Name,
-		"scope_type":   p.ScopeType,
-		"scope_id":     p.ScopeID,
-		"scope_value":  p.ScopeValue,
-		"policy_type":  p.PolicyType,
-		"targets":      targets,
-		"traffic_type": p.TrafficType,
-		"enabled":      p.Enabled,
+		"id":               p.ID,
+		"org_id":           fakeLlmOrgID,
+		"name":             p.Name,
+		"scope_type":       p.ScopeType,
+		"scope_id":         p.ScopeID,
+		"scope_value":      p.ScopeValue,
+		"policy_type":      p.PolicyType,
+		"targets":          targets,
+		"traffic_type":     p.TrafficType,
+		"enabled":          p.Enabled,
+		"last_change_note": p.LastChangeNote,
 	}
 }
 
@@ -1651,9 +1653,14 @@ func (f *fakeLlmGatewayServer) createModelAccess(w http.ResponseWriter, r *http.
 		PolicyType  string            `json:"policy_type"`
 		Targets     []json.RawMessage `json:"targets"`
 		TrafficType *string           `json:"traffic_type"`
+		ChangeNote  *string           `json:"change_note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
+	if !ok {
 		return
 	}
 	if len(body.Targets) == 0 {
@@ -1680,15 +1687,16 @@ func (f *fakeLlmGatewayServer) createModelAccess(w http.ResponseWriter, r *http.
 	}
 
 	p := &fakeLlmModelAccessPolicy{
-		ID:          f.newID("cccc"),
-		Name:        body.Name,
-		ScopeType:   body.ScopeType,
-		ScopeID:     body.ScopeID,
-		ScopeValue:  body.ScopeValue,
-		PolicyType:  body.PolicyType,
-		Targets:     body.Targets,
-		TrafficType: trafficType,
-		Enabled:     true, // create has no enabled field
+		ID:             f.newID("cccc"),
+		Name:           body.Name,
+		ScopeType:      body.ScopeType,
+		ScopeID:        body.ScopeID,
+		ScopeValue:     body.ScopeValue,
+		PolicyType:     body.PolicyType,
+		Targets:        body.Targets,
+		TrafficType:    trafficType,
+		Enabled:        true, // create has no enabled field
+		LastChangeNote: note,
 	}
 	f.policies = append(f.policies, p)
 	_ = json.NewEncoder(w).Encode(modelAccessJSON(p))
@@ -1710,9 +1718,14 @@ func (f *fakeLlmGatewayServer) updateModelAccess(w http.ResponseWriter, r *http.
 		Targets     *[]json.RawMessage `json:"targets"`
 		TrafficType *string            `json:"traffic_type"`
 		Enabled     *bool              `json:"enabled"`
+		ChangeNote  *string            `json:"change_note"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
+	if !ok {
 		return
 	}
 	if body.ScopeType != nil && !slices.Contains(fakeLlmModelAccessScopeTypes, *body.ScopeType) {
@@ -1761,6 +1774,7 @@ func (f *fakeLlmGatewayServer) updateModelAccess(w http.ResponseWriter, r *http.
 		p.Enabled = *body.Enabled
 	}
 
+	p.LastChangeNote = note
 	_ = json.NewEncoder(w).Encode(modelAccessJSON(p))
 }
 

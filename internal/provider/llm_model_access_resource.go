@@ -62,6 +62,7 @@ type llmModelAccessResourceModel struct {
 	Targets     []llmModelAccessTargetModel `tfsdk:"targets"`
 	TrafficType types.String                `tfsdk:"traffic_type"`
 	Enabled     types.Bool                  `tfsdk:"enabled"`
+	ChangeNote  types.String                `tfsdk:"change_note"`
 }
 
 // llmModelAccessTargetModel maps one entry of the targets list.
@@ -130,6 +131,7 @@ func (r *llmModelAccessResource) Schema(_ context.Context, _ resource.SchemaRequ
 			},
 			"traffic_type": llmTrafficTypeAttribute("llm", stringdefault.StaticString("llm")),
 			"enabled":      llmEnabledAttribute(),
+			"change_note":  llmChangeNoteAttribute("policy"),
 		},
 	}
 }
@@ -242,6 +244,7 @@ func (r *llmModelAccessResource) Create(ctx context.Context, req resource.Create
 		ScopeType:  plan.ScopeType.ValueString(),
 		PolicyType: plan.PolicyType.ValueString(),
 		Targets:    targets,
+		ChangeNote: stringPtrIfKnown(plan.ChangeNote),
 	}
 	if v, ok := knownString(plan.ScopeID); ok {
 		body.ScopeID = &v
@@ -342,6 +345,7 @@ func (r *llmModelAccessResource) Update(ctx context.Context, req resource.Update
 		PolicyType: &policyType,
 		Targets:    &targets,
 		Enabled:    boolPtrFromBool(plan.Enabled),
+		ChangeNote: stringPtrIfKnown(plan.ChangeNote),
 	}
 	if v, ok := knownString(plan.ScopeID); ok {
 		body.ScopeID = &v
@@ -597,6 +601,7 @@ type llmModelAccessCreateRequest struct {
 	PolicyType  string                        `json:"policy_type"`
 	Targets     []llmModelAccessTargetPayload `json:"targets"`
 	TrafficType *string                       `json:"traffic_type,omitempty"`
+	ChangeNote  *string                       `json:"change_note,omitempty"`
 }
 
 // llmModelAccessUpdateRequest mirrors the llm-gateway UpdateModelAccessRequest
@@ -611,6 +616,7 @@ type llmModelAccessUpdateRequest struct {
 	Targets     *[]llmModelAccessTargetPayload `json:"targets,omitempty"`
 	TrafficType *string                        `json:"traffic_type,omitempty"`
 	Enabled     *bool                          `json:"enabled,omitempty"`
+	ChangeNote  *string                        `json:"change_note,omitempty"`
 }
 
 // llmModelAccessResponse mirrors the llm-gateway ModelAccessPolicy response.
@@ -733,6 +739,7 @@ func applyLlmModelAccessResponse(policy *llmModelAccessResponse, prior *llmModel
 		Targets:     targets,
 		TrafficType: types.StringValue(policy.TrafficType),
 		Enabled:     types.BoolValue(policy.Enabled),
+		ChangeNote:  prior.ChangeNote, // write-only; see llmChangeNoteAttribute
 	}
 }
 

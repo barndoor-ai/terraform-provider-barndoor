@@ -52,7 +52,7 @@ resource "barndoor_llm_model_access" "frontier_only" {
 
 ### Optional
 
-- `change_note` (String) Optional note explaining the change, recorded in the platform's audit trail on create and on every update. The platform keeps only the latest note and clears it when an update omits one, so the note is sent with each update while it is set. It is not read back from the platform (an import leaves it unset), and changing only the note still updates the group. At most 500 characters.
+- `change_note` (String) Optional note explaining the change ("Raise cap for Q4 launch"), recorded on the route group and in the audit trail (at most 500 characters). It describes the write Terraform makes, not the route group: the platform clears the previous note on any update that does not send one, and the value is not refreshed from the platform. Changing only the note makes an in-place update that records it.
 - `description` (String) What the group is for. Defaults to an empty string, which is also what removing it from configuration sets.
 - `model_aliases` (Set of String) Route aliases that belong to the group, at most 1000. Every apply replaces the platform's membership with this set; omit it or set `[]` for an empty group. An empty group expands to no targets in the policies that reference it.
 

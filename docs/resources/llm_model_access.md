@@ -70,6 +70,7 @@ resource "barndoor_llm_model_access" "research_routes" {
 
 ### Optional
 
+- `change_note` (String) Optional note explaining the change ("Raise cap for Q4 launch"), recorded on the policy and in the audit trail (at most 500 characters). It describes the write Terraform makes, not the policy: the platform clears the previous note on any update that does not send one, and the value is not refreshed from the platform. Changing only the note makes an in-place update that records it.
 - `enabled` (Boolean) Whether the policy is enforced. Defaults to `true`.
 - `scope_id` (String) UUID of the scoped entity (user, team, API key, …) for UUID-keyed scope types. Removing it forces a new resource — the API cannot clear it in place.
 - `scope_value` (String) String key of the scoped entity for name-keyed scope types (e.g. a role or IdP group name for `role`/`group` scopes). Removing it forces a new resource — the API cannot clear it in place.

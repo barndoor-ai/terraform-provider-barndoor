@@ -31,9 +31,6 @@ import (
 // always be rejected.
 const llmRouteGroupMaxMembers = 1000
 
-// llmChangeNoteMaxLen mirrors the platform's change-note length cap.
-const llmChangeNoteMaxLen = 500
-
 // llmTrimmedFreeText accepts the empty string or text without surrounding
 // whitespace: the platform trims free-text fields such as descriptions, so a
 // padded value would read back changed.
@@ -138,19 +135,7 @@ func (r *llmModelRouteGroupResource) Schema(_ context.Context, _ resource.Schema
 					setvalidator.ValueStringsAre(noSurroundingWhitespace),
 				},
 			},
-			"change_note": schema.StringAttribute{
-				MarkdownDescription: "Optional note explaining the change, recorded in the platform's " +
-					"audit trail on create and on every update. The platform keeps only the latest note " +
-					"and clears it when an update omits one, so the note is sent with each update while it " +
-					"is set. It is not read back from the platform (an import leaves it unset), and " +
-					"changing only the note still updates the group. At most " +
-					fmt.Sprint(llmChangeNoteMaxLen) + " characters.",
-				Optional: true,
-				Validators: []validator.String{
-					stringvalidator.LengthAtMost(llmChangeNoteMaxLen),
-					noSurroundingWhitespace,
-				},
-			},
+			"change_note": llmChangeNoteAttribute("route group"),
 		},
 	}
 }
