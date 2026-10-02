@@ -58,6 +58,10 @@ type llmProviderDataSourceModel struct {
 	BillingMode        types.String         `tfsdk:"billing_mode"`
 	BillingReason      types.String         `tfsdk:"billing_reason"`
 	BillingNote        types.String         `tfsdk:"billing_note"`
+	CatalogID          types.String         `tfsdk:"catalog_id"`
+	ModelSyncMode      types.String         `tfsdk:"model_sync_mode"`
+	RequestTimeout     types.Int64          `tfsdk:"request_timeout_secs"`
+	StreamIdleTimeout  types.Int64          `tfsdk:"stream_idle_timeout_secs"`
 	HealthStatus       types.String         `tfsdk:"health_status"`
 	HealthDetail       types.String         `tfsdk:"health_detail"`
 	HealthCheckedAt    types.String         `tfsdk:"health_checked_at"`
@@ -143,6 +147,26 @@ func (d *llmProviderDataSource) Schema(_ context.Context, _ datasource.SchemaReq
 			"billing_note": schema.StringAttribute{
 				MarkdownDescription: "Free-text context for the billing arrangement; null when unset.",
 				Computed:            true,
+			},
+			"catalog_id": schema.StringAttribute{
+				MarkdownDescription: "UUID of the provider-catalog entry the provider was created from; " +
+					"null when it was not.",
+				Computed: true,
+			},
+			"model_sync_mode": schema.StringAttribute{
+				MarkdownDescription: "Whether the platform keeps the provider's model routes in step " +
+					"with its catalog entry: `off`, `additive`, or `full`.",
+				Computed: true,
+			},
+			"request_timeout_secs": schema.Int64Attribute{
+				MarkdownDescription: "Provider-wide upstream request timeout override, in seconds; " +
+					"null when the gateway default applies.",
+				Computed: true,
+			},
+			"stream_idle_timeout_secs": schema.Int64Attribute{
+				MarkdownDescription: "Provider-wide stream idle timeout override, in seconds; null when " +
+					"the gateway default applies.",
+				Computed: true,
 			},
 			"health_status": schema.StringAttribute{
 				MarkdownDescription: "Observed upstream reachability recorded by the platform's " +
@@ -259,6 +283,10 @@ func (d *llmProviderDataSource) Read(ctx context.Context, req datasource.ReadReq
 		BillingMode:        state.BillingMode,
 		BillingReason:      state.BillingReason,
 		BillingNote:        state.BillingNote,
+		CatalogID:          state.CatalogID,
+		ModelSyncMode:      state.ModelSyncMode,
+		RequestTimeout:     state.RequestTimeout,
+		StreamIdleTimeout:  state.StreamIdleTimeout,
 		HealthStatus:       state.HealthStatus,
 		HealthDetail:       state.HealthDetail,
 		HealthCheckedAt:    state.HealthCheckedAt,
