@@ -14,3 +14,20 @@ resource "barndoor_llm_rate_limit" "engineering_tokens" {
   tokens_per_minute = 250000
   traffic_type      = "llm"
 }
+
+# A ceiling on one upstream model, whichever alias the caller used.
+# Rate-limit targets update in place, and removing one clears it.
+resource "barndoor_llm_rate_limit" "opus_tokens" {
+  name                  = "Opus token ceiling"
+  scope_type            = "org"
+  tokens_per_minute     = 400000
+  target_provider_id    = var.anthropic_provider_id
+  target_upstream_model = "claude-opus-5-5"
+  traffic_type          = "llm"
+
+  change_note = "Protect the shared Opus quota"
+}
+
+variable "anthropic_provider_id" {
+  type = string
+}
