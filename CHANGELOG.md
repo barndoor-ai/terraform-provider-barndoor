@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+FEATURES:
+
+* **New Resource:** `barndoor_llm_model_route_group` manages a model route group: a named set of route aliases that a `barndoor_llm_model_access` policy can target as one.
+  * Each apply replaces the platform's membership with `model_aliases`.
+  * Membership is read back, so changes the platform makes on its own show as a diff. It makes two: renaming a route's alias moves the alias's memberships, and deleting a route's last mapping removes the alias from every group.
+  * Import is by id (BCP-4681).
+* **New Resource:** `barndoor_llm_routing_policy` manages a routing policy: a caller-facing alias that picks one of several model slots per request.
+  * The platform's slot, breakpoint and default-slot rules are checked at plan time. One example: leaving `context_breakpoints` unset with other than three slots fails, because the default fits only three.
+  * A `/` in the alias is rejected. The platform would accept it, but would read the alias as `provider/model` and never select the policy.
+  * Every optional setting has the platform default as its schema default, so removing one resets it.
+  * Pair it with `require_routing_policy` on `barndoor_llm_governance_config` (BCP-4682).
+* **New Resource:** `barndoor_llm_routing_rule` manages a plain-English rule on a routing policy: a minimum slot (`floor_slot`) and/or banned slots (`deny_slots`).
+  * Conflicts the platform reports with other rules appear as warnings and don't fail the apply.
+  * `policy_id` cannot change.
+  * Import with `<policy_id>/<rule_id>` (BCP-4682).
+
+BUG FIXES:
+
+* resource/`barndoor_llm_model_pricing`: a price change made through Terraform silently removed any long-context tier the rule had, for example one set in the app.
+  * The cause: every price change appends a new pricing version, the platform copies nothing from the version it replaces, and the resource never sent the tier.
+  * The tier is now managed as `long_context` (see ENHANCEMENTS) and is sent with every version. A tier set in the app now shows as a diff instead of being dropped (BCP-4685).
+
+ENHANCEMENTS:
+
+* resource/`barndoor_llm_model_access`: targets accept `kind = "route_group"` with a `group_id`.
+  * The platform does not check that the group exists, so an allowlist whose only target is an empty or deleted group denies every model.
+  * Target shapes, meaning missing fields or fields from another kind, now fail at plan time instead of at apply (BCP-4681).
+* resource/`barndoor_llm_token_budget`, resource/`barndoor_llm_rate_limit`: four new optional target attributes narrow a rule to some of its scope's traffic. `target_provider_id` (optionally with `target_upstream_model`) narrows to one provider or one of its models. `target_model_alias` narrows to one caller alias. `target_mcp_server_id` narrows to one MCP server's tool traffic.
+  * The platform's shape rules are checked at plan time, including how targets combine with `traffic_type`. That check matters for budgets: the budget update runs no shape check, so a contradicting `traffic_type` change failed with an opaque 500.
+  * A budget's targets cannot be updated, so changing one replaces the budget.
+  * A rate limit's targets change in place, and removing one clears it (BCP-4683).
+* resource/`barndoor_llm_token_budget`: new `cost_limit` and `currency` attributes, and `token_limit` is now optional. A budget can cap spend, tokens or both, and at least one is required.
+  * `cost_limit` must have at most four decimal places, matching the platform's `DECIMAL(12, 4)` column. A value the column would round now fails at plan time instead of drifting on every plan.
+  * Removing either limit clears it in place.
+  * Changing `currency` replaces the budget.
+  * The resource keeps its name (BCP-4684).
+* resource/`barndoor_llm_model_pricing`: new `long_context` attribute. It holds the higher rates a vendor charges once a prompt passes `threshold_prompt_tokens`. A request over the threshold bills all its tokens at those rates (BCP-4685).
+* resource/`barndoor_llm_provider`, data-source/`barndoor_llm_provider`: new `catalog_id`, `model_sync_mode`, `request_timeout_secs` and `stream_idle_timeout_secs` attributes.
+  * `catalog_id` can only be set on create, and an imported catalog provider keeps it.
+  * `model_sync_mode` (`off`, `additive` or `full`) needs a catalog entry, which is checked at plan time.
+  * The two timeouts are provider-wide overrides, and removing one clears it (BCP-4685).
+* New `change_note` attribute on the connection, provider, model mapping, model access, route group, budget and rate-limit resources. It is a note the platform records with each write and in the audit trail, at most 500 characters.
+  * It describes the change Terraform makes, not the object: the platform clears the note on any update that doesn't send one.
+  * It is never read back, so a note left by an edit in the app is not drift (BCP-4685).
+
 ## 0.8.0 (2026-10-02)
 
 FEATURES:
