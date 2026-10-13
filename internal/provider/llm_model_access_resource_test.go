@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"testing"
 
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	frameworkresource "github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -288,6 +289,155 @@ resource "barndoor_llm_model_access" "test" {
 }
 `,
 				ExpectError: regexp.MustCompile(`UUID\s+parsing\s+failed`),
+			},
+		},
+	})
+}
+
+// --- multi-entity scope ----------------------------------------------
+
+func TestLlmModelAccessBindingState(t *testing.T) {
+	strList := func(vals ...string) types.List {
+		elems := make([]attr.Value, 0, len(vals))
+		for _, v := range vals {
+			elems = append(elems, types.StringValue(v))
+		}
+		return types.ListValueMust(types.StringType, elems)
+	}
+	nullList := types.ListNull(types.StringType)
+	nullStr := types.StringNull()
+
+	cases := []struct {
+		name       string
+		bound      []string
+		priorList  types.List
+		priorOne   types.String
+		wantList   types.List
+		wantSingle types.String
+	}{
+		{"list form keeps every entity", []string{"a", "b"}, strList("a", "b"), nullStr,
+			strList("a", "b"), nullStr},
+		{"list form with no binding stays an empty list", nil, strList(), nullStr,
+			strList(), nullStr},
+		{"deprecated form reads the first entity", []string{"a"}, nullList, types.StringValue("a"),
+			nullList, types.StringValue("a")},
+		{"deprecated form hides the rest of a multi-entity binding", []string{"a", "b"}, nullList,
+			types.StringValue("a"), nullList, types.StringValue("a")},
+		{"deprecated form with the binding gone reads null", nil, nullList, types.StringValue("a"),
+			nullList, nullStr},
+		{"no prior value: several entities map to the list", []string{"a", "b"}, nullList, nullStr,
+			strList("a", "b"), nullStr},
+		{"no prior value: one entity maps to the deprecated field", []string{"a"}, nullList, nullStr,
+			nullList, types.StringValue("a")},
+		{"no prior value: no entity leaves both null", nil, nullList, nullStr, nullList, nullStr},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotList, gotSingle := llmBindingState(tc.bound, tc.priorList, tc.priorOne)
+			if !gotList.Equal(tc.wantList) {
+				t.Errorf("list = %s, want %s", gotList, tc.wantList)
+			}
+			if !gotSingle.Equal(tc.wantSingle) {
+				t.Errorf("single = %s, want %s", gotSingle, tc.wantSingle)
+			}
+		})
+	}
+}
+
+func TestLlmModelAccessResource_multiEntityScope(t *testing.T) {
+	fake := setupLlmGatewayTest(t)
+	const resourceName = "barndoor_llm_model_access.test"
+	const userA = "11111111-1111-1111-1111-111111111111"
+	const userB = "22222222-2222-2222-2222-222222222222"
+
+	bound := fmt.Sprintf(`
+resource "barndoor_llm_model_access" "test" {
+  name        = "Two users"
+  scope_type  = "user"
+  scope_ids   = ["%s", "%s"]
+  policy_type = "allowlist"
+
+  targets = [
+    { kind = "model_alias", alias = "gpt-*" },
+  ]
+}
+`, userA, userB)
+
+	unbound := `
+resource "barndoor_llm_model_access" "test" {
+  name        = "Two users"
+  scope_type  = "org"
+  policy_type = "allowlist"
+
+  targets = [
+    { kind = "model_alias", alias = "gpt-*" },
+  ]
+}
+`
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllLlmModelAccessDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: bound,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "scope_ids.#", "2"),
+					resource.TestCheckResourceAttr(resourceName, "scope_ids.0", userA),
+					resource.TestCheckResourceAttr(resourceName, "scope_ids.1", userB),
+					resource.TestCheckNoResourceAttr(resourceName, "scope_id"),
+				),
+			},
+			{
+				// Read back from the gateway's list, not the first-element mirror.
+				Config:   bound,
+				PlanOnly: true,
+			},
+			{
+				// Dropping the binding unbinds the policy in place, without replacement.
+				Config: unbound,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(resourceName, "scope_ids"),
+					resource.TestCheckNoResourceAttr(resourceName, "scope_id"),
+				),
+			},
+			{
+				Config:   unbound,
+				PlanOnly: true,
+			},
+			{
+				// Import reassembles every bound entity from the listing.
+				Config:            bound,
+				ResourceName:      resourceName,
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func TestLlmModelAccessResource_rejectsBothScopeForms(t *testing.T) {
+	fake := setupLlmGatewayTest(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllLlmModelAccessDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "barndoor_llm_model_access" "test" {
+  name        = "Both forms"
+  scope_type  = "user"
+  scope_id    = "11111111-1111-1111-1111-111111111111"
+  scope_ids   = ["11111111-1111-1111-1111-111111111111"]
+  policy_type = "allowlist"
+
+  targets = [
+    { kind = "model_alias", alias = "gpt-*" },
+  ]
+}
+`,
+				ExpectError: regexp.MustCompile(`Conflicting scope attributes`),
 			},
 		},
 	})

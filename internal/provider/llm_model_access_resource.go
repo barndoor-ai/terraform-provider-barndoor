@@ -10,6 +10,7 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -56,7 +57,9 @@ type llmModelAccessResourceModel struct {
 	OrgID       types.String                `tfsdk:"org_id"`
 	Name        types.String                `tfsdk:"name"`
 	ScopeType   types.String                `tfsdk:"scope_type"`
+	ScopeIDs    types.List                  `tfsdk:"scope_ids"`
 	ScopeID     types.String                `tfsdk:"scope_id"`
+	ScopeValues types.List                  `tfsdk:"scope_values"`
 	ScopeValue  types.String                `tfsdk:"scope_value"`
 	PolicyType  types.String                `tfsdk:"policy_type"`
 	Targets     []llmModelAccessTargetModel `tfsdk:"targets"`
@@ -83,11 +86,11 @@ func (r *llmModelAccessResource) Schema(_ context.Context, _ resource.SchemaRequ
 		MarkdownDescription: "Manages an LLM Gateway model-access policy: an allowlist or denylist of " +
 			"models and providers, applied to an identity scope (the organization, a user, an IdP group, " +
 			"…).\n\n" +
-			"`scope_type`/`scope_id`/`scope_value` answer *who* the policy applies to; the `targets` " +
+			"`scope_type` with `scope_ids` (UUID-keyed scopes) or `scope_values` (name-keyed `role`/`group` scopes) " +
+			"answers *who* the policy applies to, and the policy applies when any listed entity matches; the `targets` " +
 			"list answers *what* is allowed or denied and is OR-ed when matching. A `route_group` target " +
 			"stands for the current members of a `barndoor_llm_model_route_group`, so editing the group " +
-			"changes what the policy covers without an edit to the policy. A cleared `scope_id` " +
-			"or `scope_value` cannot be unset through the update API, so removing one forces a new policy.",
+			"changes what the policy covers without an edit to the policy. Removing a scope from configuration unbinds it in place.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				MarkdownDescription: "Policy UUID assigned by the API; also the `terraform import` key.",
@@ -132,6 +135,45 @@ func (r *llmModelAccessResource) Schema(_ context.Context, _ resource.SchemaRequ
 			"traffic_type": llmTrafficTypeAttribute("llm", stringdefault.StaticString("llm")),
 			"enabled":      llmEnabledAttribute(),
 			"change_note":  llmChangeNoteAttribute("policy"),
+		},
+	}
+	applyLlmModelAccessScopeForms(&resp.Schema)
+}
+
+// applyLlmModelAccessScopeForms adds the multi-entity `scope_ids` and
+// `scope_values` attributes and marks the single-entity `scope_id` and
+// `scope_value` as deprecated aliases of them. The single forms keep
+// their shared helpers and replace-on-clear plan modifiers; only the notice is
+// added here.
+func applyLlmModelAccessScopeForms(s *schema.Schema) {
+	for legacy, list := range map[string]string{"scope_id": "scope_ids", "scope_value": "scope_values"} {
+		attr, ok := s.Attributes[legacy].(schema.StringAttribute)
+		if !ok {
+			panic(fmt.Sprintf("schema attribute %q is not a string attribute", legacy))
+		}
+		attr.DeprecationMessage = "Use `" + list + "` instead. A single-entity scope cannot represent a " +
+			"policy bound to several entities, and reading it shows only the first one."
+		s.Attributes[legacy] = attr
+	}
+	s.Attributes["scope_ids"] = schema.ListAttribute{
+		MarkdownDescription: "UUIDs of every entity (user, project, API key, agent) the policy applies to, " +
+			"for UUID-keyed scope types. The policy applies when any one of them matches. Unset or empty " +
+			"means the policy is not bound to a specific entity.",
+		ElementType: types.StringType,
+		Optional:    true,
+		Validators: []validator.List{
+			listvalidator.UniqueValues(),
+			listvalidator.ValueStringsAre(noSurroundingWhitespace),
+		},
+	}
+	s.Attributes["scope_values"] = schema.ListAttribute{
+		MarkdownDescription: "Role or IdP group names the policy applies to, for name-keyed scope types " +
+			"(`role`, `group`). Same any-of semantics as `scope_ids`.",
+		ElementType: types.StringType,
+		Optional:    true,
+		Validators: []validator.List{
+			listvalidator.UniqueValues(),
+			listvalidator.ValueStringsAre(noSurroundingWhitespace),
 		},
 	}
 }
@@ -184,6 +226,8 @@ func llmModelAccessTargetNestedObject() schema.NestedAttributeObject {
 // that are still unknown (for example a group_id from a route group created
 // in the same apply) count as set.
 func (r *llmModelAccessResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	validateLlmModelAccessScopeForms(ctx, req, &resp.Diagnostics)
+
 	var targets types.List
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("targets"), &targets)...)
 	if resp.Diagnostics.HasError() || targets.IsNull() || targets.IsUnknown() {
@@ -204,6 +248,26 @@ func (r *llmModelAccessResource) ValidateConfig(ctx context.Context, req resourc
 			continue
 		}
 		checkLlmModelAccessTargetShape(i, t, func(v types.String) bool { return !v.IsNull() }, &resp.Diagnostics)
+	}
+}
+
+// validateLlmModelAccessScopeForms rejects a policy that sets both forms of
+// one binding (`scope_id` with `scope_ids`, or `scope_value` with
+// `scope_values`): the two would disagree about who the policy applies to.
+func validateLlmModelAccessScopeForms(ctx context.Context, req resource.ValidateConfigRequest, diags *diag.Diagnostics) {
+	for _, pair := range [][2]string{{"scope_id", "scope_ids"}, {"scope_value", "scope_values"}} {
+		var single types.String
+		var list types.List
+		diags.Append(req.Config.GetAttribute(ctx, path.Root(pair[0]), &single)...)
+		diags.Append(req.Config.GetAttribute(ctx, path.Root(pair[1]), &list)...)
+		if diags.HasError() {
+			return
+		}
+		_, singleSet := knownString(single)
+		if singleSet && !list.IsNull() && !list.IsUnknown() {
+			diags.AddAttributeError(path.Root(pair[1]), "Conflicting scope attributes",
+				fmt.Sprintf("Set either `%s` or the deprecated `%s`, not both.", pair[1], pair[0]))
+		}
 	}
 }
 
@@ -246,12 +310,7 @@ func (r *llmModelAccessResource) Create(ctx context.Context, req resource.Create
 		Targets:    targets,
 		ChangeNote: stringPtrIfKnown(plan.ChangeNote),
 	}
-	if v, ok := knownString(plan.ScopeID); ok {
-		body.ScopeID = &v
-	}
-	if v, ok := knownString(plan.ScopeValue); ok {
-		body.ScopeValue = &v
-	}
+	body.llmScopeFields = llmScopeFieldsFromPlan(&plan)
 	if v, ok := knownString(plan.TrafficType); ok {
 		body.TrafficType = &v
 	}
@@ -311,6 +370,11 @@ func (r *llmModelAccessResource) Read(ctx context.Context, req resource.ReadRequ
 	for i := range policies {
 		if policies[i].ID == state.ID.ValueString() {
 			newState := applyLlmModelAccessResponse(&policies[i], &state)
+			if newState.ScopeIDs.IsNull() && len(policies[i].ScopeIDs) > 1 {
+				resp.Diagnostics.AddWarning("Model-access policy bound to several entities",
+					fmt.Sprintf("Policy %q applies to %d entities, but `scope_id` shows only the first. "+
+						"Move the configuration to `scope_ids`.", policies[i].Name, len(policies[i].ScopeIDs)))
+			}
 			resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 			return
 		}
@@ -347,12 +411,7 @@ func (r *llmModelAccessResource) Update(ctx context.Context, req resource.Update
 		Enabled:    boolPtrFromBool(plan.Enabled),
 		ChangeNote: stringPtrIfKnown(plan.ChangeNote),
 	}
-	if v, ok := knownString(plan.ScopeID); ok {
-		body.ScopeID = &v
-	}
-	if v, ok := knownString(plan.ScopeValue); ok {
-		body.ScopeValue = &v
-	}
+	body.llmScopeFields = llmScopeFieldsFromPlan(&plan)
 	if v, ok := knownString(plan.TrafficType); ok {
 		body.TrafficType = &v
 	}
@@ -591,17 +650,26 @@ type llmModelAccessTargetPayload struct {
 	GroupID    *string `json:"group_id,omitempty"`
 }
 
+// llmScopeFields carries a policy's scope binding on the wire. scope_ids and
+// scope_values are the binding. scope_id and scope_value mirror their first
+// element for a gateway that predates the lists, as the admin UI does.
+type llmScopeFields struct {
+	ScopeIDs    *[]string `json:"scope_ids,omitempty"`
+	ScopeID     *string   `json:"scope_id,omitempty"`
+	ScopeValues *[]string `json:"scope_values,omitempty"`
+	ScopeValue  *string   `json:"scope_value,omitempty"`
+}
+
 // llmModelAccessCreateRequest mirrors the llm-gateway CreateModelAccessRequest
 // body.
 type llmModelAccessCreateRequest struct {
 	Name        string                        `json:"name"`
 	ScopeType   string                        `json:"scope_type"`
-	ScopeID     *string                       `json:"scope_id,omitempty"`
-	ScopeValue  *string                       `json:"scope_value,omitempty"`
 	PolicyType  string                        `json:"policy_type"`
 	Targets     []llmModelAccessTargetPayload `json:"targets"`
 	TrafficType *string                       `json:"traffic_type,omitempty"`
 	ChangeNote  *string                       `json:"change_note,omitempty"`
+	llmScopeFields
 }
 
 // llmModelAccessUpdateRequest mirrors the llm-gateway UpdateModelAccessRequest
@@ -610,13 +678,12 @@ type llmModelAccessCreateRequest struct {
 type llmModelAccessUpdateRequest struct {
 	Name        *string                        `json:"name,omitempty"`
 	ScopeType   *string                        `json:"scope_type,omitempty"`
-	ScopeID     *string                        `json:"scope_id,omitempty"`
-	ScopeValue  *string                        `json:"scope_value,omitempty"`
 	PolicyType  *string                        `json:"policy_type,omitempty"`
 	Targets     *[]llmModelAccessTargetPayload `json:"targets,omitempty"`
 	TrafficType *string                        `json:"traffic_type,omitempty"`
 	Enabled     *bool                          `json:"enabled,omitempty"`
 	ChangeNote  *string                        `json:"change_note,omitempty"`
+	llmScopeFields
 }
 
 // llmModelAccessResponse mirrors the llm-gateway ModelAccessPolicy response.
@@ -626,7 +693,9 @@ type llmModelAccessResponse struct {
 	Name        string                        `json:"name"`
 	ScopeType   string                        `json:"scope_type"`
 	ScopeID     *string                       `json:"scope_id"`
+	ScopeIDs    []string                      `json:"scope_ids"`
 	ScopeValue  *string                       `json:"scope_value"`
+	ScopeValues []string                      `json:"scope_values"`
 	PolicyType  string                        `json:"policy_type"`
 	Targets     []llmModelAccessTargetPayload `json:"targets"`
 	TrafficType string                        `json:"traffic_type"`
@@ -713,6 +782,84 @@ func llmTargetShapeHint(kind string) string {
 	}
 }
 
+// llmScopeFieldsFromPlan converts the planned binding to the wire shape. Both
+// lists always go out, so an empty list unbinds the policy in place. The first
+// element of each list is mirrored into its single-entity field when there is one.
+func llmScopeFieldsFromPlan(plan *llmModelAccessResourceModel) llmScopeFields {
+	ids := llmBindingFromPlan(plan.ScopeIDs, plan.ScopeID)
+	values := llmBindingFromPlan(plan.ScopeValues, plan.ScopeValue)
+	out := llmScopeFields{ScopeIDs: &ids, ScopeValues: &values}
+	if len(ids) > 0 {
+		out.ScopeID = &ids[0]
+	}
+	if len(values) > 0 {
+		out.ScopeValue = &values[0]
+	}
+	return out
+}
+
+// llmBindingFromPlan returns the entities a planned binding names: the list
+// when it is set, else the deprecated single field. Unknown elements are
+// skipped; at apply time the plan has none.
+func llmBindingFromPlan(list types.List, single types.String) []string {
+	if !list.IsNull() && !list.IsUnknown() {
+		out := make([]string, 0, len(list.Elements()))
+		for _, e := range list.Elements() {
+			if s, ok := e.(types.String); ok && !s.IsUnknown() {
+				out = append(out, s.ValueString())
+			}
+		}
+		return out
+	}
+	if v, ok := knownString(single); ok {
+		return []string{v}
+	}
+	return []string{}
+}
+
+// llmBindingFromPolicy returns the entities a policy is bound to. The list is
+// authoritative; the single field is read only for a gateway that predates it.
+func llmBindingFromPolicy(list []string, single *string) []string {
+	if len(list) > 0 {
+		return list
+	}
+	if single != nil {
+		return []string{*single}
+	}
+	return nil
+}
+
+// llmBindingState maps the bound entities onto the list and single-field
+// attributes. The prior value says which form the configuration uses, so a
+// list-form policy never shows a diff against a null list and a policy written
+// with the deprecated field keeps reading back that way. With neither set
+// (import, or an org-wide policy) a single entity maps to the deprecated field
+// and several map to the list.
+func llmBindingState(bound []string, priorList types.List, priorSingle types.String) (types.List, types.String) {
+	listOf := func(vals []string) types.List {
+		elems := make([]attr.Value, 0, len(vals))
+		for _, v := range vals {
+			elems = append(elems, types.StringValue(v))
+		}
+		return types.ListValueMust(types.StringType, elems)
+	}
+	switch {
+	case !priorList.IsNull() && !priorList.IsUnknown():
+		return listOf(bound), types.StringNull()
+	case !priorSingle.IsNull() && !priorSingle.IsUnknown():
+		if len(bound) == 0 {
+			return types.ListNull(types.StringType), types.StringNull()
+		}
+		return types.ListNull(types.StringType), types.StringValue(bound[0])
+	case len(bound) > 1:
+		return listOf(bound), types.StringNull()
+	case len(bound) == 1:
+		return types.ListNull(types.StringType), types.StringValue(bound[0])
+	default:
+		return types.ListNull(types.StringType), types.StringNull()
+	}
+}
+
 // applyLlmModelAccessResponse maps the server's view onto a state model.
 // prior is the plan (Create/Update) or previous state (Read), used to settle
 // cleared optionals back to null.
@@ -728,13 +875,20 @@ func applyLlmModelAccessResponse(policy *llmModelAccessResponse, prior *llmModel
 		})
 	}
 
+	scopeIDs, scopeID := llmBindingState(llmBindingFromPolicy(policy.ScopeIDs, policy.ScopeID),
+		prior.ScopeIDs, prior.ScopeID)
+	scopeValues, scopeValue := llmBindingState(llmBindingFromPolicy(policy.ScopeValues, policy.ScopeValue),
+		prior.ScopeValues, prior.ScopeValue)
+
 	return llmModelAccessResourceModel{
 		ID:          types.StringValue(policy.ID),
 		OrgID:       types.StringValue(policy.OrgID),
 		Name:        types.StringValue(policy.Name),
 		ScopeType:   types.StringValue(policy.ScopeType),
-		ScopeID:     optionalStringFromPtr(policy.ScopeID, prior.ScopeID),
-		ScopeValue:  optionalStringFromPtr(policy.ScopeValue, prior.ScopeValue),
+		ScopeIDs:    scopeIDs,
+		ScopeID:     scopeID,
+		ScopeValues: scopeValues,
+		ScopeValue:  scopeValue,
 		PolicyType:  types.StringValue(policy.PolicyType),
 		Targets:     targets,
 		TrafficType: types.StringValue(policy.TrafficType),
