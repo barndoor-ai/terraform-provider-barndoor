@@ -147,7 +147,10 @@ func (r *llmModelAccessResource) Schema(_ context.Context, _ resource.SchemaRequ
 // added here.
 func applyLlmModelAccessScopeForms(s *schema.Schema) {
 	for legacy, list := range map[string]string{"scope_id": "scope_ids", "scope_value": "scope_values"} {
-		attr := s.Attributes[legacy].(schema.StringAttribute)
+		attr, ok := s.Attributes[legacy].(schema.StringAttribute)
+		if !ok {
+			panic(fmt.Sprintf("schema attribute %q is not a string attribute", legacy))
+		}
 		attr.DeprecationMessage = "Use `" + list + "` instead. A single-entity scope cannot represent a " +
 			"policy bound to several entities, and reading it shows only the first one."
 		s.Attributes[legacy] = attr
