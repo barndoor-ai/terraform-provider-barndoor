@@ -298,6 +298,7 @@ func (f *fakeLlmGatewayServer) seedRouteGroupMapping(alias string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	m := &fakeLlmModelMapping{
+		Kind:          "route",
 		ID:            f.newID("cdcd"),
 		ProviderID:    f.newID("aaaa"),
 		ModelAlias:    alias,

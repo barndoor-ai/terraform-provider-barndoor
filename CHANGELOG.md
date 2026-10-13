@@ -4,6 +4,8 @@
 
 ENHANCEMENTS:
 
+* resource/`barndoor_llm_model_mapping`: new `kind` attribute (`model` for a 1:1 enablement, `route` for a route target). It is inferred when unset, as the platform infers it, and sent explicitly on create. A route that carries the model's own name is now its own row, separate from the enablement, and is bare-callable by default. Changing `kind` forces a new mapping. Requires platform support for route kinds.
+* resource/`barndoor_llm_model_mapping`: an enablement (`kind = "model"`) that sets `bare_alias = true` is rejected at plan time. So is one whose `model_alias` differs from its `upstream_model`, and one whose `model_alias`, `upstream_model` or `bare_alias` changes in place: the platform rejects those updates.
 * resource/`barndoor_llm_model_access`: new `scope_ids` and `scope_values` attributes bind one policy to every user, project, API key, agent, role or group it applies to; it applies when any listed entity matches. Previously a policy edited in the Barndoor app with several entities showed up in state as only its first one. Requires platform support for multi-entity model-access scopes.
 * resource/`barndoor_llm_model_access`: `scope_id` and `scope_value` are deprecated in favour of `scope_ids` and `scope_values`. They cannot represent a multi-entity binding, and a read shows only the first entity with a warning. Setting both forms of one binding is rejected at plan time.
 

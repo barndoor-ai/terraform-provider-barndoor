@@ -99,6 +99,7 @@ func validLlmProviderSync(w http.ResponseWriter, p *fakeLlmProvider) bool {
 }
 
 type fakeLlmModelMapping struct {
+	Kind                  string
 	ID                    string
 	ProviderID            string
 	ModelAlias            string
@@ -1236,6 +1237,7 @@ func mappingJSON(f *fakeLlmGatewayServer, m *fakeLlmModelMapping, withProvider b
 		"retry_on_429_count":         m.RetryOn429Count,
 		"retry_on_429_max_wait_secs": m.RetryOn429MaxWaitSecs,
 		"bare_alias":                 m.BareAlias,
+		"kind":                       m.Kind,
 		"stream_idle_timeout_secs":   m.StreamIdleTimeoutSecs,
 		"request_timeout_secs":       m.RequestTimeoutSecs,
 		"last_change_note":           m.LastChangeNote,
@@ -1309,6 +1311,7 @@ func validLlmMappingRanges(w http.ResponseWriter, retryCount, retryMaxWait int64
 
 func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http.Request) {
 	var body struct {
+		Kind                  *string `json:"kind"`
 		ProviderID            string  `json:"provider_id"`
 		ModelAlias            string  `json:"model_alias"`
 		UpstreamModel         string  `json:"upstream_model"`
@@ -1344,17 +1347,39 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 	if body.Enabled != nil {
 		enabled = *body.Enabled
 	}
+	kind := "route"
+	switch {
+	case body.Kind != nil:
+		kind = *body.Kind
+		if kind != "model" && kind != "route" {
+			writeLlmError(w, http.StatusBadRequest, "kind must be 'model' or 'route'")
+			return
+		}
+	case body.ModelAlias == body.UpstreamModel && (body.BareAlias == nil || !*body.BareAlias):
+		kind = "model"
+	}
 	alias1to1 := body.ModelAlias == body.UpstreamModel
-	bareAlias := !alias1to1
-	if body.BareAlias != nil {
+	if kind == "model" {
+		if !alias1to1 {
+			writeLlmError(w, http.StatusBadRequest,
+				"a model enablement must be named after its model (model_alias == upstream_model)")
+			return
+		}
+		if body.BareAlias != nil && *body.BareAlias {
+			writeLlmError(w, http.StatusBadRequest, "an enablement is never bare-callable; create a route instead")
+			return
+		}
+	}
+	// Bare-callable by default for routes, never for enablements.
+	bareAlias := kind == "route"
+	if body.BareAlias != nil && kind == "route" {
 		bareAlias = *body.BareAlias
 	}
 
 	// The anchor is the 1:1 enablement row for (provider, upstream).
 	var anchor *fakeLlmModelMapping
 	for _, m := range f.mappings {
-		if m.ProviderID == body.ProviderID && m.UpstreamModel == body.UpstreamModel &&
-			m.ModelAlias == m.UpstreamModel {
+		if m.ProviderID == body.ProviderID && m.UpstreamModel == body.UpstreamModel && m.Kind == "model" {
 			anchor = m
 			break
 		}
@@ -1362,7 +1387,7 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 
 	// Orphan-alias guard (BCP-2920): a custom alias without its 1:1
 	// enablement would never resolve at request time.
-	if !alias1to1 && anchor == nil {
+	if kind == "route" && !alias1to1 && anchor == nil {
 		writeLlmError(w, http.StatusBadRequest, fmt.Sprintf(
 			"Cannot route to '%s' on this provider: the model is not enabled. "+
 				"Enable it under LLM Configuration → Models first, then create the route.",
@@ -1372,7 +1397,7 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 
 	// PATCH-or-create for 1:1 rows: a second POST folds into the existing
 	// anchor instead of duplicating.
-	if alias1to1 && anchor != nil {
+	if kind == "model" && anchor != nil {
 		// Upsert-only for the cooldown policy: omitted keys keep the stored
 		// value rather than resetting it.
 		cooldown := anchor.Cooldown.apply(body.fakeLlmCooldownPatch)
@@ -1411,6 +1436,7 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 	}
 
 	m := &fakeLlmModelMapping{
+		Kind:                  kind,
 		ID:                    f.newID("bbbb"),
 		ProviderID:            body.ProviderID,
 		ModelAlias:            body.ModelAlias,
@@ -1455,6 +1481,14 @@ func (f *fakeLlmGatewayServer) updateModelMapping(w http.ResponseWriter, r *http
 	}
 	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
 	if !ok {
+		return
+	}
+
+	if m.Kind == "model" && ((body.ModelAlias != nil && *body.ModelAlias != m.ModelAlias) ||
+		(body.UpstreamModel != nil && *body.UpstreamModel != m.UpstreamModel) ||
+		(body.BareAlias != nil && *body.BareAlias != m.BareAlias)) {
+		writeLlmError(w, http.StatusBadRequest,
+			"an enablement cannot be renamed, repointed or made bare-callable; use a route")
 		return
 	}
 
