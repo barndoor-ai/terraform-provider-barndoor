@@ -187,8 +187,8 @@ type fakeLlmModelAccessPolicy struct {
 	ID             string
 	Name           string
 	ScopeType      string
-	ScopeID        *string
-	ScopeValue     *string
+	ScopeIDs       []string
+	ScopeValues    []string
 	PolicyType     string
 	Targets        []json.RawMessage
 	TrafficType    string
@@ -1547,18 +1547,54 @@ func (f *fakeLlmGatewayServer) findPolicy(id string) *fakeLlmModelAccessPolicy {
 	return nil
 }
 
+// fakeLlmFirstOrNil mirrors the first element of a binding into the
+// single-entity field, or null when the binding is empty.
+func fakeLlmFirstOrNil(vals []string) any {
+	if len(vals) == 0 {
+		return nil
+	}
+	return vals[0]
+}
+
+// fakeLlmBinding resolves a write's binding the way the platform does: the
+// lists win, and a lone single-entity field is promoted into a one-element
+// list. When both are sent, scope_id must be the first element of scope_ids.
+// ok is false when the write names no binding at all.
+func fakeLlmBinding(list *[]string, single *string) (vals []string, ok bool, err string) {
+	if list != nil && single != nil && (len(*list) == 0 || (*list)[0] != *single) {
+		return nil, true, "scope_id must be the first element of scope_ids"
+	}
+	if list != nil {
+		return *list, true, ""
+	}
+	if single != nil {
+		return []string{*single}, true, ""
+	}
+	return nil, false, ""
+}
+
 func modelAccessJSON(p *fakeLlmModelAccessPolicy) map[string]any {
 	targets := p.Targets
 	if targets == nil {
 		targets = []json.RawMessage{}
+	}
+	scopeIDs := p.ScopeIDs
+	if scopeIDs == nil {
+		scopeIDs = []string{}
+	}
+	scopeValues := p.ScopeValues
+	if scopeValues == nil {
+		scopeValues = []string{}
 	}
 	return map[string]any{
 		"id":               p.ID,
 		"org_id":           fakeLlmOrgID,
 		"name":             p.Name,
 		"scope_type":       p.ScopeType,
-		"scope_id":         p.ScopeID,
-		"scope_value":      p.ScopeValue,
+		"scope_id":         fakeLlmFirstOrNil(scopeIDs),
+		"scope_ids":        scopeIDs,
+		"scope_value":      fakeLlmFirstOrNil(scopeValues),
+		"scope_values":     scopeValues,
 		"policy_type":      p.PolicyType,
 		"targets":          targets,
 		"traffic_type":     p.TrafficType,
@@ -1657,7 +1693,9 @@ func (f *fakeLlmGatewayServer) createModelAccess(w http.ResponseWriter, r *http.
 	var body struct {
 		Name        string            `json:"name"`
 		ScopeType   string            `json:"scope_type"`
+		ScopeIDs    *[]string         `json:"scope_ids"`
 		ScopeID     *string           `json:"scope_id"`
+		ScopeValues *[]string         `json:"scope_values"`
 		ScopeValue  *string           `json:"scope_value"`
 		PolicyType  string            `json:"policy_type"`
 		Targets     []json.RawMessage `json:"targets"`
@@ -1690,6 +1728,17 @@ func (f *fakeLlmGatewayServer) createModelAccess(w http.ResponseWriter, r *http.
 		return
 	}
 
+	ids, _, err := fakeLlmBinding(body.ScopeIDs, body.ScopeID)
+	if err != "" {
+		writeLlmError(w, http.StatusBadRequest, err)
+		return
+	}
+	values, _, err := fakeLlmBinding(body.ScopeValues, body.ScopeValue)
+	if err != "" {
+		writeLlmError(w, http.StatusBadRequest, err)
+		return
+	}
+
 	trafficType := "llm"
 	if body.TrafficType != nil {
 		trafficType = *body.TrafficType
@@ -1699,8 +1748,8 @@ func (f *fakeLlmGatewayServer) createModelAccess(w http.ResponseWriter, r *http.
 		ID:             f.newID("cccc"),
 		Name:           body.Name,
 		ScopeType:      body.ScopeType,
-		ScopeID:        body.ScopeID,
-		ScopeValue:     body.ScopeValue,
+		ScopeIDs:       ids,
+		ScopeValues:    values,
 		PolicyType:     body.PolicyType,
 		Targets:        body.Targets,
 		TrafficType:    trafficType,
@@ -1721,7 +1770,9 @@ func (f *fakeLlmGatewayServer) updateModelAccess(w http.ResponseWriter, r *http.
 	var body struct {
 		Name        *string            `json:"name"`
 		ScopeType   *string            `json:"scope_type"`
+		ScopeIDs    *[]string          `json:"scope_ids"`
 		ScopeID     *string            `json:"scope_id"`
+		ScopeValues *[]string          `json:"scope_values"`
 		ScopeValue  *string            `json:"scope_value"`
 		PolicyType  *string            `json:"policy_type"`
 		Targets     *[]json.RawMessage `json:"targets"`
@@ -1764,11 +1815,17 @@ func (f *fakeLlmGatewayServer) updateModelAccess(w http.ResponseWriter, r *http.
 	if body.ScopeType != nil {
 		p.ScopeType = *body.ScopeType
 	}
-	if body.ScopeID != nil {
-		p.ScopeID = body.ScopeID
+	if ids, ok, err := fakeLlmBinding(body.ScopeIDs, body.ScopeID); err != "" {
+		writeLlmError(w, http.StatusBadRequest, err)
+		return
+	} else if ok {
+		p.ScopeIDs = ids
 	}
-	if body.ScopeValue != nil {
-		p.ScopeValue = body.ScopeValue
+	if values, ok, err := fakeLlmBinding(body.ScopeValues, body.ScopeValue); err != "" {
+		writeLlmError(w, http.StatusBadRequest, err)
+		return
+	} else if ok {
+		p.ScopeValues = values
 	}
 	if body.PolicyType != nil {
 		p.PolicyType = *body.PolicyType
