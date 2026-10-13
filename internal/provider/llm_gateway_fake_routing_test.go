@@ -129,7 +129,7 @@ func (f *fakeLlmGatewayServer) fakeLlmResolvesBare(alias string) bool {
 		}
 		for _, anchor := range f.mappings {
 			if anchor.ProviderID == m.ProviderID && anchor.UpstreamModel == m.UpstreamModel &&
-				anchor.ModelAlias == anchor.UpstreamModel && anchor.Enabled {
+				anchor.Kind == "model" && anchor.Enabled {
 				return true
 			}
 		}

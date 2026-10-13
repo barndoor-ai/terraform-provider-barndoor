@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+ENHANCEMENTS:
+
+* resource/`barndoor_llm_model_mapping`: new `kind` attribute (`model` for a 1:1 enablement, `route` for a route target). It is inferred when unset, as the platform infers it, and sent explicitly on create. A route that carries the model's own name is now its own row, separate from the enablement, and is bare-callable by default. Changing `kind` forces a new mapping. Requires platform support for route kinds.
+* resource/`barndoor_llm_model_mapping`: an enablement (`kind = "model"`) that sets `bare_alias = true` is rejected at plan time. So is one whose `model_alias` differs from its `upstream_model`, and one whose `model_alias`, `upstream_model` or `bare_alias` changes in place: the platform rejects those updates.
+
 ## 0.9.0 (2026-10-02)
 
 FEATURES:

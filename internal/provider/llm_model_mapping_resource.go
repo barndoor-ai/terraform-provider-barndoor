@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -26,10 +27,11 @@ import (
 
 // Ensure the resource satisfies the framework interfaces it relies on.
 var (
-	_ resource.Resource                = &llmModelMappingResource{}
-	_ resource.ResourceWithConfigure   = &llmModelMappingResource{}
-	_ resource.ResourceWithImportState = &llmModelMappingResource{}
-	_ resource.ResourceWithModifyPlan  = &llmModelMappingResource{}
+	_ resource.Resource                   = &llmModelMappingResource{}
+	_ resource.ResourceWithConfigure      = &llmModelMappingResource{}
+	_ resource.ResourceWithImportState    = &llmModelMappingResource{}
+	_ resource.ResourceWithModifyPlan     = &llmModelMappingResource{}
+	_ resource.ResourceWithValidateConfig = &llmModelMappingResource{}
 )
 
 // NewLlmModelMappingResource returns a new barndoor_llm_model_mapping resource.
@@ -50,6 +52,7 @@ type llmModelMappingResourceModel struct {
 	ProviderID            types.String `tfsdk:"provider_id"`
 	ModelAlias            types.String `tfsdk:"model_alias"`
 	UpstreamModel         types.String `tfsdk:"upstream_model"`
+	Kind                  types.String `tfsdk:"kind"`
 	Enabled               types.Bool   `tfsdk:"enabled"`
 	Priority              types.Int64  `tfsdk:"priority"`
 	RetryOn429Count       types.Int64  `tfsdk:"retry_on_429_count"`
@@ -81,7 +84,7 @@ func (r *llmModelMappingResource) Schema(_ context.Context, _ resource.SchemaReq
 			"on the provider, and a **custom alias** (`model_alias != upstream_model`) routes an alias to " +
 			"it. A custom alias requires the 1:1 enablement for its `(provider_id, upstream_model)` pair " +
 			"to exist first — the API rejects orphan aliases with a 400. The create endpoint **upserts** " +
-			"1:1 rows: creating a 1:1 mapping that already exists on the platform adopts and updates the " +
+			"enablement rows (`kind = \"model\"`): creating one that already exists on the platform adopts and updates the " +
 			"existing row instead of failing.\n\n" +
 			"`priority` orders failover between routes serving the same alias (lower wins) and is " +
 			"written through the per-mapping update endpoint. The platform's bulk " +
@@ -114,6 +117,21 @@ func (r *llmModelMappingResource) Schema(_ context.Context, _ resource.SchemaReq
 			"upstream_model": schema.StringAttribute{
 				MarkdownDescription: "Upstream model the route points at (the provider's model name).",
 				Required:            true,
+			},
+			"kind": schema.StringAttribute{
+				MarkdownDescription: "Row kind: `model` is a 1:1 enablement, named after its model and never " +
+					"bare-callable; `route` is a route target, which may also carry the model's own name. Inferred " +
+					"when unset, as the platform infers it: a `model_alias` equal to `upstream_model` without " +
+					"`bare_alias = true` is a `model`, anything else a `route`. Set at create; changing it forces a new mapping.",
+				Optional: true,
+				Computed: true,
+				Validators: []validator.String{
+					stringvalidator.OneOf("model", "route"),
+				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+					stringplanmodifier.RequiresReplace(),
+				},
 			},
 			"enabled": schema.BoolAttribute{
 				MarkdownDescription: "Whether the route serves traffic. Defaults to `true`. Disabling a " +
@@ -240,6 +258,31 @@ func llmCooldownAttribute(description string, lower, upper int64) schema.Int64At
 // API enforces the same rules with a 400; checking here fails at plan instead.
 // A rule is skipped while either side is still unknown (an omitted attribute
 // on create), leaving the server as the backstop.
+// ValidateConfig checks an explicit `kind = "model"` at plan time: an
+// enablement is named after its model and is never bare-callable.
+func (r *llmModelMappingResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var kind, alias, upstream types.String
+	var bare types.Bool
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("kind"), &kind)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("model_alias"), &alias)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("upstream_model"), &upstream)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("bare_alias"), &bare)...)
+	if resp.Diagnostics.HasError() || kind.IsNull() || kind.IsUnknown() || kind.ValueString() != "model" {
+		return
+	}
+	if b, ok := bare.ValueBool(), !bare.IsNull() && !bare.IsUnknown(); ok && b {
+		resp.Diagnostics.AddAttributeError(path.Root("bare_alias"), "Enablement cannot be bare-callable",
+			"kind = \"model\" is a 1:1 enablement, which is never bare-callable. For a route that carries the "+
+				"model's own name, use kind = \"route\".")
+	}
+	if a, ok := knownString(alias); ok {
+		if u, ok := knownString(upstream); ok && a != u {
+			resp.Diagnostics.AddAttributeError(path.Root("kind"), "Enablement must be named after its model",
+				"kind = \"model\" requires model_alias to equal upstream_model. Use kind = \"route\" for a custom alias.")
+		}
+	}
+}
+
 func (r *llmModelMappingResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
 	if req.Plan.Raw.IsNull() {
 		return // destroy
@@ -249,6 +292,23 @@ func (r *llmModelMappingResource) ModifyPlan(ctx context.Context, req resource.M
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
 		return
+	}
+	if !req.State.Raw.IsNull() {
+		var prior llmModelMappingResourceModel
+		resp.Diagnostics.Append(req.State.Get(ctx, &prior)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		// The update API cannot rename, repoint or make bare-callable an
+		// enablement; surface that at plan time, not as a 400 at apply.
+		if prior.Kind.ValueString() == "model" && (!plan.ModelAlias.Equal(prior.ModelAlias) ||
+			!plan.UpstreamModel.Equal(prior.UpstreamModel) || !plan.BareAlias.Equal(prior.BareAlias)) {
+			resp.Diagnostics.AddError("Enablement cannot change in place",
+				"A `model` mapping (a 1:1 enablement) cannot have its model_alias, upstream_model or bare_alias "+
+					"changed: the platform rejects the update. Route the alias with a `route` mapping instead, or "+
+					"remove and recreate the enablement deliberately.")
+			return
+		}
 	}
 	if plan.CooldownMaxSecs.IsNull() || plan.CooldownMaxSecs.IsUnknown() {
 		return
@@ -417,6 +477,7 @@ type llmModelMappingCreateRequest struct {
 	ProviderID            string  `json:"provider_id"`
 	ModelAlias            string  `json:"model_alias"`
 	UpstreamModel         string  `json:"upstream_model"`
+	Kind                  *string `json:"kind,omitempty"`
 	Enabled               *bool   `json:"enabled,omitempty"`
 	Priority              *int32  `json:"priority,omitempty"`
 	RetryOn429Count       *int32  `json:"retry_on_429_count,omitempty"`
@@ -467,6 +528,7 @@ type llmModelMappingResponse struct {
 	ProviderID            string `json:"provider_id"`
 	ModelAlias            string `json:"model_alias"`
 	UpstreamModel         string `json:"upstream_model"`
+	Kind                  string `json:"kind"`
 	Enabled               bool   `json:"enabled"`
 	Priority              int32  `json:"priority"`
 	RetryOn429Count       int32  `json:"retry_on_429_count"`
@@ -505,11 +567,26 @@ func boolPtrFromBool(v types.Bool) *bool {
 	return nil
 }
 
+// llmMappingKind returns the kind to send on create: the configured kind, or
+// the platform's inference when unset (a 1:1 name without bare_alias = true is
+// an enablement, anything else a route).
+func llmMappingKind(plan *llmModelMappingResourceModel) string {
+	if v, ok := knownString(plan.Kind); ok {
+		return v
+	}
+	if plan.ModelAlias.ValueString() == plan.UpstreamModel.ValueString() && !plan.BareAlias.ValueBool() {
+		return "model"
+	}
+	return "route"
+}
+
 // buildLlmModelMappingCreateRequest converts the planned model to the create
 // body. Unset optionals are omitted so the API's defaulting applies (enabled
 // true, priority 0, bare-alias inference, platform timeout defaults).
 func buildLlmModelMappingCreateRequest(plan *llmModelMappingResourceModel) *llmModelMappingCreateRequest {
+	kind := llmMappingKind(plan)
 	return &llmModelMappingCreateRequest{
+		Kind:                  &kind,
 		ProviderID:            plan.ProviderID.ValueString(),
 		ModelAlias:            plan.ModelAlias.ValueString(),
 		UpstreamModel:         plan.UpstreamModel.ValueString(),
@@ -555,6 +632,7 @@ func applyLlmModelMappingResponse(mapping *llmModelMappingResponse, changeNote t
 		ProviderID:            types.StringValue(mapping.ProviderID),
 		ModelAlias:            types.StringValue(mapping.ModelAlias),
 		UpstreamModel:         types.StringValue(mapping.UpstreamModel),
+		Kind:                  types.StringValue(mapping.Kind),
 		Enabled:               types.BoolValue(mapping.Enabled),
 		Priority:              types.Int64Value(int64(mapping.Priority)),
 		RetryOn429Count:       types.Int64Value(int64(mapping.RetryOn429Count)),

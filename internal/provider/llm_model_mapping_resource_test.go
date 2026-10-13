@@ -38,7 +38,7 @@ func TestLlmModelMappingResource_Schema(t *testing.T) {
 	}
 
 	for _, attr := range []string{
-		"id", "provider_id", "model_alias", "upstream_model", "enabled", "priority",
+		"id", "provider_id", "model_alias", "upstream_model", "kind", "enabled", "priority",
 		"retry_on_429_count", "retry_on_429_max_wait_secs", "bare_alias",
 		"stream_idle_timeout_secs", "request_timeout_secs",
 	} {
@@ -52,7 +52,7 @@ func TestLlmModelMappingResource_Schema(t *testing.T) {
 		}
 	}
 	for _, computed := range []string{
-		"id", "enabled", "priority", "retry_on_429_count", "retry_on_429_max_wait_secs",
+		"id", "kind", "enabled", "priority", "retry_on_429_count", "retry_on_429_max_wait_secs",
 		"bare_alias", "stream_idle_timeout_secs", "request_timeout_secs",
 	} {
 		if !resp.Schema.Attributes[computed].IsComputed() {
@@ -92,7 +92,6 @@ resource "barndoor_llm_model_mapping" "enable" {
   provider_id    = %[1]q
   model_alias    = "gpt-4o"
   upstream_model = "gpt-4o"
-  bare_alias     = true
 }
 
 resource "barndoor_llm_model_mapping" "alias" {
@@ -137,11 +136,12 @@ resource "barndoor_llm_model_mapping" "alias" {
 				PlanOnly: true,
 			},
 			{
-				// In-place update: opt the enablement into bare resolution;
-				// tune the alias row's failover and timeouts and disable it.
+				// In-place update: tune the alias row's failover and timeouts and
+				// disable it. The enablement is unchanged: the platform rejects making
+				// it bare-callable in place.
 				Config: expandedConfig,
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(enableName, "bare_alias", "true"),
+					resource.TestCheckResourceAttr(enableName, "bare_alias", "false"),
 					resource.TestCheckResourceAttr(aliasName, "enabled", "false"),
 					resource.TestCheckResourceAttr(aliasName, "priority", "5"),
 					resource.TestCheckResourceAttr(aliasName, "retry_on_429_count", "3"),
@@ -174,6 +174,7 @@ func TestLlmModelMappingResource_oneToOneCreateAdoptsExistingRow(t *testing.T) {
 	fake.mu.Lock()
 	tunedThreshold := int64(3)
 	existing := &fakeLlmModelMapping{
+		Kind:                  "model",
 		ID:                    fake.newID("bbbb"),
 		ProviderID:            provider.ID,
 		ModelAlias:            "gpt-4o",
@@ -199,12 +200,13 @@ resource "barndoor_llm_model_mapping" "enable" {
   provider_id    = %q
   model_alias    = "gpt-4o"
   upstream_model = "gpt-4o"
-  bare_alias     = true
+  kind           = "model"
 }
 `, provider.ID),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr(resourceName, "id", existing.ID),
-					resource.TestCheckResourceAttr(resourceName, "bare_alias", "true"),
+					resource.TestCheckResourceAttr(resourceName, "kind", "model"),
+					resource.TestCheckResourceAttr(resourceName, "bare_alias", "false"),
 					resource.TestCheckResourceAttr(resourceName, "cooldown_failure_threshold", "3"),
 					func(*terraform.State) error {
 						fake.mu.Lock()
@@ -498,6 +500,132 @@ resource "barndoor_llm_model_mapping" "enable" {
 			{
 				Config: config(300),
 				Check:  resource.TestCheckResourceAttr("barndoor_llm_model_mapping.enable", "stream_idle_timeout_secs", "300"),
+			},
+		},
+	})
+}
+
+// --- row kind ---------------------------------------------------------
+
+func TestLlmModelMappingResource_kindInferenceAndSameNameRoute(t *testing.T) {
+	fake := setupLlmGatewayTest(t)
+	provider := fake.seedProvider()
+	const enableName = "barndoor_llm_model_mapping.enable"
+	const routeName = "barndoor_llm_model_mapping.same_name_route"
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllLlmMappingsDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				// Kind is inferred when unset: a 1:1 name is an enablement.
+				// A route that carries the model's own name is a separate row
+				// with its own id, bare-callable by default.
+				Config: fmt.Sprintf(`
+resource "barndoor_llm_model_mapping" "enable" {
+  provider_id    = %[1]q
+  model_alias    = "gpt-4o"
+  upstream_model = "gpt-4o"
+}
+
+resource "barndoor_llm_model_mapping" "same_name_route" {
+  provider_id    = %[1]q
+  model_alias    = "gpt-4o"
+  upstream_model = "gpt-4o"
+  kind           = "route"
+  bare_alias     = true
+  depends_on     = [barndoor_llm_model_mapping.enable]
+}
+`, provider.ID),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(enableName, "kind", "model"),
+					resource.TestCheckResourceAttr(enableName, "bare_alias", "false"),
+					resource.TestCheckResourceAttr(routeName, "kind", "route"),
+					resource.TestCheckResourceAttr(routeName, "bare_alias", "true"),
+					func(*terraform.State) error {
+						fake.mu.Lock()
+						defer fake.mu.Unlock()
+						if len(fake.mappings) != 2 {
+							return fmt.Errorf("a same-name route must be its own row: have %d rows, want 2",
+								len(fake.mappings))
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: fmt.Sprintf(`
+resource "barndoor_llm_model_mapping" "enable" {
+  provider_id    = %[1]q
+  model_alias    = "gpt-4o"
+  upstream_model = "gpt-4o"
+}
+
+resource "barndoor_llm_model_mapping" "same_name_route" {
+  provider_id    = %[1]q
+  model_alias    = "gpt-4o"
+  upstream_model = "gpt-4o"
+  kind           = "route"
+  bare_alias     = true
+  depends_on     = [barndoor_llm_model_mapping.enable]
+}
+`, provider.ID),
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+func TestLlmModelMappingResource_enablementRejectsBareAlias(t *testing.T) {
+	fake := setupLlmGatewayTest(t)
+	provider := fake.seedProvider()
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllLlmMappingsDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: fmt.Sprintf(`
+resource "barndoor_llm_model_mapping" "enable" {
+  provider_id    = %q
+  model_alias    = "gpt-4o"
+  upstream_model = "gpt-4o"
+  kind           = "model"
+  bare_alias     = true
+}
+`, provider.ID),
+				ExpectError: regexp.MustCompile(`Enablement cannot be bare-callable`),
+			},
+		},
+	})
+}
+
+func TestLlmModelMappingResource_enablementCannotBeRenamedInPlace(t *testing.T) {
+	fake := setupLlmGatewayTest(t)
+	provider := fake.seedProvider()
+	enablement := func(model string) string {
+		return fmt.Sprintf(`
+resource "barndoor_llm_model_mapping" "enable" {
+  provider_id    = %q
+  model_alias    = %q
+  upstream_model = %q
+}
+`, provider.ID, model, model)
+	}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllLlmMappingsDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: enablement("gpt-4o"),
+				Check:  resource.TestCheckResourceAttr("barndoor_llm_model_mapping.enable", "kind", "model"),
+			},
+			{
+				// Renaming the enablement is refused at plan time; the platform
+				// would answer the same update with a 400.
+				Config:      enablement("gpt-4o-mini"),
+				ExpectError: regexp.MustCompile(`Enablement cannot change in place`),
 			},
 		},
 	})
