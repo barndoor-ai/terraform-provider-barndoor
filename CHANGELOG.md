@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+ENHANCEMENTS:
+
+* resource/`barndoor_llm_model_access`: new `scope_ids` and `scope_values` attributes bind one policy to every user, project, API key, agent, role or group it applies to; it applies when any listed entity matches. Previously a policy edited in the Barndoor app with several entities showed up in state as only its first one. Requires platform support for multi-entity model-access scopes.
+* resource/`barndoor_llm_model_access`: `scope_id` and `scope_value` are deprecated in favour of `scope_ids` and `scope_values`. They cannot represent a multi-entity binding, and a read shows only the first entity with a warning. Setting both forms of one binding is rejected at plan time.
+
 ## 0.9.0 (2026-10-02)
 
 FEATURES:

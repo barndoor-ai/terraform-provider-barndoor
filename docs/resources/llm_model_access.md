@@ -4,14 +4,14 @@ page_title: "barndoor_llm_model_access Resource - Barndoor"
 subcategory: ""
 description: |-
   Manages an LLM Gateway model-access policy: an allowlist or denylist of models and providers, applied to an identity scope (the organization, a user, an IdP group, …).
-  scope_type/scope_id/scope_value answer who the policy applies to; the targets list answers what is allowed or denied and is OR-ed when matching. A route_group target stands for the current members of a barndoor_llm_model_route_group, so editing the group changes what the policy covers without an edit to the policy. A cleared scope_id or scope_value cannot be unset through the update API, so removing one forces a new policy.
+  scope_type with scope_ids (UUID-keyed scopes) or scope_values (name-keyed role/group scopes) answers who the policy applies to, and the policy applies when any listed entity matches; the targets list answers what is allowed or denied and is OR-ed when matching. A route_group target stands for the current members of a barndoor_llm_model_route_group, so editing the group changes what the policy covers without an edit to the policy. Removing a scope from configuration unbinds it in place.
 ---
 
 # barndoor_llm_model_access (Resource)
 
 Manages an LLM Gateway model-access policy: an allowlist or denylist of models and providers, applied to an identity scope (the organization, a user, an IdP group, …).
 
-`scope_type`/`scope_id`/`scope_value` answer *who* the policy applies to; the `targets` list answers *what* is allowed or denied and is OR-ed when matching. A `route_group` target stands for the current members of a `barndoor_llm_model_route_group`, so editing the group changes what the policy covers without an edit to the policy. A cleared `scope_id` or `scope_value` cannot be unset through the update API, so removing one forces a new policy.
+`scope_type` with `scope_ids` (UUID-keyed scopes) or `scope_values` (name-keyed `role`/`group` scopes) answers *who* the policy applies to, and the policy applies when any listed entity matches; the `targets` list answers *what* is allowed or denied and is OR-ed when matching. A `route_group` target stands for the current members of a `barndoor_llm_model_route_group`, so editing the group changes what the policy covers without an edit to the policy. Removing a scope from configuration unbinds it in place.
 
 ## Example Usage
 
@@ -72,8 +72,10 @@ resource "barndoor_llm_model_access" "research_routes" {
 
 - `change_note` (String) Optional note explaining the change ("Raise cap for Q4 launch"), recorded on the policy and in the audit trail (at most 500 characters). It describes the write Terraform makes, not the policy: the platform clears the previous note on any update that does not send one, and the value is not refreshed from the platform. Changing only the note makes an in-place update that records it.
 - `enabled` (Boolean) Whether the policy is enforced. Defaults to `true`.
-- `scope_id` (String) UUID of the scoped entity (user, team, API key, …) for UUID-keyed scope types. Removing it forces a new resource — the API cannot clear it in place.
-- `scope_value` (String) String key of the scoped entity for name-keyed scope types (e.g. a role or IdP group name for `role`/`group` scopes). Removing it forces a new resource — the API cannot clear it in place.
+- `scope_id` (String, Deprecated) UUID of the scoped entity (user, team, API key, …) for UUID-keyed scope types. Removing it forces a new resource — the API cannot clear it in place.
+- `scope_ids` (List of String) UUIDs of every entity (user, project, API key, agent) the policy applies to, for UUID-keyed scope types. The policy applies when any one of them matches. Unset or empty means the policy is not bound to a specific entity.
+- `scope_value` (String, Deprecated) String key of the scoped entity for name-keyed scope types (e.g. a role or IdP group name for `role`/`group` scopes). Removing it forces a new resource — the API cannot clear it in place.
+- `scope_values` (List of String) Role or IdP group names the policy applies to, for name-keyed scope types (`role`, `group`). Same any-of semantics as `scope_ids`.
 - `traffic_type` (String) Traffic lane the policy applies to: `all`, `llm` (model-proxy traffic), or `mcp` (MCP tool traffic). Defaults to `llm`.
 
 ### Read-Only
