@@ -4,11 +4,22 @@ resource "barndoor_mcp_server" "github" {
   name                    = "GitHub (Engineering)"
   mcp_server_directory_id = "11111111-1111-1111-1111-111111111111"
 
-  client_id     = var.github_oauth_client_id
-  client_secret = var.github_oauth_client_secret
+  credential_mode = "manual"
+  client_id       = var.github_oauth_client_id
+  client_secret   = var.github_oauth_client_secret
 
   # Override the directory's default OAuth scopes for this server.
   scopes = ["repo", "read:org"]
+}
+
+# An OAuth server whose client Barndoor obtains itself: through the
+# provider's client ID metadata document support, or by registering a client.
+# resolved_credential_mode reports which one it chose.
+resource "barndoor_mcp_server" "linear" {
+  name                    = "Linear"
+  mcp_server_directory_id = "33333333-3333-3333-3333-333333333333"
+
+  credential_mode = "auto"
 }
 
 # A non-OAuth server seeded with pre-populated credentials that cascade to

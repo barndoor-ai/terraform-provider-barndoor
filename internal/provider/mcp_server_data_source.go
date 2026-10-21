@@ -52,6 +52,7 @@ type mcpServerDataSourceModel struct {
 	McpServerDirectoryID   types.String `tfsdk:"mcp_server_directory_id"`
 	OauthBaseURLOverride   types.String `tfsdk:"oauth_base_url_override"`
 	UsesManagedCredentials types.Bool   `tfsdk:"uses_managed_credentials"`
+	CredentialMode         types.String `tfsdk:"credential_mode"`
 	Scopes                 types.List   `tfsdk:"scopes"`
 	PublishedAt            types.String `tfsdk:"published_at"`
 	AttentionTier          types.String `tfsdk:"attention_tier"`
@@ -106,6 +107,10 @@ func (d *mcpServerDataSource) Schema(_ context.Context, _ datasource.SchemaReque
 				MarkdownDescription: "Whether the server uses Barndoor-managed OAuth credentials instead " +
 					"of tenant-supplied ones.",
 				Computed: true,
+			},
+			"credential_mode": schema.StringAttribute{
+				MarkdownDescription: storedCredentialModeDescription,
+				Computed:            true,
 			},
 			"scopes": schema.ListAttribute{
 				MarkdownDescription: "Server-level OAuth scope override, when one is set (null means the " +
@@ -225,6 +230,7 @@ func applyMcpServerDataSource(ctx context.Context, server *mcpServerResponse, da
 	data.OauthBaseURLOverride = optionalStringFromPtr(server.OauthBaseURLOverride, types.StringNull())
 	data.PublishedAt = types.StringPointerValue(server.PublishedAt)
 	data.AttentionTier = types.StringPointerValue(server.AttentionTier)
+	data.CredentialMode = types.StringPointerValue(server.CredentialMode)
 	if server.UsesManagedCredentials == nil {
 		data.UsesManagedCredentials = types.BoolNull()
 	} else {

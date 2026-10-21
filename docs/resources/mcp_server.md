@@ -19,11 +19,22 @@ resource "barndoor_mcp_server" "github" {
   name                    = "GitHub (Engineering)"
   mcp_server_directory_id = "11111111-1111-1111-1111-111111111111"
 
-  client_id     = var.github_oauth_client_id
-  client_secret = var.github_oauth_client_secret
+  credential_mode = "manual"
+  client_id       = var.github_oauth_client_id
+  client_secret   = var.github_oauth_client_secret
 
   # Override the directory's default OAuth scopes for this server.
   scopes = ["repo", "read:org"]
+}
+
+# An OAuth server whose client Barndoor obtains itself: through the
+# provider's client ID metadata document support, or by registering a client.
+# resolved_credential_mode reports which one it chose.
+resource "barndoor_mcp_server" "linear" {
+  name                    = "Linear"
+  mcp_server_directory_id = "33333333-3333-3333-3333-333333333333"
+
+  credential_mode = "auto"
 }
 
 # A non-OAuth server seeded with pre-populated credentials that cascade to
@@ -66,11 +77,14 @@ variable "internal_api_key" {
 - `cascaded_fields` (List of String) Names of pre-populated credential fields that cascade from the server to user connections. Create-only: changing it forces a new server.
 - `client_id` (String) Tenant OAuth client ID for the upstream provider. **Write-only:** the API stores and returns an obfuscated mask, so Terraform tracks the configured value and never refreshes it from the server (out-of-band changes are not detected).
 - `client_secret` (String, Sensitive) Tenant OAuth client secret for the upstream provider. Write-only, never returned by the API. May be omitted for PKCE public clients.
+- `credential_mode` (String) Where the server's OAuth client comes from: `managed` (Barndoor's managed OAuth client; the directory entry must support it), `cimd` (Barndoor's OAuth client ID metadata document; the provider must advertise it and S256 PKCE), `dcr` (Barndoor registers a client with the provider through dynamic client registration), `manual` (the configured `client_id` and `client_secret`), or `auto` (Barndoor chooses from what the provider supports when it creates the server). Omit it for a provider that does not use OAuth. **State follows configuration:** the mode the server actually uses is `resolved_credential_mode`.
+
+Changing it to `managed` or `manual`, or from `cimd` to `dcr`, updates the server in place. Changing it to `cimd`, or to `dcr` from any mode other than `cimd`, forces a new server, because the registry cannot move an existing server there. Changing it to `auto`, or removing it, leaves the server's mode as it is. Any change of mode deletes the server's existing user connections.
 - `meta` (String) Server metadata as a JSON object (`jsonencode({...})`), e.g. the `access_context` values for directory-templated properties. **State follows configuration:** the platform merges computed defaults into stored metadata, and those server-computed keys are deliberately not tracked here.
 - `oauth_base_url_override` (String) Tenant-specific OAuth base URL override for the upstream provider.
 - `prepopulated_credentials` (String, Sensitive) Pre-populated credentials for non-OAuth providers as a JSON object (e.g. `jsonencode({api_key = "..."})`). Write-only and **create-only**: the API has no update path for it, so changing it forces a new server.
 - `scopes` (List of String) Server-level OAuth scope override. Omit (or set `[]`… but prefer omitting) to inherit the directory entry's default scopes; a non-empty list overrides them.
-- `uses_managed_credentials` (Boolean) Use Barndoor-managed OAuth credentials instead of tenant-supplied ones. The directory entry must support managed OAuth (the API rejects it with a 422 otherwise).
+- `uses_managed_credentials` (Boolean, Deprecated) **Deprecated:** use `credential_mode = "managed"`. Use Barndoor-managed OAuth credentials instead of tenant-supplied ones. The directory entry must support managed OAuth (the API rejects it with a 422 otherwise). When both are set they must agree.
 
 ### Read-Only
 
@@ -78,6 +92,7 @@ variable "internal_api_key" {
 - `id` (String) Server UUID assigned by the API; also the `terraform import` key.
 - `publish_blockers` (List of String) Why a publish would be rejected right now, in the order the registry's publish gate evaluates them: `not_operationally_available` (the server has no working connection or credentials) and/or `no_active_policy` (no ACTIVE `barndoor_policy` targets it). **Read-only.** An empty list means a publish would be accepted; **null means undetermined** — the registry could not evaluate the gate (the `mcp-server-publishing` feature flag is off for the organization, or policy-service did not answer) — so null is not evidence that publishing will succeed.
 - `published_at` (String) RFC 3339 timestamp of when the server was published (made discoverable to end users); null while unpublished. **Read-only** — publish with the `barndoor_mcp_server_publication` resource. Publishing is one-way: there is no unpublish.
+- `resolved_credential_mode` (String) Where the server's OAuth client comes from, as the registry stores it: `managed`, `cimd`, `dcr`, `manual`, `static_client` (a per-server client that was either entered by hand or registered with the provider, and the registry cannot tell which), or `none` (no OAuth client: not configured yet, or the provider does not use OAuth). **Read-only.** A change made outside Terraform shows here and does not plan a change back to `credential_mode`.
 - `slug` (String) URL-safe identifier generated by the API from the name at create time.
 - `status` (String) Lifecycle status computed by the platform: `pending` (awaiting credentials or an OAuth connection), `active`, or `error`. Creating a server with credentials (or `uses_managed_credentials`) activates it immediately; otherwise it stays `pending` until a connection is established out-of-band.
 
