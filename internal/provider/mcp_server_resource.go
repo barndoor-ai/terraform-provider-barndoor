@@ -10,6 +10,7 @@ import (
 	"net/http"
 
 	"github.com/hashicorp/terraform-plugin-framework-jsontypes/jsontypes"
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -17,6 +18,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/barndoor-ai/terraform-provider-barndoor/internal/client"
@@ -54,6 +56,8 @@ type mcpServerResourceModel struct {
 	Status                  types.String         `tfsdk:"status"`
 	OauthBaseURLOverride    types.String         `tfsdk:"oauth_base_url_override"`
 	UsesManagedCredentials  types.Bool           `tfsdk:"uses_managed_credentials"`
+	CredentialMode          types.String         `tfsdk:"credential_mode"`
+	ResolvedCredentialMode  types.String         `tfsdk:"resolved_credential_mode"`
 	ClientID                types.String         `tfsdk:"client_id"`
 	ClientSecret            types.String         `tfsdk:"client_secret"`
 	Scopes                  types.List           `tfsdk:"scopes"`
@@ -85,7 +89,27 @@ const (
 		"accepted; **null means undetermined** — the registry could not evaluate the gate " +
 		"(the `mcp-server-publishing` feature flag is off for the organization, or " +
 		"policy-service did not answer) — so null is not evidence that publishing will succeed."
+
+	storedCredentialModeDescription = "Where the server's OAuth client comes from, as the registry " +
+		"stores it: `managed`, `cimd`, `dcr`, `manual`, `static_client` (a per-server client that was " +
+		"either entered by hand or registered with the provider, and the registry cannot tell which), " +
+		"or `none` (no OAuth client: not configured yet, or the provider does not use OAuth). **Read-only.**"
 )
+
+// The credential modes a server create or update request can name. The
+// registry stores and returns two more, `static_client` and `none`, which a
+// request cannot.
+const (
+	credentialModeAuto    = "auto"
+	credentialModeManaged = "managed"
+	credentialModeCIMD    = "cimd"
+	credentialModeDCR     = "dcr"
+	credentialModeManual  = "manual"
+)
+
+var requestedCredentialModes = []string{
+	credentialModeAuto, credentialModeManaged, credentialModeCIMD, credentialModeDCR, credentialModeManual,
+}
 
 func (r *mcpServerResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
 	resp.TypeName = req.ProviderTypeName + "_mcp_server"
@@ -135,9 +159,41 @@ func (r *mcpServerResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				Optional:            true,
 			},
 			"uses_managed_credentials": schema.BoolAttribute{
-				MarkdownDescription: "Use Barndoor-managed OAuth credentials instead of tenant-supplied ones. " +
-					"The directory entry must support managed OAuth (the API rejects it with a 422 otherwise).",
+				MarkdownDescription: "**Deprecated:** use `credential_mode = \"managed\"`. Use " +
+					"Barndoor-managed OAuth credentials instead of tenant-supplied ones. The directory entry " +
+					"must support managed OAuth (the API rejects it with a 422 otherwise). When both are set " +
+					"they must agree.",
+				DeprecationMessage: "Use credential_mode = \"managed\" instead.",
+				Optional:           true,
+			},
+			"credential_mode": schema.StringAttribute{
+				MarkdownDescription: "Where the server's OAuth client comes from: `managed` (Barndoor's " +
+					"managed OAuth client; the directory entry must support it), `cimd` (Barndoor's OAuth " +
+					"client ID metadata document; the provider must advertise it and S256 PKCE), `dcr` " +
+					"(Barndoor registers a client with the provider through dynamic client registration), " +
+					"`manual` (the configured `client_id` and `client_secret`), or `auto` (Barndoor chooses " +
+					"from what the provider supports when it creates the server). Omit it for a provider that " +
+					"does not use OAuth. **State follows configuration:** the mode the server actually uses is " +
+					"`resolved_credential_mode`.\n\n" +
+					"Changing it to `managed` or `manual`, or from `cimd` to `dcr`, updates the server in " +
+					"place. Changing it to `cimd`, or to `dcr` from any mode other than `cimd`, forces a new " +
+					"server, because the registry cannot move an existing server there. Changing it to `auto`, " +
+					"or removing it, leaves the server's mode as it is. Any change of mode deletes the " +
+					"server's existing user connections.",
 				Optional: true,
+				Validators: []validator.String{
+					stringvalidator.OneOf(requestedCredentialModes...),
+				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplaceIf(credentialModeRequiresReplace,
+						"Replaces the server when an update cannot move it to the configured credential mode.",
+						"Replaces the server when an update cannot move it to the configured credential mode."),
+				},
+			},
+			"resolved_credential_mode": schema.StringAttribute{
+				MarkdownDescription: storedCredentialModeDescription + " A change made outside Terraform " +
+					"shows here and does not plan a change back to `credential_mode`.",
+				Computed: true,
 			},
 			"client_id": schema.StringAttribute{
 				MarkdownDescription: "Tenant OAuth client ID for the upstream provider. **Write-only:** the " +
@@ -247,6 +303,72 @@ func (r *mcpServerResource) ValidateConfig(ctx context.Context, req resource.Val
 				"but no `prepopulated_credentials` are configured.",
 		)
 	}
+
+	validateCredentialMode(&cfg, &resp.Diagnostics)
+}
+
+// validateCredentialMode rejects the credential_mode combinations the registry
+// refuses, and the ones it accepts but resolves to a mode other than the one
+// credential_mode names: a client_id outranks every mode but `manual`.
+func validateCredentialMode(cfg *mcpServerResourceModel, diags *diag.Diagnostics) {
+	mode, ok := knownString(cfg.CredentialMode)
+	if !ok {
+		return
+	}
+
+	if !cfg.UsesManagedCredentials.IsNull() && !cfg.UsesManagedCredentials.IsUnknown() &&
+		cfg.UsesManagedCredentials.ValueBool() != (mode == credentialModeManaged) {
+		diags.AddAttributeError(
+			path.Root("uses_managed_credentials"),
+			"uses_managed_credentials conflicts with credential_mode",
+			fmt.Sprintf("`uses_managed_credentials = %t` contradicts `credential_mode = %q`. Remove "+
+				"`uses_managed_credentials`; `credential_mode` replaces it.",
+				cfg.UsesManagedCredentials.ValueBool(), mode),
+		)
+	}
+
+	if cfg.ClientID.IsUnknown() {
+		return
+	}
+
+	switch {
+	case mode == credentialModeManual && cfg.ClientID.IsNull():
+		diags.AddAttributeError(
+			path.Root("client_id"),
+			"credential_mode \"manual\" requires client_id",
+			"A `manual` server uses the configured `client_id` (and `client_secret`, when the provider "+
+				"needs one); set `client_id`.",
+		)
+	case mode != credentialModeManual && !cfg.ClientID.IsNull():
+		diags.AddAttributeError(
+			path.Root("client_id"),
+			"client_id requires credential_mode \"manual\"",
+			fmt.Sprintf("The registry uses a configured `client_id` in place of `credential_mode = %q`. "+
+				"Set `credential_mode = \"manual\"` to use the client ID, or remove `client_id`.", mode),
+		)
+	}
+}
+
+// credentialModeRequiresReplace forces a new server when an update cannot move
+// the existing one to the configured mode: the registry never moves a server
+// into `cimd`, and moves one into `dcr` only from `cimd`. Naming the mode the
+// server already uses is a no-op update, so it never replaces.
+func credentialModeRequiresReplace(ctx context.Context, req planmodifier.StringRequest, resp *stringplanmodifier.RequiresReplaceIfFuncResponse) {
+	planned, ok := knownString(req.PlanValue)
+	if !ok {
+		return
+	}
+
+	var resolved types.String
+	resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("resolved_credential_mode"), &resolved)...)
+	current := resolved.ValueString()
+
+	switch planned {
+	case credentialModeCIMD:
+		resp.RequiresReplace = current != credentialModeCIMD
+	case credentialModeDCR:
+		resp.RequiresReplace = current != credentialModeCIMD && current != credentialModeDCR
+	}
 }
 
 // validateJSONObject adds a diagnostic when v holds known JSON that is not an
@@ -299,6 +421,7 @@ func (r *mcpServerResource) Create(ctx context.Context, req resource.CreateReque
 		resp.Diagnostics.AddError("Failed to read the MCP server after create", err.Error())
 		plan.Slug = types.StringNull()
 		plan.Status = types.StringNull()
+		plan.ResolvedCredentialMode = types.StringNull()
 		plan.PublishedAt = types.StringNull()
 		plan.AttentionTier = types.StringNull()
 		plan.PublishBlockers = types.ListNull(types.StringType)
@@ -351,8 +474,9 @@ func (r *mcpServerResource) Update(ctx context.Context, req resource.UpdateReque
 		return
 	}
 
-	var plan mcpServerResourceModel
+	var plan, prior mcpServerResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &prior)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -362,6 +486,7 @@ func (r *mcpServerResource) Update(ctx context.Context, req resource.UpdateReque
 		resp.Diagnostics.AddError("Invalid MCP server configuration", err.Error())
 		return
 	}
+	applyCredentialModeUpdate(body, &plan, &prior)
 
 	var server mcpServerResponse
 	if err := doJSON(ctx, r.client, http.MethodPut, registryAPIPrefix+"/servers/"+plan.ID.ValueString(), body, &server); err != nil {
@@ -467,12 +592,14 @@ func addMcpServerAPIError(diags *diag.Diagnostics, action string, err error) {
 // value behind and the configuration could never converge. client_id /
 // client_secret / meta / prepopulated_credentials / cascaded_fields are sent
 // only when configured — an explicit null would be meaningless (credentials)
-// or a no-op (meta) server-side.
+// or a no-op (meta) server-side. credential_mode is sent on create when
+// configured, and on update only as applyCredentialModeUpdate decides.
 type mcpServerWriteRequest struct {
 	Name                    string          `json:"name"`
 	McpServerDirectoryID    string          `json:"mcp_server_directory_id"`
 	OauthBaseURLOverride    *string         `json:"oauth_base_url_override"`
 	UsesManagedCredentials  *bool           `json:"uses_managed_credentials"`
+	CredentialMode          *string         `json:"credential_mode,omitempty"`
 	Scopes                  []string        `json:"scopes"`
 	ClientID                *string         `json:"client_id,omitempty"`
 	ClientSecret            *string         `json:"client_secret,omitempty"`
@@ -497,6 +624,7 @@ type mcpServerResponse struct {
 	McpServerDirectoryID   string   `json:"mcp_server_directory_id"`
 	OauthBaseURLOverride   *string  `json:"oauth_base_url_override"`
 	UsesManagedCredentials *bool    `json:"uses_managed_credentials"`
+	CredentialMode         *string  `json:"credential_mode"`
 	Scopes                 []string `json:"scopes"`
 	PublishedAt            *string  `json:"published_at"`
 	AttentionTier          *string  `json:"attention_tier"`
@@ -530,6 +658,19 @@ func buildMcpServerWriteRequest(ctx context.Context, plan *mcpServerResourceMode
 		v := plan.UsesManagedCredentials.ValueBool()
 		body.UsesManagedCredentials = &v
 	}
+
+	mode, hasMode := knownString(plan.CredentialMode)
+	if create && hasMode {
+		body.CredentialMode = &mode
+	}
+	// An update writes uses_managed_credentials from the payload whether or
+	// not it is sent, so a managed server must carry `true` on every update,
+	// including the ones that do not send credential_mode.
+	if body.UsesManagedCredentials == nil && mode == credentialModeManaged {
+		v := true
+		body.UsesManagedCredentials = &v
+	}
+
 	if v, ok := knownString(plan.ClientID); ok {
 		body.ClientID = &v
 	}
@@ -556,6 +697,29 @@ func buildMcpServerWriteRequest(ctx context.Context, plan *mcpServerResourceMode
 	return body, nil
 }
 
+// applyCredentialModeUpdate sets the update body's credential_mode from the
+// planned and prior configuration. It is sent only when the configured value
+// changed to a mode an update can name: re-sending an unchanged mode would
+// turn a mode changed outside Terraform back, and an update refuses `auto`.
+//
+// The update writes uses_managed_credentials from every payload, so when the
+// configuration has never set the flag and the server is managed, the flag is
+// sent as `true`: an unrelated update, or removing credential_mode, must not
+// move the server off its managed client.
+func applyCredentialModeUpdate(body *mcpServerWriteRequest, plan, prior *mcpServerResourceModel) {
+	mode, ok := knownString(plan.CredentialMode)
+	if ok && mode != credentialModeAuto && !plan.CredentialMode.Equal(prior.CredentialMode) {
+		body.CredentialMode = &mode
+		return
+	}
+
+	if body.UsesManagedCredentials == nil && plan.UsesManagedCredentials.IsNull() &&
+		prior.UsesManagedCredentials.IsNull() && prior.ResolvedCredentialMode.ValueString() == credentialModeManaged {
+		v := true
+		body.UsesManagedCredentials = &v
+	}
+}
+
 // applyMcpServerResponse maps the server's view onto a state model. prior is
 // the plan (Create/Update) or previous state (Read); write-only attributes
 // (client_id, client_secret, meta, prepopulated_credentials, cascaded_fields)
@@ -572,6 +736,12 @@ func applyMcpServerResponse(ctx context.Context, server *mcpServerResponse, prio
 		PublishedAt:          types.StringPointerValue(server.PublishedAt),
 		AttentionTier:        types.StringPointerValue(server.AttentionTier),
 
+		// `auto` resolves to a different stored mode, and a mode changed outside
+		// Terraform is reported rather than planned back, so the configured
+		// value is carried and the stored one goes to resolved_credential_mode.
+		CredentialMode:         nullIfUnknownString(prior.CredentialMode),
+		ResolvedCredentialMode: types.StringPointerValue(server.CredentialMode),
+
 		// Write-only: state follows configuration.
 		ClientID:                nullIfUnknownString(prior.ClientID),
 		ClientSecret:            nullIfUnknownString(prior.ClientSecret),
@@ -584,7 +754,10 @@ func applyMcpServerResponse(ctx context.Context, server *mcpServerResponse, prio
 		m.CascadedFields = types.ListNull(types.StringType)
 	}
 
-	if server.UsesManagedCredentials == nil {
+	// An unset flag follows configuration: the provider derives it from
+	// credential_mode, and a server made managed outside Terraform is reported
+	// in resolved_credential_mode rather than planned back.
+	if prior.UsesManagedCredentials.IsNull() || server.UsesManagedCredentials == nil {
 		m.UsesManagedCredentials = types.BoolNull()
 	} else {
 		m.UsesManagedCredentials = types.BoolValue(*server.UsesManagedCredentials)

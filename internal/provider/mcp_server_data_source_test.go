@@ -91,9 +91,9 @@ func TestMcpServerDataSource_Schema(t *testing.T) {
 		}
 	}
 
-	// Both publish-gate fields are read-only on the data source too, as is
-	// published_at; only the three lookup keys are settable.
-	for _, readOnly := range []string{"published_at", "attention_tier", "publish_blockers"} {
+	// Both publish-gate fields are read-only on the data source too, as are
+	// published_at and credential_mode; only the three lookup keys are settable.
+	for _, readOnly := range []string{"published_at", "attention_tier", "publish_blockers", "credential_mode"} {
 		a, ok := resp.Schema.Attributes[readOnly]
 		if !ok {
 			t.Errorf("schema missing attribute %q", readOnly)

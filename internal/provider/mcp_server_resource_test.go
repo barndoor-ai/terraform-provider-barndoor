@@ -35,14 +35,18 @@ import (
 // echoes.
 
 type fakeMcpServer struct {
-	ID                     string   `json:"id"`
-	Name                   string   `json:"name"`
-	Slug                   string   `json:"slug"`
-	Status                 string   `json:"status"`
-	McpServerDirectoryID   string   `json:"mcp_server_directory_id"`
-	OauthBaseURLOverride   *string  `json:"oauth_base_url_override"`
-	UsesManagedCredentials *bool    `json:"uses_managed_credentials"`
-	Scopes                 []string `json:"scopes"`
+	ID                     string  `json:"id"`
+	Name                   string  `json:"name"`
+	Slug                   string  `json:"slug"`
+	Status                 string  `json:"status"`
+	McpServerDirectoryID   string  `json:"mcp_server_directory_id"`
+	OauthBaseURLOverride   *string `json:"oauth_base_url_override"`
+	UsesManagedCredentials *bool   `json:"uses_managed_credentials"`
+	// CredentialMode is the stored mode the registry returns; see
+	// fakeCreateCredentialMode and fakeUpdateCredentialMode for the rules the
+	// fake models.
+	CredentialMode *string  `json:"credential_mode"`
+	Scopes         []string `json:"scopes"`
 	// ClientID holds the obfuscated echo the real API returns; the real value
 	// is never stored, mirroring production.
 	ClientID *string `json:"client_id"`
@@ -90,6 +94,11 @@ type fakeRegistryServer struct {
 	// failGetAfterPut arms failNextServerGet from inside the next PUT, so the
 	// failure hits Update's re-read rather than the plan's refresh.
 	failGetAfterPut bool
+
+	// credentialModeWrites records the credential_mode of every create and
+	// update request that sent one, in order, so a test can tell an unchanged
+	// mode that was not re-sent from one that was.
+	credentialModeWrites []string
 
 	// agents backs the /agents endpoints; see agent_resource_test.go.
 	nextAgentID int
@@ -203,6 +212,7 @@ func (f *fakeRegistryServer) createServer(w http.ResponseWriter, r *http.Request
 		McpServerDirectoryID    string          `json:"mcp_server_directory_id"`
 		OauthBaseURLOverride    *string         `json:"oauth_base_url_override"`
 		UsesManagedCredentials  *bool           `json:"uses_managed_credentials"`
+		CredentialMode          *string         `json:"credential_mode"`
 		Scopes                  []string        `json:"scopes"`
 		ClientID                *string         `json:"client_id"`
 		ClientSecret            *string         `json:"client_secret"`
@@ -221,13 +231,24 @@ func (f *fakeRegistryServer) createServer(w http.ResponseWriter, r *http.Request
 			fmt.Sprintf("An MCP server named '%s' already exists in this organization", body.Name))
 		return
 	}
+	mode, detail := fakeCreateCredentialMode(body.CredentialMode, body.UsesManagedCredentials, body.ClientID)
+	if detail != "" {
+		writeJSONError(w, http.StatusUnprocessableEntity, detail)
+		return
+	}
+	if body.CredentialMode != nil {
+		f.credentialModeWrites = append(f.credentialModeWrites, *body.CredentialMode)
+	}
+	if mode == credentialModeManaged {
+		managed := true
+		body.UsesManagedCredentials = &managed
+	}
 
 	f.nextID++
 	id := fmt.Sprintf("00000000-0000-0000-0000-%012d", f.nextID)
 	defaultTier := fakeDefaultAttentionTier
 	status := "pending"
-	if body.ClientID != nil || (body.UsesManagedCredentials != nil && *body.UsesManagedCredentials) ||
-		len(body.PrepopulatedCredentials) > 0 {
+	if mode != "none" || len(body.PrepopulatedCredentials) > 0 {
 		status = "active"
 	}
 	s := &fakeMcpServer{
@@ -238,6 +259,7 @@ func (f *fakeRegistryServer) createServer(w http.ResponseWriter, r *http.Request
 		McpServerDirectoryID:   body.McpServerDirectoryID,
 		OauthBaseURLOverride:   body.OauthBaseURLOverride,
 		UsesManagedCredentials: body.UsesManagedCredentials,
+		CredentialMode:         &mode,
 		Scopes:                 body.Scopes,
 		AttentionTier:          &defaultTier,
 	}
@@ -295,14 +317,13 @@ func (f *fakeRegistryServer) updateServer(w http.ResponseWriter, r *http.Request
 		_ = json.Unmarshal(v, &scopes)
 		s.Scopes = scopes
 	}
+	var newClientID *string
 	if v, ok := raw["client_id"]; ok {
 		var clientID *string
 		_ = json.Unmarshal(v, &clientID)
-		// Production ignores obfuscated echoes; a real value re-activates.
+		// Production ignores obfuscated echoes.
 		if clientID != nil && !strings.Contains(*clientID, "...") {
-			ob := obfuscate(*clientID)
-			s.ClientID = &ob
-			s.Status = "active"
+			newClientID = clientID
 		}
 	}
 	// Mirrors production: uses_managed_credentials is applied from the parsed
@@ -311,7 +332,34 @@ func (f *fakeRegistryServer) updateServer(w http.ResponseWriter, r *http.Request
 	if v, ok := raw["uses_managed_credentials"]; ok {
 		_ = json.Unmarshal(v, &umc)
 	}
+	var requested *string
+	if v, ok := raw["credential_mode"]; ok {
+		_ = json.Unmarshal(v, &requested)
+	}
+	if requested != nil {
+		f.credentialModeWrites = append(f.credentialModeWrites, *requested)
+	}
+	mode, detail := fakeUpdateCredentialMode(*s.CredentialMode, requested, umc, newClientID != nil)
+	if detail != "" {
+		writeJSONError(w, http.StatusUnprocessableEntity, detail)
+		return
+	}
+	if newClientID != nil {
+		// A real client ID re-activates the server.
+		ob := obfuscate(*newClientID)
+		s.ClientID = &ob
+		s.Status = "active"
+	}
+	if requested != nil && *requested == *s.CredentialMode && newClientID == nil && umc == nil {
+		// Production keeps the stored flag when the request names the stored mode.
+		umc = s.UsesManagedCredentials
+	}
+	if mode == credentialModeManaged && umc == nil {
+		managed := true
+		umc = &managed
+	}
 	s.UsesManagedCredentials = umc
+	s.CredentialMode = &mode
 	if umc != nil && *umc {
 		s.Status = "active"
 	}
@@ -327,6 +375,117 @@ func (f *fakeRegistryServer) updateServer(w http.ResponseWriter, r *http.Request
 	echo.AttentionTier = nil
 	echo.PublishBlockers = nil
 	_ = json.NewEncoder(w).Encode(&echo)
+}
+
+// fakeModeAgreement mirrors the registry's refusal of a request whose
+// uses_managed_credentials contradicts its credential_mode.
+func fakeModeAgreement(requested string, umc *bool) string {
+	if umc != nil && *umc != (requested == credentialModeManaged) {
+		return fmt.Sprintf("credential_mode '%s' conflicts with uses_managed_credentials=%t", requested, *umc)
+	}
+	return ""
+}
+
+// fakeCreateCredentialMode returns the mode a create stores, or the detail of
+// the 422 it refuses with. The fake's directory supports managed OAuth, CIMD
+// and registration alike, and `auto` resolves to registration, so an `auto`
+// server reads back as `dcr`.
+func fakeCreateCredentialMode(requested *string, umc *bool, clientID *string) (string, string) {
+	req := ""
+	if requested != nil {
+		req = *requested
+		if detail := fakeModeAgreement(req, umc); detail != "" {
+			return "", detail
+		}
+	}
+
+	switch {
+	case (umc != nil && *umc) || req == credentialModeManaged:
+		return credentialModeManaged, ""
+	case clientID != nil && (req == credentialModeCIMD || req == credentialModeDCR):
+		return "", fmt.Sprintf("credential_mode '%s' does not take a client_id", req)
+	case clientID != nil && req == credentialModeManual:
+		return credentialModeManual, ""
+	case clientID != nil:
+		return "static_client", ""
+	case req == credentialModeManual:
+		return "", "credential_mode 'manual' requires a client_id"
+	case req == credentialModeCIMD:
+		return credentialModeCIMD, ""
+	case req == credentialModeDCR || req == credentialModeAuto:
+		return credentialModeDCR, ""
+	}
+	return "none", ""
+}
+
+// fakeUpdateCredentialMode returns the mode an update leaves stored, or the
+// detail of the 422 it refuses with, following the registry's update rules.
+func fakeUpdateCredentialMode(stored string, requested *string, umc *bool, newClientID bool) (string, string) {
+	if requested != nil {
+		req := *requested
+		if detail := fakeModeAgreement(req, umc); detail != "" {
+			return "", detail
+		}
+		switch {
+		case req == credentialModeAuto:
+			return "", "credential_mode 'auto' applies only when creating a server"
+		case req == stored && !newClientID:
+			return stored, ""
+		case (req == credentialModeCIMD || req == credentialModeDCR) && newClientID:
+			return "", fmt.Sprintf("credential_mode '%s' does not take a client_id", req)
+		case req == credentialModeCIMD:
+			return "", "An existing server cannot be switched to CIMD; create a new server to use it"
+		case req == credentialModeManual && !newClientID:
+			return "", "credential_mode 'manual' requires a new client_id"
+		case req == credentialModeDCR && stored != credentialModeCIMD:
+			return "", "credential_mode 'dcr' only moves a CIMD server to a registered client"
+		case req == credentialModeManual:
+			return credentialModeManual, ""
+		default:
+			return req, ""
+		}
+	}
+
+	switch {
+	case umc != nil && *umc:
+		return credentialModeManaged, ""
+	case newClientID:
+		return "static_client", ""
+	}
+	return stored, ""
+}
+
+// setServerCredentialMode changes a server's stored mode out-of-band, as an
+// administrator in the Barndoor app would.
+func (f *fakeRegistryServer) setServerCredentialMode(t *testing.T, id, mode string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.servers[id]
+	if !ok {
+		t.Fatalf("setServerCredentialMode: no server %s", id)
+	}
+	s.CredentialMode = &mode
+}
+
+// serverUsesManagedCredentials returns the stored flag, which the update
+// writes from every payload and the provider does not read back when it
+// derives it from credential_mode.
+func (f *fakeRegistryServer) serverUsesManagedCredentials(t *testing.T, id string) *bool {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.servers[id]
+	if !ok {
+		t.Fatalf("serverUsesManagedCredentials: no server %s", id)
+	}
+	return s.UsesManagedCredentials
+}
+
+func (f *fakeRegistryServer) credentialModeWriteLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.credentialModeWrites)
 }
 
 // fakePublishedAtFor is the deterministic stamp the fake's publish endpoint
@@ -557,9 +716,9 @@ func TestMcpServerResource_Schema(t *testing.T) {
 
 	for _, attr := range []string{
 		"id", "name", "mcp_server_directory_id", "slug", "status", "oauth_base_url_override",
-		"uses_managed_credentials", "client_id", "client_secret", "scopes", "meta",
-		"prepopulated_credentials", "cascaded_fields", "published_at", "attention_tier",
-		"publish_blockers",
+		"uses_managed_credentials", "credential_mode", "resolved_credential_mode", "client_id",
+		"client_secret", "scopes", "meta", "prepopulated_credentials", "cascaded_fields", "published_at",
+		"attention_tier", "publish_blockers",
 	} {
 		if _, ok := s.Attributes[attr]; !ok {
 			t.Errorf("schema missing attribute %q", attr)
@@ -571,7 +730,9 @@ func TestMcpServerResource_Schema(t *testing.T) {
 			t.Errorf("%s must be Sensitive", sensitive)
 		}
 	}
-	for _, computed := range []string{"id", "slug", "status", "published_at", "attention_tier", "publish_blockers"} {
+	for _, computed := range []string{
+		"id", "slug", "status", "resolved_credential_mode", "published_at", "attention_tier", "publish_blockers",
+	} {
 		if !s.Attributes[computed].IsComputed() {
 			t.Errorf("%s should be Computed", computed)
 		}
@@ -590,7 +751,7 @@ func TestMcpServerResource_Schema(t *testing.T) {
 	// inconsistent result after apply" when the value moves between the plan
 	// and the write. A lifecycle test cannot catch this (the refresh that
 	// precedes every plan hides it), so it is pinned here.
-	for _, readOnly := range []string{"attention_tier", "publish_blockers"} {
+	for _, readOnly := range []string{"attention_tier", "publish_blockers", "resolved_credential_mode"} {
 		attr := s.Attributes[readOnly]
 		if attr.IsOptional() || attr.IsRequired() {
 			t.Errorf("%s must be Computed-only, never Optional or Required", readOnly)

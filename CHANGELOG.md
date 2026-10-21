@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+ENHANCEMENTS:
+
+* resource/`barndoor_mcp_server`: new `credential_mode` attribute (`auto`, `managed`, `cimd`, `dcr`, `manual`) names where the server's OAuth client comes from. `cimd` uses Barndoor's OAuth client ID metadata document, and `dcr` has Barndoor register a client with the provider. Requires platform support for credential modes.
+  * Changing it to `managed` or `manual`, or from `cimd` to `dcr`, updates the server in place. Changing it to `cimd`, or to `dcr` from any other mode, forces a new server. Changing it to `auto`, or removing it, leaves the server's mode as it is.
+  * Combinations the platform would resolve to a different mode are rejected at plan time: a `client_id` with a mode other than `manual`, `manual` without a `client_id`, and a `uses_managed_credentials` that contradicts the mode.
+* resource/`barndoor_mcp_server`: new read-only `resolved_credential_mode` reports the mode the server actually uses, including `static_client` and `none`. A mode changed outside Terraform shows there and is not planned back, because switching modes deletes the server's user connections.
+* resource/`barndoor_mcp_server`: `uses_managed_credentials` is deprecated in favor of `credential_mode = "managed"`. When it is not configured, its state follows configuration: a server made managed outside Terraform no longer plans a change that would clear the flag.
+* data-source/`barndoor_mcp_server`: new read-only `credential_mode`.
+
 ## 0.10.0 (2026-10-13)
 
 ENHANCEMENTS:
