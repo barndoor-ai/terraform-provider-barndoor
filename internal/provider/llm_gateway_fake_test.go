@@ -26,7 +26,7 @@ import (
 // fakeLlmGatewayServer emulates the llm-gateway admin REST surface the
 // provider binds (`/api/llm-gateway/admin/connections|providers|model-mappings|
 // model-access|model-route-groups|rate-limits|budgets|model-pricing|
-// governance-config|routing-policies|routing-rules`)
+// governance-config|routing-policies|routing-rules|api-key-lifetime-policies`)
 // faithfully enough to drive real plan/apply cycles: write-only connection
 // secrets (stored, never echoed), providers bound to connections with inline
 // keys rejected (BCP-3647), per-model-provider auth_type
@@ -339,6 +339,12 @@ type fakeLlmGatewayServer struct {
 	defaultModelAccess   string
 	requireRoutingPolicy bool
 
+	// lifetimeDefault, lifetimeGroups and lifetimeUsers back the API key
+	// lifetime policy family; see llm_gateway_fake_lifetime_test.go.
+	lifetimeDefault *fakeLlmLifetimeRow
+	lifetimeGroups  []*fakeLlmLifetimeRow
+	lifetimeUsers   []*fakeLlmLifetimeRow
+
 	// forbidden simulates a credential that fails the Cerbos authorize()
 	// check every admin handler runs; when set, the governance-config and
 	// model-pricing families answer 403.
@@ -382,6 +388,8 @@ func (f *fakeLlmGatewayServer) handler() http.HandlerFunc {
 			f.handleRoutingRules(w, r)
 		case r.URL.Path == "/api/llm-gateway/admin/governance-config":
 			f.handleGovernanceConfig(w, r)
+		case strings.HasPrefix(r.URL.Path, "/api/llm-gateway/admin/api-key-lifetime-policies"):
+			f.handleAPIKeyLifetimePolicies(w, r)
 		default:
 			http.NotFound(w, r)
 		}
