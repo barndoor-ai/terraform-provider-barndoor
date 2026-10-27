@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+FEATURES:
+
+* **New Resource:** `barndoor_llm_api_key` manages an LLM Gateway API key: a service key, a key bound to an IdP group, or a key assigned to a user. Requires platform support for in-place key rotation and expiry changes.
+  * **The key's secret is stored in Terraform state** (sensitive), because the platform returns it only when the key is created or rotated. Protect your state.
+  * Changing `rotation_trigger` rotates the secret in place, keeping the key's id, agent binding and usage history; `grace_period_secs` (up to 7 days) keeps the previous secret working meanwhile. Removing the trigger doesn't rotate.
+  * `expires_at` and `disabled` change in place without a new secret; extending an expired key reactivates it. `name`, `user_id`, `group_name` and `scopes` force a new key. Destroy revokes the key.
+  * A key revoked outside Terraform is planned for re-creation. Import is by id; the imported key's secret stays null until the next rotation.
+
 ENHANCEMENTS:
 
 * resource/`barndoor_mcp_server`: new `credential_mode` attribute (`auto`, `managed`, `cimd`, `dcr`, `manual`) names where the server's OAuth client comes from. `cimd` uses Barndoor's OAuth client ID metadata document, and `dcr` has Barndoor register a client with the provider. Requires platform support for credential modes.
