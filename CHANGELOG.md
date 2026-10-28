@@ -8,6 +8,11 @@ FEATURES:
 * **New Resource:** `barndoor_llm_api_key_lifetime_group_override` overrides the default for members of one IdP group. An override with no limits exempts the group; a user in several overridden groups gets the strictest. Changing `group_name` forces a new override.
 * **New Resource:** `barndoor_llm_api_key_lifetime_user_override` overrides the policy for one user, and wins over that user's group overrides and the default, so it can be looser or stricter. Changing `user_id` forces a new override.
 * All three reject `fixed_lifetime` without `max_lifetime_days`, and a `max_lifetime_days` outside 1-3650, at plan time.
+* **New Resource:** `barndoor_llm_api_key` manages an LLM Gateway API key: a service key, a key bound to an IdP group, or a key assigned to a user. Requires platform support for in-place key rotation and expiry changes.
+  * **The key's secret is stored in Terraform state** (sensitive), because the platform returns it only when the key is created or rotated. Protect your state.
+  * Changing `rotation_trigger` rotates the secret in place, keeping the key's id, agent binding and usage history; `grace_period_secs` (up to 7 days) keeps the previous secret working meanwhile. Removing the trigger doesn't rotate.
+  * `expires_at` and `disabled` change in place without a new secret; extending an expired key reactivates it. `name`, `user_id`, `group_name` and `scopes` force a new key. Destroy revokes the key.
+  * A key revoked outside Terraform is planned for re-creation. Import is by id; the imported key's secret stays null until the next rotation.
 
 ENHANCEMENTS:
 
