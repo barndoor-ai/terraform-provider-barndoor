@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+FEATURES:
+
+* **New Resource:** `barndoor_llm_api_key_lifetime_policy` sets the organization's default limit on how long API keys that users create for themselves may live: a maximum in days, a required expiry, or a fixed lifetime users don't choose. Keys created by admins are exempt, and existing keys keep their expiry. It is a singleton; `terraform destroy` clears the default. Requires platform support for API key lifetime policies.
+* **New Resource:** `barndoor_llm_api_key_lifetime_group_override` overrides the default for members of one IdP group. An override with no limits exempts the group; a user in several overridden groups gets the strictest. Changing `group_name` forces a new override.
+* **New Resource:** `barndoor_llm_api_key_lifetime_user_override` overrides the policy for one user, and wins over that user's group overrides and the default, so it can be looser or stricter. Changing `user_id` forces a new override.
+* All three reject `fixed_lifetime` without `max_lifetime_days`, and a `max_lifetime_days` outside 1-3650, at plan time.
+
 ENHANCEMENTS:
 
 * resource/`barndoor_mcp_server`: new `credential_mode` attribute (`auto`, `managed`, `cimd`, `dcr`, `manual`) names where the server's OAuth client comes from. `cimd` uses Barndoor's OAuth client ID metadata document, and `dcr` has Barndoor register a client with the provider. Requires platform support for credential modes.
