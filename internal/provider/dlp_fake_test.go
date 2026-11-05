@@ -71,6 +71,7 @@ type fakeDlpEnforcementPolicy struct {
 	DryRun             bool
 	McpTargets         []dlpMcpTargetPayload
 	Principals         []dlpPrincipalPayload
+	AgentScope         dlpAgentScopePayload
 	DetectionEngineIDs []string
 }
 
@@ -119,6 +120,17 @@ type fakeDlpServer struct {
 	nextPolicyID int
 	policies     map[string]*fakeDlpEnforcementPolicy
 
+	// agentScopeEnabled simulates whether agent scope selection is enabled for
+	// the organization; false makes a SELECTED agent_scope fail like an org
+	// that doesn't have it yet.
+	agentScopeEnabled bool
+	// agentDirectoryDown simulates the agent directory outage a SELECTED
+	// agent_scope checks ids against.
+	agentDirectoryDown bool
+	// knownAgentIDs are the agent ids a SELECTED agent_scope may reference;
+	// any other id is rejected like production's unknown-agent-id 422.
+	knownAgentIDs map[string]bool
+
 	nextEntryID int
 	// allowList keeps insertion order for stable offset pagination.
 	allowList []*fakeDlpAllowListEntry
@@ -140,8 +152,10 @@ type fakeDlpServer struct {
 
 func newFakeDlpServer() *fakeDlpServer {
 	return &fakeDlpServer{
-		policies:       map[string]*fakeDlpEnforcementPolicy{},
-		detectionTypes: map[string]*fakeDlpCustomDetectionType{},
+		policies:          map[string]*fakeDlpEnforcementPolicy{},
+		agentScopeEnabled: true,
+		knownAgentIDs:     map[string]bool{},
+		detectionTypes:    map[string]*fakeDlpCustomDetectionType{},
 		detectionEngines: map[string]*fakeDlpDetectionEngine{
 			fakeDlpDetectionEngineID: {
 				ID:                    fakeDlpDetectionEngineID,
@@ -276,7 +290,7 @@ func writeJSONMessage(w http.ResponseWriter, status int, message string) {
 
 var fakeDlpUpdatePolicyKeys = []string{
 	"name", "target_kind", "provider_ids", "model_alias", "runtime_stage",
-	"action", "priority", "dry_run", "mcp_targets", "principals", "detection_engine_ids",
+	"action", "priority", "dry_run", "mcp_targets", "principals", "agent_scope", "detection_engine_ids",
 }
 
 func (f *fakeDlpServer) handleEnforcementPolicies(w http.ResponseWriter, r *http.Request) {
@@ -335,18 +349,22 @@ func policyJSON(p *fakeDlpEnforcementPolicy) map[string]any {
 		})
 	}
 	return map[string]any{
-		"id":                   p.ID,
-		"org_id":               fakeDlpOrgID,
-		"name":                 p.Name,
-		"target_kind":          p.TargetKind,
-		"provider_ids":         p.ProviderIDs,
-		"model_alias":          p.ModelAlias,
-		"runtime_stage":        p.RuntimeStage,
-		"action":               p.Action,
-		"priority":             p.Priority,
-		"dry_run":              p.DryRun,
-		"mcp_targets":          mcpTargets,
-		"principals":           principals,
+		"id":            p.ID,
+		"org_id":        fakeDlpOrgID,
+		"name":          p.Name,
+		"target_kind":   p.TargetKind,
+		"provider_ids":  p.ProviderIDs,
+		"model_alias":   p.ModelAlias,
+		"runtime_stage": p.RuntimeStage,
+		"action":        p.Action,
+		"priority":      p.Priority,
+		"dry_run":       p.DryRun,
+		"mcp_targets":   mcpTargets,
+		"principals":    principals,
+		"agent_scope": map[string]any{
+			"mode":      p.AgentScope.Mode,
+			"agent_ids": p.AgentScope.AgentIDs,
+		},
 		"detection_engine_ids": p.DetectionEngineIDs,
 		"created_by":           "svc-test",
 		"updated_by":           "svc-test",
@@ -433,6 +451,39 @@ func (f *fakeDlpServer) validatePolicyShape(w http.ResponseWriter, p *fakeDlpEnf
 			return false
 		}
 	}
+	switch p.AgentScope.Mode {
+	case dlpAgentScopeAll:
+		if len(p.AgentScope.AgentIDs) > 0 {
+			writeJSONMessage(w, http.StatusUnprocessableEntity,
+				"agent_scope.agent_ids must be empty when agent_scope.mode is ALL")
+			return false
+		}
+	case dlpAgentScopeSelected:
+		if len(p.AgentScope.AgentIDs) == 0 || len(p.AgentScope.AgentIDs) > dlpAgentScopeMaxIDs {
+			writeJSONMessage(w, http.StatusUnprocessableEntity,
+				fmt.Sprintf("agent_scope.agent_ids must list between 1 and %d agents", dlpAgentScopeMaxIDs))
+			return false
+		}
+		if !f.agentScopeEnabled {
+			writeJSONMessage(w, http.StatusForbidden, dlpAgentScopeNotEnabledMessage)
+			return false
+		}
+		if f.agentDirectoryDown {
+			writeJSONMessage(w, http.StatusServiceUnavailable,
+				"the agent directory is temporarily unavailable")
+			return false
+		}
+		for _, agentID := range p.AgentScope.AgentIDs {
+			if !f.knownAgentIDs[agentID] {
+				writeJSONMessage(w, http.StatusUnprocessableEntity, "unknown agent id: "+agentID)
+				return false
+			}
+		}
+	default:
+		writeJSONMessage(w, http.StatusUnprocessableEntity,
+			fmt.Sprintf("agent_scope.mode must be one of: ALL, SELECTED; got '%s'", p.AgentScope.Mode))
+		return false
+	}
 	return true
 }
 
@@ -469,6 +520,7 @@ func (f *fakeDlpServer) createPolicy(w http.ResponseWriter, r *http.Request) {
 		DryRun             bool                  `json:"dry_run"`
 		McpTargets         []dlpMcpTargetPayload `json:"mcp_targets"`
 		Principals         []dlpPrincipalPayload `json:"principals"`
+		AgentScope         *dlpAgentScopePayload `json:"agent_scope"`
 		DetectionEngineIDs []string              `json:"detection_engine_ids"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -502,6 +554,14 @@ func (f *fakeDlpServer) createPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	f.nextPolicyID++
+	// Absent agent_scope means every agent, like production.
+	agentScope := dlpAgentScopePayload{Mode: dlpAgentScopeAll, AgentIDs: []string{}}
+	if body.AgentScope != nil {
+		agentScope = *body.AgentScope
+		if agentScope.AgentIDs == nil {
+			agentScope.AgentIDs = []string{}
+		}
+	}
 	p := &fakeDlpEnforcementPolicy{
 		ID:                 fmt.Sprintf("eeee0000-0000-0000-0000-%012d", f.nextPolicyID),
 		Name:               body.Name,
@@ -514,6 +574,7 @@ func (f *fakeDlpServer) createPolicy(w http.ResponseWriter, r *http.Request) {
 		DryRun:             body.DryRun,
 		McpTargets:         body.McpTargets,
 		Principals:         body.Principals,
+		AgentScope:         agentScope,
 		DetectionEngineIDs: body.DetectionEngineIDs,
 	}
 	if p.ProviderIDs == nil {
@@ -554,6 +615,7 @@ func (f *fakeDlpServer) updatePolicy(w http.ResponseWriter, r *http.Request, id 
 	updated.ProviderIDs = slices.Clone(p.ProviderIDs)
 	updated.McpTargets = slices.Clone(p.McpTargets)
 	updated.Principals = slices.Clone(p.Principals)
+	updated.AgentScope.AgentIDs = slices.Clone(p.AgentScope.AgentIDs)
 	updated.DetectionEngineIDs = slices.Clone(p.DetectionEngineIDs)
 
 	if v, ok := raw["name"]; ok {
@@ -606,6 +668,17 @@ func (f *fakeDlpServer) updatePolicy(w http.ResponseWriter, r *http.Request, id 
 		updated.Principals = nil
 		_ = json.Unmarshal(v, &updated.Principals)
 	}
+	if v, ok := raw["agent_scope"]; ok {
+		var scope dlpAgentScopePayload
+		if err := json.Unmarshal(v, &scope); err != nil {
+			writeJSONMessage(w, http.StatusUnprocessableEntity, "agent_scope: "+err.Error())
+			return
+		}
+		if scope.AgentIDs == nil {
+			scope.AgentIDs = []string{}
+		}
+		updated.AgentScope = scope
+	}
 	if v, ok := raw["detection_engine_ids"]; ok {
 		updated.DetectionEngineIDs = nil
 		_ = json.Unmarshal(v, &updated.DetectionEngineIDs)
@@ -617,6 +690,35 @@ func (f *fakeDlpServer) updatePolicy(w http.ResponseWriter, r *http.Request, id 
 
 	*p = updated
 	_ = json.NewEncoder(w).Encode(policyJSON(p))
+}
+
+// setAgentScopeEnabled toggles whether a SELECTED agent_scope is accepted,
+// simulating agent scope selection being disabled for an organization.
+func (f *fakeDlpServer) setAgentScopeEnabled(t *testing.T, enabled bool) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.agentScopeEnabled = enabled
+}
+
+// setAgentDirectoryDown toggles whether a SELECTED agent_scope fails with a
+// 503, simulating an agent-directory outage.
+func (f *fakeDlpServer) setAgentDirectoryDown(t *testing.T, down bool) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.agentDirectoryDown = down
+}
+
+// seedKnownAgentIDs registers agent ids as existing, so a SELECTED
+// agent_scope can reference them without tripping the unknown-agent-id 422.
+func (f *fakeDlpServer) seedKnownAgentIDs(t *testing.T, ids ...string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, id := range ids {
+		f.knownAgentIDs[id] = true
+	}
 }
 
 // markPolicyDeleted removes a stored policy out-of-band.

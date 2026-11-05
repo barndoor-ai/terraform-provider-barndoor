@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+ENHANCEMENTS:
+
+* resource/`barndoor_dlp_enforcement_policy`: new `agent_scope` attribute limits a policy to selected AI agents instead of every agent. It combines with `principals` (a request must match both). Omit it, or set `mode = "ALL"`, to apply to every agent, including agents created later; `mode = "SELECTED"` requires 1-200 `agent_ids`. Selecting agents can be unavailable for an organization, in which case the API refuses it with a 403. Requires platform v2.45.0 or later.
+
 ## 0.11.0 (2026-10-28)
 
 FEATURES:
