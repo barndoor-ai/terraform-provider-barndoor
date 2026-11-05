@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+FEATURES:
+
+* **New Resource:** `barndoor_dlp_mcp_policy` manages a Data Protection MCP server policy: a `name`, the `mcp_server_ids` it covers, and ordered `rules`. Each rule sets a `runtime_boundary` (`TOOL_INPUT`, `TOOL_OUTPUT` or `BOTH`), an `action`, its `detection_engine_ids`, and optionally a `label`, `dry_run`, a `mask_format` for `POLICY_ACTION_MASK`, and `agent_scope` / `principal_scope` (`ALL`, `ONLY` or `EXCEPT`). Each server belongs to at most one policy; destroying a policy hands its servers back to the Baseline policy. Import is by id.
+* **New Resource:** `barndoor_dlp_mcp_baseline_policy` manages the organization's Baseline MCP policy, whose `rules` cover every MCP server without its own policy. It is a singleton; creating it takes over the existing Baseline policy, and `terraform destroy` clears its rules, since the Baseline policy itself can't be deleted.
+* Both keep rules you didn't change when you edit others, so their ids and agent checks carry over. Scope and mask pairings are checked at plan time. Both need an organization on MCP server policies: on one that isn't, the API refuses writes with a 409 and the provider says so.
+
+NOTES:
+
+* resource/`barndoor_dlp_enforcement_policy`: organizations on MCP server policies (every organization since November 2026) can no longer create, update or delete `MCP_SERVER` enforcement policies; the API refuses with a 409. Move MCP protection to the new resources, and remove existing `MCP_SERVER` enforcement policies from state rather than destroying them. `MODEL_PROVIDER` policies are unaffected.
+
 ## 0.11.0 (2026-10-28)
 
 FEATURES:
