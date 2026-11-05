@@ -49,10 +49,10 @@ const (
 	llmRoutingMaxSlotDescriptionChars    = 2000
 )
 
-// llmRoutingDefaultBreakpoints is the platform's default_context_breakpoints.
-// Two breakpoints split requests into three context bands, so the default
-// only fits a three-slot policy.
-var llmRoutingDefaultBreakpoints = []int64{128000, 512000}
+// llmRoutingDefaultBreakpoints is the platform's default context_breakpoints:
+// none, so there is no size floor and the determiner alone picks the slot at
+// any request size. It fits every slot count.
+var llmRoutingDefaultBreakpoints = []int64{}
 
 // llmRoutingPostures are the `Posture` enum values (snake_case on the wire).
 var llmRoutingPostures = []string{"savings", "balanced", "quality"}
@@ -123,8 +123,8 @@ func (r *llmRoutingPolicyResource) Schema(_ context.Context, _ resource.SchemaRe
 		MarkdownDescription: "Manages an LLM Gateway routing policy: a caller-facing `model_alias` " +
 			"that, instead of naming one model, picks one of several model **slots** per request. A " +
 			"determiner model reads the request (and any `barndoor_llm_routing_rule` attached to the " +
-			"policy) and chooses a slot; `context_breakpoints` force larger-context slots as the " +
-			"request grows.\n\n" +
+			"policy) and chooses a slot; optional `context_breakpoints` force larger-context slots " +
+			"as the request grows.\n\n" +
 			"List slots from cheapest to strongest: rules and breakpoints refer to slots by index, " +
 			"and that ordering makes \"at least slot 1\" mean \"at least the mid tier\". The platform " +
 			"does not check it against prices. Each slot `model_alias` must already resolve to " +
@@ -133,6 +133,11 @@ func (r *llmRoutingPolicyResource) Schema(_ context.Context, _ resource.SchemaRe
 			"`<provider name>/<model>` of a 1:1 enablement. The policy's own `model_alias` must not " +
 			"already be a model mapping alias. The platform checks both on every write and answers " +
 			"with a 400 naming the offending target.\n\n" +
+			"Rules (`barndoor_llm_routing_rule`) name slots by position too, so removing or " +
+			"reordering slots changes what an existing rule's `floor_slot` and `deny_slots` mean; " +
+			"update the rules in the same apply. The Barndoor app edits a policy's rules inside the " +
+			"policy editor and saves the whole rule set, so a policy edited there can change or " +
+			"delete rules Terraform manages; that shows up as drift on the next plan.\n\n" +
 			"Every optional setting has the platform's default as its schema default and is sent on " +
 			"every write, so removing one from configuration resets it to that default rather than " +
 			"keeping a value set elsewhere. Pair the policy with `require_routing_policy` on " +
@@ -238,10 +243,12 @@ func (r *llmRoutingPolicyResource) Schema(_ context.Context, _ resource.SchemaRe
 				},
 			},
 			"context_breakpoints": schema.ListAttribute{
-				MarkdownDescription: "Ascending request-size thresholds, one fewer than there are " +
-					"slots: a request larger than the Nth breakpoint is routed to slot N+1 or above. " +
-					"Defaults to `[128000, 512000]`, which only fits a three-slot policy — any other slot " +
-					"count must set this explicitly.",
+				MarkdownDescription: "Optional request-size floor: ascending token thresholds, one " +
+					"fewer than there are slots. A request larger than breakpoint N (from 0) is routed to " +
+					"slot N+1 or above. Defaults to `[]`, no size floor: the determiner picks the slot at " +
+					"any request size. Most models now have context windows of 200k tokens or more, and " +
+					"a floor that moves a conversation to another slot part-way through also discards " +
+					"the prompt cache built on the previous one.",
 				ElementType: types.Int64Type,
 				Optional:    true,
 				Computed:    true,
@@ -345,22 +352,14 @@ func (r *llmRoutingPolicyResource) ValidateConfig(ctx context.Context, req resou
 		return
 	}
 
-	switch {
-	case cfg.ContextBreakpoints.IsNull():
-		if want := len(llmRoutingDefaultBreakpoints); n-1 != want {
-			resp.Diagnostics.AddAttributeError(path.Root("context_breakpoints"),
-				"context_breakpoints must be set for this slot count",
-				fmt.Sprintf("The policy has %d slots, so it needs exactly %d context_breakpoints. The "+
-					"platform default [128000, 512000] has %d and only fits a %d-slot policy; set "+
-					"context_breakpoints to %d ascending token counts.", n, n-1, want, want+1, n-1))
-		}
-	case !cfg.ContextBreakpoints.IsUnknown():
+	// Unset takes the default, no breakpoints, which fits any slot count.
+	if !cfg.ContextBreakpoints.IsNull() && !cfg.ContextBreakpoints.IsUnknown() {
 		breakpoints := cfg.ContextBreakpoints.Elements()
-		if len(breakpoints) != n-1 {
+		if len(breakpoints) != 0 && len(breakpoints) != n-1 {
 			resp.Diagnostics.AddAttributeError(path.Root("context_breakpoints"),
 				"Wrong number of context_breakpoints",
-				fmt.Sprintf("context_breakpoints must have exactly %d entries for %d slots (one "+
-					"fewer than the slots), got %d.", n-1, n, len(breakpoints)))
+				fmt.Sprintf("context_breakpoints must be empty (no size floor) or have exactly %d "+
+					"entries for %d slots (one fewer than the slots), got %d.", n-1, n, len(breakpoints)))
 		}
 		var prev *int64
 		for i, v := range breakpoints {

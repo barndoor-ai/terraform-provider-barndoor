@@ -3,16 +3,19 @@
 page_title: "barndoor_llm_routing_policy Resource - Barndoor"
 subcategory: ""
 description: |-
-  Manages an LLM Gateway routing policy: a caller-facing model_alias that, instead of naming one model, picks one of several model slots per request. A determiner model reads the request (and any barndoor_llm_routing_rule attached to the policy) and chooses a slot; context_breakpoints force larger-context slots as the request grows.
+  Manages an LLM Gateway routing policy: a caller-facing model_alias that, instead of naming one model, picks one of several model slots per request. A determiner model reads the request (and any barndoor_llm_routing_rule attached to the policy) and chooses a slot; optional context_breakpoints force larger-context slots as the request grows.
   List slots from cheapest to strongest: rules and breakpoints refer to slots by index, and that ordering makes "at least slot 1" mean "at least the mid tier". The platform does not check it against prices. Each slot model_alias must already resolve to enabled routes: a bare-callable alias (a custom barndoor_llm_model_mapping alias, or a 1:1 enablement with bare_alias = true), or the provider-scoped form <provider name>/<model> of a 1:1 enablement. The policy's own model_alias must not already be a model mapping alias. The platform checks both on every write and answers with a 400 naming the offending target.
+  Rules (barndoor_llm_routing_rule) name slots by position too, so removing or reordering slots changes what an existing rule's floor_slot and deny_slots mean; update the rules in the same apply. The Barndoor app edits a policy's rules inside the policy editor and saves the whole rule set, so a policy edited there can change or delete rules Terraform manages; that shows up as drift on the next plan.
   Every optional setting has the platform's default as its schema default and is sent on every write, so removing one from configuration resets it to that default rather than keeping a value set elsewhere. Pair the policy with require_routing_policy on barndoor_llm_governance_config to make callers go through policies.
 ---
 
 # barndoor_llm_routing_policy (Resource)
 
-Manages an LLM Gateway routing policy: a caller-facing `model_alias` that, instead of naming one model, picks one of several model **slots** per request. A determiner model reads the request (and any `barndoor_llm_routing_rule` attached to the policy) and chooses a slot; `context_breakpoints` force larger-context slots as the request grows.
+Manages an LLM Gateway routing policy: a caller-facing `model_alias` that, instead of naming one model, picks one of several model **slots** per request. A determiner model reads the request (and any `barndoor_llm_routing_rule` attached to the policy) and chooses a slot; optional `context_breakpoints` force larger-context slots as the request grows.
 
 List slots from cheapest to strongest: rules and breakpoints refer to slots by index, and that ordering makes "at least slot 1" mean "at least the mid tier". The platform does not check it against prices. Each slot `model_alias` must already resolve to enabled routes: a bare-callable alias (a custom `barndoor_llm_model_mapping` alias, or a 1:1 enablement with `bare_alias = true`), or the provider-scoped form `<provider name>/<model>` of a 1:1 enablement. The policy's own `model_alias` must not already be a model mapping alias. The platform checks both on every write and answers with a 400 naming the offending target.
+
+Rules (`barndoor_llm_routing_rule`) name slots by position too, so removing or reordering slots changes what an existing rule's `floor_slot` and `deny_slots` mean; update the rules in the same apply. The Barndoor app edits a policy's rules inside the policy editor and saves the whole rule set, so a policy edited there can change or delete rules Terraform manages; that shows up as drift on the next plan.
 
 Every optional setting has the platform's default as its schema default and is sent on every write, so removing one from configuration resets it to that default rather than keeping a value set elsewhere. Pair the policy with `require_routing_policy` on `barndoor_llm_governance_config` to make callers go through policies.
 
@@ -34,9 +37,9 @@ resource "barndoor_llm_routing_policy" "auto" {
     { model_alias = "strong", label = "Strong", description = "Hard reasoning, long documents" },
   ]
 
-  # Requests over 128k tokens go to slot 1 or above, over 512k to slot 2. One
-  # fewer breakpoint than slots; this is the default, so it can be omitted for
-  # a three-slot policy but must be set for any other slot count.
+  # Optional size floor: requests over 128k tokens go to slot 1 or above, over
+  # 512k to slot 2. One fewer breakpoint than slots. Omit it (the default, [])
+  # to let the determiner pick the slot at any request size.
   context_breakpoints = [128000, 512000]
 }
 
@@ -55,7 +58,7 @@ resource "barndoor_llm_routing_policy" "auto" {
 
 ### Optional
 
-- `context_breakpoints` (List of Number) Ascending request-size thresholds, one fewer than there are slots: a request larger than the Nth breakpoint is routed to slot N+1 or above. Defaults to `[128000, 512000]`, which only fits a three-slot policy — any other slot count must set this explicitly.
+- `context_breakpoints` (List of Number) Optional request-size floor: ascending token thresholds, one fewer than there are slots. A request larger than breakpoint N (from 0) is routed to slot N+1 or above. Defaults to `[]`, no size floor: the determiner picks the slot at any request size. Most models now have context windows of 200k tokens or more, and a floor that moves a conversation to another slot part-way through also discards the prompt cache built on the previous one.
 - `default_slot_on_failure` (Number) Slot index used when the determiner fails or answers unusably. Defaults to `1`; must be a valid index into `slots`.
 - `description` (String) Free-text description shown in the app. Removing it clears it.
 - `determiner_prompt` (String) Custom instructions for the determiner (at most 8000 characters). Unset or empty uses the platform's built-in prompt; removing it from configuration reverts to the built-in prompt.

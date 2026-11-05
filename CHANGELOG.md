@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+NOTES:
+
+* resource/`barndoor_llm_routing_policy`: `context_breakpoints` now defaults to `[]`, no size floor, matching the platform. A policy that leaves it unset plans an in-place update from the old default `[128000, 512000]` to `[]`; set `context_breakpoints = [128000, 512000]` to keep the old behaviour. Requires platform support for optional context breakpoints; against an older platform, set `context_breakpoints` explicitly.
+
+ENHANCEMENTS:
+
+* resource/`barndoor_llm_routing_policy`: `context_breakpoints` is optional at every slot count. Leave it unset or set `[]` and the determiner picks the slot at any request size. Previously a policy with other than three slots had to set it.
+* resource/`barndoor_llm_routing_policy` and `barndoor_llm_routing_rule`: the docs now say that removing or reordering slots changes what existing rules' slot numbers mean, and that editing a policy in the Barndoor app saves its whole rule set, so Terraform-managed rules can show as drift.
+
 ## 0.11.0 (2026-10-28)
 
 FEATURES:

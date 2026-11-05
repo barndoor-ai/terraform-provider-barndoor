@@ -202,8 +202,9 @@ func validRoutingPolicyDraft(w http.ResponseWriter, p *fakeLlmRoutingPolicy) boo
 	if len(p.Slots) < 2 {
 		return fail("at least two model slots are required")
 	}
-	if len(p.ContextBreakpoints) != len(p.Slots)-1 {
-		return fail(fmt.Sprintf("context_breakpoints must have exactly %d entries for %d slots",
+	// Empty turns the size floor off; otherwise every step up needs its own threshold.
+	if len(p.ContextBreakpoints) != 0 && len(p.ContextBreakpoints) != len(p.Slots)-1 {
+		return fail(fmt.Sprintf("context_breakpoints must be empty or have exactly %d entries for %d slots",
 			len(p.Slots)-1, len(p.Slots)))
 	}
 	for i, slot := range p.Slots {
@@ -334,7 +335,7 @@ func (f *fakeLlmGatewayServer) createRoutingPolicy(w http.ResponseWriter, r *htt
 		DeterminerPrompt:     body.DeterminerPrompt,
 		Posture:              "balanced",
 		Slots:                body.Slots,
-		ContextBreakpoints:   []int64{128000, 512000},
+		ContextBreakpoints:   []int64{},
 		RouterInputMaxChars:  12000,
 		DefaultSlotOnFailure: 1,
 		CreatedAt:            stamp,
