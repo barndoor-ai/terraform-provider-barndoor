@@ -38,3 +38,31 @@ resource "barndoor_dlp_field_control_policy" "erp_guard" {
     },
   ])
 }
+
+# "All except" scopes: agent_scope and principal_scope each default to
+# applying to everyone when omitted. Set mode to EXCEPT to apply a rule to
+# every agent, or every principal, other than the ones listed.
+resource "barndoor_dlp_field_control_policy" "support_guard" {
+  mcp_server_id = "44444444-4444-4444-4444-444444444444"
+  name          = "Support tooling field controls"
+
+  rules = jsonencode([
+    {
+      tool      = "search_tickets"
+      direction = "output"
+      # Every agent except the audit agent is restricted.
+      agent_scope = {
+        mode      = "EXCEPT"
+        agent_ids = ["55555555-5555-5555-5555-555555555555"]
+      }
+      # Every principal except the support-leads group is restricted.
+      principals = [
+        { type = "GROUP", id = "support-leads" },
+      ]
+      principal_scope = { mode = "EXCEPT" }
+      fields = [
+        { path = "tickets.customer_email", action = "redact" },
+      ]
+    },
+  ])
+}

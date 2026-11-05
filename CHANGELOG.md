@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+ENHANCEMENTS:
+
+* resource/`barndoor_dlp_field_control_policy`: `rules` supports "all except" scopes — `agent_scope.mode = "EXCEPT"` and `principal_scope.mode = "EXCEPT"` (next to `principals`) apply a rule to every agent or principal other than the ones listed. The API stores and echoes rules verbatim, so these (and the pre-existing shape with no `principal_scope`) round-trip without drift. Requires platform v2.49.2 or later.
+
 ## 0.11.0 (2026-10-28)
 
 FEATURES:
