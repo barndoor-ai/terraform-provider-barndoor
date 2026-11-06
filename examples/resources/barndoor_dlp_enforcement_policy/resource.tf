@@ -30,3 +30,25 @@ resource "barndoor_dlp_enforcement_policy" "llm_prompts" {
 
   detection_engine_ids = ["00000000-0000-0000-0000-000000000000"]
 }
+
+# Limit a policy to two specific agents instead of every agent. Omitting
+# agent_scope (as in the examples above) applies the policy to every agent,
+# including agents created later.
+resource "barndoor_dlp_enforcement_policy" "agent_pilot" {
+  name   = "Tokenize PII for pilot agents"
+  action = "POLICY_ACTION_TOKENIZE"
+
+  mcp_targets = [
+    { mcp_server_id = "*", direction = "BOTH" },
+  ]
+
+  agent_scope = {
+    mode = "SELECTED"
+    agent_ids = [
+      "00000000-0000-0000-0000-000000000001",
+      "00000000-0000-0000-0000-000000000002",
+    ]
+  }
+
+  detection_engine_ids = ["00000000-0000-0000-0000-000000000000"]
+}

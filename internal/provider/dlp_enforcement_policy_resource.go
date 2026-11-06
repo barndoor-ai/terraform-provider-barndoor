@@ -10,6 +10,7 @@ import (
 	"regexp"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -48,7 +49,25 @@ var (
 	dlpTargetKinds    = []string{"MCP_SERVER", "MODEL_PROVIDER"}
 	dlpDirections     = []string{"REQUEST", "RESPONSE", "BOTH"}
 	dlpPrincipalTypes = []string{"GROUP", "ROLE"}
+	dlpAgentScopes    = []string{dlpAgentScopeAll, dlpAgentScopeSelected}
 )
+
+// Agent scope modes, and the API's cap on the agents one policy may list.
+const (
+	dlpAgentScopeAll      = "ALL"
+	dlpAgentScopeSelected = "SELECTED"
+	dlpAgentScopeMaxIDs   = 200
+
+	// dlpAgentScopeNotEnabledMessage is the dlp-service admin API's exact 403
+	// body when agent scope selection is not enabled for the organization.
+	// Matching it verbatim tells this case apart from every other reason the
+	// credential itself might be refused on a 403.
+	dlpAgentScopeNotEnabledMessage = "Limiting a policy to selected agents isn't available for your organization yet."
+)
+
+// uuidPattern matches the canonical hyphenated UUID form the API requires
+// for agent ids.
+var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
 // noSurroundingWhitespace mirrors the API's trimming of identifier-ish
 // values (names, scope ids): a padded value would read back trimmed and
@@ -61,9 +80,10 @@ var noSurroundingWhitespace = stringvalidator.RegexMatches(
 
 // Ensure the resource satisfies the framework interfaces it relies on.
 var (
-	_ resource.Resource                = &dlpEnforcementPolicyResource{}
-	_ resource.ResourceWithConfigure   = &dlpEnforcementPolicyResource{}
-	_ resource.ResourceWithImportState = &dlpEnforcementPolicyResource{}
+	_ resource.Resource                   = &dlpEnforcementPolicyResource{}
+	_ resource.ResourceWithConfigure      = &dlpEnforcementPolicyResource{}
+	_ resource.ResourceWithValidateConfig = &dlpEnforcementPolicyResource{}
+	_ resource.ResourceWithImportState    = &dlpEnforcementPolicyResource{}
 )
 
 // NewDlpEnforcementPolicyResource returns a new barndoor_dlp_enforcement_policy resource.
@@ -81,7 +101,7 @@ type dlpEnforcementPolicyResource struct {
 // dlpEnforcementPolicyResourceModel maps the resource schema to Go types.
 // McpTargets and Principals are plain slices so a null set (attribute
 // omitted) round-trips as nil and an explicit empty set as a non-nil empty
-// slice.
+// slice; AgentScope is a pointer for the same reason (nil = omitted).
 type dlpEnforcementPolicyResourceModel struct {
 	ID                 types.String        `tfsdk:"id"`
 	OrgID              types.String        `tfsdk:"org_id"`
@@ -95,11 +115,18 @@ type dlpEnforcementPolicyResourceModel struct {
 	DryRun             types.Bool          `tfsdk:"dry_run"`
 	McpTargets         []dlpMcpTargetModel `tfsdk:"mcp_targets"`
 	Principals         []dlpPrincipalModel `tfsdk:"principals"`
+	AgentScope         *dlpAgentScopeModel `tfsdk:"agent_scope"`
 	DetectionEngineIDs types.List          `tfsdk:"detection_engine_ids"`
 	CreatedBy          types.String        `tfsdk:"created_by"`
 	UpdatedBy          types.String        `tfsdk:"updated_by"`
 	CreatedAt          types.String        `tfsdk:"created_at"`
 	UpdatedAt          types.String        `tfsdk:"updated_at"`
+}
+
+// dlpAgentScopeModel maps the agent_scope object.
+type dlpAgentScopeModel struct {
+	Mode     types.String `tfsdk:"mode"`
+	AgentIDs types.Set    `tfsdk:"agent_ids"`
 }
 
 // dlpMcpTargetModel maps one entry of the mcp_targets set.
@@ -238,6 +265,17 @@ func (r *dlpEnforcementPolicyResource) Schema(_ context.Context, _ resource.Sche
 				Optional:     true,
 				NestedObject: dlpPrincipalNestedObject(),
 			},
+			"agent_scope": schema.SingleNestedAttribute{
+				MarkdownDescription: "AI agents the policy is limited to. It combines with `principals`: a " +
+					"request must match both. Omit to apply to every agent, including agents created " +
+					"later; removing it from configuration resets the policy to every agent.\n\n" +
+					"An agent-specific `MODEL_PROVIDER` policy applies only to model calls made with an API " +
+					"key bound to one of the agents; other model traffic is governed by every-agent " +
+					"policies alone. Selecting agents can be unavailable for an organization, in which " +
+					"case the API refuses it with a 403.",
+				Optional:   true,
+				Attributes: dlpAgentScopeAttributes(),
+			},
 			"detection_engine_ids": schema.ListAttribute{
 				MarkdownDescription: "IDs (UUIDs) of the detection engines that evaluate traffic for this " +
 					"policy, in evaluation order. At least one is required, and each engine must belong to " +
@@ -320,6 +358,58 @@ func dlpPrincipalNestedObject() schema.NestedAttributeObject {
 				},
 			},
 		},
+	}
+}
+
+// dlpAgentScopeAttributes defines the schema of the agent_scope object.
+func dlpAgentScopeAttributes() map[string]schema.Attribute {
+	return map[string]schema.Attribute{
+		"mode": schema.StringAttribute{
+			MarkdownDescription: "`ALL` (every agent) or `SELECTED` (only the agents in `agent_ids`).",
+			Required:            true,
+			Validators: []validator.String{
+				stringvalidator.OneOf(dlpAgentScopes...),
+			},
+		},
+		"agent_ids": schema.SetAttribute{
+			MarkdownDescription: fmt.Sprintf("IDs (UUIDs) of the agents the policy is limited to: 1 to %d, "+
+				"required when `mode` is `SELECTED` and not allowed when it is `ALL`. Each newly added "+
+				"agent must exist and not be deleted; an agent deleted after it was saved stays listed "+
+				"but no longer matches any request.", dlpAgentScopeMaxIDs),
+			ElementType: types.StringType,
+			Optional:    true,
+			Validators: []validator.Set{
+				setvalidator.SizeBetween(1, dlpAgentScopeMaxIDs),
+				setvalidator.ValueStringsAre(stringvalidator.RegexMatches(uuidPattern, "must be a UUID")),
+			},
+		},
+	}
+}
+
+// ValidateConfig checks the agent_scope mode/agent_ids pairing at plan time,
+// matching the API's 422. Unknown values (e.g. ids of agents created in the
+// same apply) are left for the API to check.
+func (r *dlpEnforcementPolicyResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var mode types.String
+	var agentIDs types.Set
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("agent_scope").AtName("mode"), &mode)...)
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("agent_scope").AtName("agent_ids"), &agentIDs)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	m, ok := knownString(mode)
+	if !ok {
+		return
+	}
+	idsPath := path.Root("agent_scope").AtName("agent_ids")
+	switch {
+	case m == dlpAgentScopeAll && !agentIDs.IsNull():
+		resp.Diagnostics.AddAttributeError(idsPath, "Agent ids not allowed",
+			"`agent_ids` must be omitted when `agent_scope.mode` is `ALL`.")
+	case m == dlpAgentScopeSelected && agentIDs.IsNull():
+		resp.Diagnostics.AddAttributeError(idsPath, "Missing agent ids",
+			"`agent_ids` must list at least one agent when `agent_scope.mode` is `SELECTED`.")
 	}
 }
 
@@ -487,6 +577,22 @@ func addDlpEnforcementPolicyAPIError(diags *diag.Diagnostics, action string, err
 	}
 
 	switch apiErr.status {
+	case http.StatusForbidden:
+		// Matched on the API's exact message rather than on the request's own
+		// agent_scope.mode: that tells "this org doesn't have agent scope"
+		// apart from every other reason the credential might be refused,
+		// without having to thread the request's scope through every call
+		// site.
+		if apiErr.displayBody() == dlpAgentScopeNotEnabledMessage {
+			diags.AddError(
+				"Agent scope refused by the Data Protection API",
+				fmt.Sprintf("Failed to %s: %s\n\nLimiting a policy to selected agents is not available "+
+					"for this organization yet. Use `agent_scope.mode = \"ALL\"` or omit `agent_scope` "+
+					"until it is.", action, apiErr.displayBody()),
+			)
+			return
+		}
+		addDlpCredentialRefusedError(diags, action, apiErr)
 	case http.StatusNotFound:
 		// Either the policy itself or a referenced detection engine; the API's
 		// message names which.
@@ -506,19 +612,34 @@ func addDlpEnforcementPolicyAPIError(diags *diag.Diagnostics, action string, err
 	case http.StatusUnprocessableEntity:
 		// The API's validation message (mixed target shape, unsupported
 		// engine/action combination, wildcard mixing, direction/stage
-		// mismatch, …) is the most specific thing we can show; surface it
-		// verbatim.
+		// mismatch, an unknown or deleted agent id, …) is the most specific
+		// thing we can show; surface it verbatim.
 		diags.AddError("Enforcement policy rejected by the Data Protection API", apiErr.displayBody())
-	case http.StatusUnauthorized, http.StatusForbidden:
+	case http.StatusServiceUnavailable:
+		// The agent directory the API checks new agent_scope ids against is
+		// down; transient, so point at retrying rather than at the config.
 		diags.AddError(
-			"Permission denied by the Data Protection API",
-			fmt.Sprintf("Failed to %s: the configured credential was not accepted. Confirm the "+
-				"service-account credential's token carries the organization claim for the organization "+
-				"that owns this policy.\n\nServer message: %s", action, apiErr.displayBody()),
+			"Agent directory unavailable",
+			fmt.Sprintf("Failed to %s: %s\n\nThe Data Protection API could not verify the selected agents "+
+				"because the agent directory is temporarily unavailable. Retry the apply.",
+				action, apiErr.displayBody()),
 		)
+	case http.StatusUnauthorized:
+		addDlpCredentialRefusedError(diags, action, apiErr)
 	default:
 		diags.AddError("Failed to "+action, apiErr.Error())
 	}
+}
+
+// addDlpCredentialRefusedError reports a 401/403 that refused the provider's
+// credential itself.
+func addDlpCredentialRefusedError(diags *diag.Diagnostics, action string, apiErr *apiError) {
+	diags.AddError(
+		"Permission denied by the Data Protection API",
+		fmt.Sprintf("Failed to %s: the configured credential was not accepted. Confirm the "+
+			"service-account credential's token carries the organization claim for the organization "+
+			"that owns this policy.\n\nServer message: %s", action, apiErr.displayBody()),
+	)
 }
 
 // --- request/response DTOs ---------------------------------------------------
@@ -537,9 +658,19 @@ type dlpPrincipalPayload struct {
 	PrincipalID   string `json:"principal_id"`
 }
 
+// dlpAgentScopePayload mirrors the agent_scope request/response shape.
+// AgentIDs is always non-nil so it serializes as `[]` for ALL, never JSON
+// null (which the API rejects).
+type dlpAgentScopePayload struct {
+	Mode     string   `json:"mode"`
+	AgentIDs []string `json:"agent_ids"`
+}
+
 // dlpEnforcementPolicyCreateRequest mirrors the dlp-service
 // CreateEnforcementPolicyRequest body. The collections are always non-nil:
 // the API tolerates absent collections but rejects JSON null for them.
+// agent_scope is the exception: omitted means "every agent" on create, so it
+// is sent only when configured.
 type dlpEnforcementPolicyCreateRequest struct {
 	Name               string                `json:"name"`
 	TargetKind         *string               `json:"target_kind,omitempty"`
@@ -551,6 +682,7 @@ type dlpEnforcementPolicyCreateRequest struct {
 	DryRun             bool                  `json:"dry_run"`
 	McpTargets         []dlpMcpTargetPayload `json:"mcp_targets"`
 	Principals         []dlpPrincipalPayload `json:"principals"`
+	AgentScope         *dlpAgentScopePayload `json:"agent_scope,omitempty"`
 	DetectionEngineIDs []string              `json:"detection_engine_ids"`
 }
 
@@ -562,7 +694,11 @@ type dlpEnforcementPolicyCreateRequest struct {
 // pointer-to-slice so an emptied collection serializes as `[]` (clear), never
 // as an absent key (keep). model_alias is special: the API treats JSON null
 // as "no change" and an empty string as "clear", so it is always sent as a
-// string, "" when unset.
+// string, "" when unset. agent_scope follows the collection convention: on
+// Update, unlike Create, an absent key means "leave unchanged" rather than
+// "every agent", so it is always sent — explicit `{mode: "ALL", agent_ids:
+// []}` when the block is omitted from config, converging the policy back to
+// every agent instead of leaving a stale SELECTED scope in place.
 type dlpEnforcementPolicyUpdateRequest struct {
 	Name               *string                `json:"name,omitempty"`
 	TargetKind         *string                `json:"target_kind,omitempty"`
@@ -574,6 +710,7 @@ type dlpEnforcementPolicyUpdateRequest struct {
 	DryRun             *bool                  `json:"dry_run,omitempty"`
 	McpTargets         *[]dlpMcpTargetPayload `json:"mcp_targets,omitempty"`
 	Principals         *[]dlpPrincipalPayload `json:"principals,omitempty"`
+	AgentScope         *dlpAgentScopePayload  `json:"agent_scope,omitempty"`
 	DetectionEngineIDs *[]string              `json:"detection_engine_ids,omitempty"`
 }
 
@@ -592,6 +729,7 @@ type dlpEnforcementPolicyResponse struct {
 	DryRun             bool                  `json:"dry_run"`
 	McpTargets         []dlpMcpTargetPayload `json:"mcp_targets"`
 	Principals         []dlpPrincipalPayload `json:"principals"`
+	AgentScope         dlpAgentScopePayload  `json:"agent_scope"`
 	DetectionEngineIDs []string              `json:"detection_engine_ids"`
 	CreatedBy          string                `json:"created_by"`
 	UpdatedBy          string                `json:"updated_by"`
@@ -668,6 +806,16 @@ func buildDlpEnforcementPolicyCreateRequest(ctx context.Context, plan *dlpEnforc
 	if v, ok := knownInt64(plan.Priority); ok {
 		body.Priority = &v
 	}
+	if plan.AgentScope != nil {
+		agentIDs, err := stringsFromSet(ctx, plan.AgentScope.AgentIDs)
+		if err != nil {
+			return nil, fmt.Errorf("agent_scope.agent_ids: %w", err)
+		}
+		body.AgentScope = &dlpAgentScopePayload{
+			Mode:     plan.AgentScope.Mode.ValueString(),
+			AgentIDs: nonNilStrings(agentIDs),
+		}
+	}
 	return body, nil
 }
 
@@ -716,6 +864,21 @@ func buildDlpEnforcementPolicyUpdateRequest(ctx context.Context, plan *dlpEnforc
 	if v, ok := knownInt64(plan.Priority); ok {
 		body.Priority = &v
 	}
+	// Always sent, defaulting to explicit ALL: an absent agent_scope block
+	// means "leave unchanged" to the API, which would leave a stale SELECTED
+	// scope in place instead of converging to what config now says.
+	agentScope := &dlpAgentScopePayload{Mode: dlpAgentScopeAll, AgentIDs: []string{}}
+	if plan.AgentScope != nil {
+		agentIDs, err := stringsFromSet(ctx, plan.AgentScope.AgentIDs)
+		if err != nil {
+			return nil, fmt.Errorf("agent_scope.agent_ids: %w", err)
+		}
+		agentScope = &dlpAgentScopePayload{
+			Mode:     plan.AgentScope.Mode.ValueString(),
+			AgentIDs: nonNilStrings(agentIDs),
+		}
+	}
+	body.AgentScope = agentScope
 	return body, nil
 }
 
@@ -742,7 +905,12 @@ func applyDlpEnforcementPolicyResponse(ctx context.Context, policy *dlpEnforceme
 		UpdatedAt:    types.StringValue(policy.UpdatedAt),
 	}
 
-	var err error
+	agentScope, err := applyDlpAgentScope(ctx, policy.AgentScope, prior.AgentScope)
+	if err != nil {
+		return dlpEnforcementPolicyResourceModel{}, fmt.Errorf("agent_scope: %w", err)
+	}
+	m.AgentScope = agentScope
+
 	if m.ProviderIDs, err = listFromStrings(ctx, policy.ProviderIDs, prior.ProviderIDs); err != nil {
 		return dlpEnforcementPolicyResourceModel{}, fmt.Errorf("provider_ids: %w", err)
 	}
@@ -789,4 +957,27 @@ func applyDlpPrincipals(principals []dlpPrincipalPayload, prior []dlpPrincipalMo
 		})
 	}
 	return out
+}
+
+// applyDlpAgentScope maps the wire agent_scope to state, settling the whole
+// block to nil (same null-vs-empty reasoning as applyDlpMcpTargets) when the
+// API reports the default — mode ALL with no agent ids — and the prior value
+// was nil, i.e. configuration never mentioned agent_scope. Any other result
+// (SELECTED, or ALL that the prior had made explicit) is carried through.
+func applyDlpAgentScope(ctx context.Context, scope dlpAgentScopePayload, prior *dlpAgentScopeModel) (*dlpAgentScopeModel, error) {
+	if scope.Mode == dlpAgentScopeAll && len(scope.AgentIDs) == 0 && prior == nil {
+		return nil, nil
+	}
+	priorIDs := types.SetNull(types.StringType)
+	if prior != nil {
+		priorIDs = prior.AgentIDs
+	}
+	agentIDs, err := setFromStrings(ctx, scope.AgentIDs, priorIDs)
+	if err != nil {
+		return nil, fmt.Errorf("agent_ids: %w", err)
+	}
+	return &dlpAgentScopeModel{
+		Mode:     types.StringValue(scope.Mode),
+		AgentIDs: agentIDs,
+	}, nil
 }
