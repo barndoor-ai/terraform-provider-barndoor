@@ -247,6 +247,67 @@ func TestDlpFieldControlPolicyResource_lifecycle(t *testing.T) {
 	})
 }
 
+// allExceptFieldPolicyRules covers three shapes: an EXCEPT agent scope, an
+// EXCEPT principal (group) scope, and a rule with no principal_scope at all
+// (the shape that predates it). The API stores and echoes rules verbatim, so
+// none of these should drift on a subsequent plan.
+const allExceptFieldPolicyRules = `
+  rules = jsonencode([
+    {
+      tool        = "search_contacts"
+      direction   = "output"
+      agent_scope = { mode = "EXCEPT", agent_ids = ["11111111-1111-1111-1111-111111111111"] }
+      fields = [
+        { path = "records.email", action = "redact" },
+      ]
+    },
+    {
+      tool            = "search_contacts"
+      direction       = "output"
+      principals      = [{ type = "GROUP", id = "finance" }]
+      principal_scope = { mode = "EXCEPT" }
+      fields = [
+        { path = "records.ssn", action = "block" },
+      ]
+    },
+    {
+      tool      = "export_ledger"
+      direction = "output"
+      fields = [
+        { path = "entries.account_number", action = "redact" },
+      ]
+    },
+  ])
+`
+
+func TestDlpFieldControlPolicyResource_allExceptScopesRoundTripWithoutDrift(t *testing.T) {
+	setupDlpTest(t)
+	const resourceName = "barndoor_dlp_field_control_policy.test"
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: fieldPolicyConfig("srv-crm", "tf-dlp-all-except", allExceptFieldPolicyRules),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestMatchResourceAttr(resourceName, "rules",
+						regexp.MustCompile(`"agent_scope":\{"agent_ids":\["11111111-1111-1111-1111-111111111111"\],"mode":"EXCEPT"\}`)),
+					resource.TestMatchResourceAttr(resourceName, "rules",
+						regexp.MustCompile(`"principal_scope":\{"mode":"EXCEPT"\}`)),
+				),
+			},
+			{
+				// The fake (like the real API) echoes the stored rules
+				// verbatim, so a second plan over the same configuration —
+				// EXCEPT agent scope, EXCEPT principal scope, and the rule
+				// with no principal_scope at all — must be empty.
+				Config:   fieldPolicyConfig("srv-crm", "tf-dlp-all-except", allExceptFieldPolicyRules),
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
 func TestDlpFieldControlPolicyResource_existingPolicyBlocksCreate(t *testing.T) {
 	fake := setupDlpTest(t)
 	fake.seedFieldControlPolicy("srv-crm", "made out of band")
