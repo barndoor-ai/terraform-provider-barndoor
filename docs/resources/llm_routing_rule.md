@@ -4,7 +4,7 @@ page_title: "barndoor_llm_routing_rule Resource - Barndoor"
 subcategory: ""
 description: |-
   Manages a routing rule on a barndoor_llm_routing_policy: a plain-English description of a kind of request, plus the constraint the gateway applies when the policy's determiner decides a request matches it — a minimum slot (floor_slot), banned slots (deny_slots), or both.
-  Slot numbers are indices into the policy's slots list (0 = first). The platform does not check them against the policy: an index past the last slot is ignored at request time. When rules contradict each other (for example one rule's floor is banned by another), the platform still saves the rule and reports the conflict; the provider surfaces each conflict that involves this rule as a warning.
+  Slot numbers are indices into the policy's slots list (0 = first). The platform does not check them against the policy: an index past the last slot is ignored at request time. Removing or reordering the policy's slots changes what an existing index means, so update the policy's rules in the same apply. The Barndoor app edits rules inside the policy editor and saves the policy's whole rule set, so editing the policy there can change or delete this rule; that shows up as drift on the next plan. When rules contradict each other (for example one rule's floor is banned by another), the platform still saves the rule and reports the conflict; the provider surfaces each conflict that involves this rule as a warning.
   Deleting the policy deletes its rules.
 ---
 
@@ -12,7 +12,7 @@ description: |-
 
 Manages a routing rule on a `barndoor_llm_routing_policy`: a plain-English `description` of a kind of request, plus the constraint the gateway applies when the policy's determiner decides a request matches it — a minimum slot (`floor_slot`), banned slots (`deny_slots`), or both.
 
-Slot numbers are indices into the policy's `slots` list (0 = first). The platform does not check them against the policy: an index past the last slot is ignored at request time. When rules contradict each other (for example one rule's floor is banned by another), the platform still saves the rule and reports the conflict; the provider surfaces each conflict that involves this rule as a warning.
+Slot numbers are indices into the policy's `slots` list (0 = first). The platform does not check them against the policy: an index past the last slot is ignored at request time. Removing or reordering the policy's slots changes what an existing index means, so update the policy's rules in the same apply. The Barndoor app edits rules inside the policy editor and saves the policy's whole rule set, so editing the policy there can change or delete this rule; that shows up as drift on the next plan. When rules contradict each other (for example one rule's floor is banned by another), the platform still saves the rule and reports the conflict; the provider surfaces each conflict that involves this rule as a warning.
 
 Deleting the policy deletes its rules.
 

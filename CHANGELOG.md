@@ -12,10 +12,12 @@ ENHANCEMENTS:
 
 * resource/`barndoor_dlp_enforcement_policy`: new `agent_scope` attribute limits a policy to selected AI agents instead of every agent. It combines with `principals` (a request must match both). Omit it, or set `mode = "ALL"`, to apply to every agent, including agents created later; `mode = "SELECTED"` requires 1-200 `agent_ids`. Selecting agents can be unavailable for an organization, in which case the API refuses it with a 403. Requires platform v2.45.0 or later.
 * resource/`barndoor_dlp_field_control_policy`: `rules` supports "all except" scopes — `agent_scope.mode = "EXCEPT"` and `principal_scope.mode = "EXCEPT"` (next to `principals`) apply a rule to every agent or principal other than the ones listed. The API stores and echoes rules verbatim, so these (and the pre-existing shape with no `principal_scope`) round-trip without drift. Requires platform v2.49.2 or later.
+* resource/`barndoor_llm_routing_policy` and `barndoor_llm_routing_rule`: the docs now say that removing or reordering slots changes what existing rules' slot numbers mean, and that editing a policy in the Barndoor app saves its whole rule set, so Terraform-managed rules can show as drift.
 
 NOTES:
 
 * resource/`barndoor_dlp_enforcement_policy`: organizations on MCP server policies (every organization since November 2026) can no longer create, update or delete `MCP_SERVER` enforcement policies; the API refuses with a 409. Move MCP protection to the new resources, and remove existing `MCP_SERVER` enforcement policies from state rather than destroying them. `MODEL_PROVIDER` policies are unaffected.
+* resource/`barndoor_llm_routing_policy`: the `context_breakpoints` attribute is removed. The platform no longer routes on request size (a large request is not a harder one, and moving a conversation to another slot part-way through discards its prompt cache); it keeps a request off any slot whose model's context window is too small to hold it. Remove `context_breakpoints` from configurations; existing state that holds it upgrades without error. Requires a platform with the size floor retired; an older platform applies its own default floor to policies this version creates.
 
 ## 0.11.0 (2026-10-28)
 
