@@ -154,7 +154,13 @@ func (r *dlpEnforcementPolicyResource) Schema(_ context.Context, _ resource.Sche
 			"`mcp_targets` (with `RUNTIME_STAGE_TOOL_INPUT`/`RUNTIME_STAGE_TOOL_OUTPUT` stages) and may not " +
 			"set `provider_ids`/`model_alias`; `MODEL_PROVIDER` policies are the reverse (with " +
 			"`RUNTIME_STAGE_PROMPT`/`RUNTIME_STAGE_RESPONSE` stages). When `target_kind` is unset the API " +
-			"infers it from the scope attributes.",
+			"infers it from the scope attributes.\n\n" +
+			"~> **MCP server policies.** Since November 2026 every organization manages MCP traffic with MCP " +
+			"server policies, and the API refuses creating, updating, or deleting an `MCP_SERVER` enforcement " +
+			"policy with a 409. Manage MCP protection with `barndoor_dlp_mcp_policy` and " +
+			"`barndoor_dlp_mcp_baseline_policy` instead, and stop managing existing `MCP_SERVER` enforcement " +
+			"policies by removing them from state (`terraform state rm`, or a `removed` block with " +
+			"`destroy = false`) rather than destroying them. `MODEL_PROVIDER` policies are unaffected.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				MarkdownDescription: "Policy UUID assigned by the API; also the `terraform import` key.",
