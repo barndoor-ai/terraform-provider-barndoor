@@ -58,7 +58,7 @@ resource "barndoor_llm_routing_policy" "auto" {
 
 ### Optional
 
-- `context_breakpoints` (List of Number) Optional request-size floor: ascending token thresholds, one fewer than there are slots. A request larger than breakpoint N (from 0) is routed to slot N+1 or above. Defaults to `[]`, no size floor: the determiner picks the slot at any request size. Most models now have context windows of 200k tokens or more, and a floor that moves a conversation to another slot part-way through also discards the prompt cache built on the previous one.
+- `context_breakpoints` (List of Number) Optional request-size floor: one token threshold per slot after the first. A request at or above breakpoint N (from 0) is routed to slot N+1 or above. `0` gives that slot no floor of its own, so `[0, 100000]` lifts only 100k+ requests, to the third slot; the thresholds that are set must increase. Defaults to `[]`, no size floor (as is all `0`): the determiner picks the slot at any request size. Most models now have context windows of 200k tokens or more, and a floor that moves a conversation to another slot part-way through also discards the prompt cache built on the previous one.
 - `default_slot_on_failure` (Number) Slot index used when the determiner fails or answers unusably. Defaults to `1`; must be a valid index into `slots`.
 - `description` (String) Free-text description shown in the app. Removing it clears it.
 - `determiner_prompt` (String) Custom instructions for the determiner (at most 8000 characters). Unset or empty uses the platform's built-in prompt; removing it from configuration reverts to the built-in prompt.

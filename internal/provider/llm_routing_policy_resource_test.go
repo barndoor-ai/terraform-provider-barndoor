@@ -268,8 +268,9 @@ func TestLlmRoutingPolicyResource_lifecycle(t *testing.T) {
 	})
 }
 
-// The size floor is optional: unset means none, at any slot count, and an
-// explicit floor can be added and then removed again.
+// The size floor is optional: unset means none, at any slot count, an
+// explicit floor can be added, set on some slots only (0 = none), and
+// removed again.
 func TestLlmRoutingPolicyResource_sizeFloorIsOptional(t *testing.T) {
 	fake := setupLlmGatewayTest(t)
 	provider := fake.seedProvider()
@@ -283,6 +284,9 @@ func TestLlmRoutingPolicyResource_sizeFloorIsOptional(t *testing.T) {
   ]`)
 	withFloor := mappings + llmRoutingPolicyHCL(llmRoutingThreeSlots+`
   context_breakpoints = [128000, 512000]`)
+	// 0: the middle slot has no floor of its own; only 512k+ is lifted.
+	topOnly := mappings + llmRoutingPolicyHCL(llmRoutingThreeSlots+`
+  context_breakpoints = [0, 512000]`)
 
 	var policyID string
 	platformBreakpoints := func(want int) resource.TestCheckFunc {
@@ -317,6 +321,18 @@ func TestLlmRoutingPolicyResource_sizeFloorIsOptional(t *testing.T) {
 					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.1", "512000"),
 					platformBreakpoints(2),
 				),
+			},
+			{
+				Config: topOnly,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.0", "0"),
+					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.1", "512000"),
+					platformBreakpoints(2),
+				),
+			},
+			{
+				Config:   topOnly,
+				PlanOnly: true,
 			},
 			{
 				// Dropping the floor and a slot in one apply sends [], which
@@ -406,14 +422,19 @@ resource "barndoor_llm_routing_policy" "auto" {
 			`must be strictly increasing`,
 		},
 		{
+			"set breakpoints out of order around a 0",
+			policy("auto", slots("a", "b", "c", "d")+"  context_breakpoints = [32000, 0, 8000]\n"),
+			`must be strictly increasing`,
+		},
+		{
 			"equal breakpoints",
 			policy("auto", slots("a", "b", "c")+"  context_breakpoints = [1000, 1000]\n"),
 			`must be strictly increasing`,
 		},
 		{
-			"non-positive breakpoint",
-			policy("auto", slots("a", "b")+"  context_breakpoints = [0]\n"),
-			`must be between 1 and`,
+			"negative breakpoint",
+			policy("auto", slots("a", "b")+"  context_breakpoints = [-1]\n"),
+			`must be between 0 and`,
 		},
 		{
 			"default slot out of range",

@@ -215,13 +215,18 @@ func validRoutingPolicyDraft(w http.ResponseWriter, p *fakeLlmRoutingPolicy) boo
 			return fail("routing policy alias cannot appear as a slot target")
 		}
 	}
+	// 0 is a slot with no floor of its own; only the set ones are ordered.
+	var floors []int64
 	for _, b := range p.ContextBreakpoints {
-		if b <= 0 {
-			return fail("context breakpoints must be positive")
+		if b < 0 {
+			return fail("context breakpoints must be positive, or 0 for a slot with no size floor")
+		}
+		if b > 0 {
+			floors = append(floors, b)
 		}
 	}
-	for i := 1; i < len(p.ContextBreakpoints); i++ {
-		if p.ContextBreakpoints[i-1] >= p.ContextBreakpoints[i] {
+	for i := 1; i < len(floors); i++ {
+		if floors[i-1] >= floors[i] {
 			return fail("context breakpoints must be strictly increasing")
 		}
 	}

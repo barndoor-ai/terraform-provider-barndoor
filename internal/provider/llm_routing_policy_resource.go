@@ -243,9 +243,11 @@ func (r *llmRoutingPolicyResource) Schema(_ context.Context, _ resource.SchemaRe
 				},
 			},
 			"context_breakpoints": schema.ListAttribute{
-				MarkdownDescription: "Optional request-size floor: ascending token thresholds, one " +
-					"fewer than there are slots. A request larger than breakpoint N (from 0) is routed to " +
-					"slot N+1 or above. Defaults to `[]`, no size floor: the determiner picks the slot at " +
+				MarkdownDescription: "Optional request-size floor: one token threshold per slot after " +
+					"the first. A request at or above breakpoint N (from 0) is routed to slot N+1 or above. " +
+					"`0` gives that slot no floor of its own, so `[0, 100000]` lifts only 100k+ requests, to " +
+					"the third slot; the thresholds that are set must increase. Defaults to `[]`, no size " +
+					"floor (as is all `0`): the determiner picks the slot at " +
 					"any request size. Most models now have context windows of 200k tokens or more, and " +
 					"a floor that moves a conversation to another slot part-way through also discards " +
 					"the prompt cache built on the previous one.",
@@ -254,7 +256,7 @@ func (r *llmRoutingPolicyResource) Schema(_ context.Context, _ resource.SchemaRe
 				Computed:    true,
 				Default:     listdefault.StaticValue(types.ListValueMust(types.Int64Type, breakpointDefaults)),
 				Validators: []validator.List{
-					listvalidator.ValueInt64sAre(int64validator.Between(1, 1<<31-1)),
+					listvalidator.ValueInt64sAre(int64validator.Between(0, 1<<31-1)),
 				},
 			},
 			"router_input_max_chars": schema.Int64Attribute{
@@ -369,10 +371,14 @@ func (r *llmRoutingPolicyResource) ValidateConfig(ctx context.Context, req resou
 				continue
 			}
 			cur := b.ValueInt64()
+			// 0 is a slot with no floor of its own; only the set ones are ordered.
+			if cur == 0 {
+				continue
+			}
 			if prev != nil && cur <= *prev {
 				resp.Diagnostics.AddAttributeError(path.Root("context_breakpoints").AtListIndex(i),
 					"context_breakpoints must be strictly increasing",
-					fmt.Sprintf("Breakpoint %d (%d) must be greater than the one before it (%d).", i, cur, *prev))
+					fmt.Sprintf("Breakpoint %d (%d) must be greater than the last non-zero one before it (%d).", i, cur, *prev))
 			}
 			prev = &cur
 		}
