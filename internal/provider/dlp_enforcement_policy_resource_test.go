@@ -127,6 +127,7 @@ func TestApplyDlpEnforcementPolicyResponse_SettlesEmptyToNull(t *testing.T) {
 		Action:             "POLICY_ACTION_BLOCK",
 		McpTargets:         []dlpMcpTargetPayload{},
 		Principals:         []dlpPrincipalPayload{},
+		AgentScope:         dlpAgentScopePayload{Mode: dlpAgentScopeAll, AgentIDs: []string{}},
 		DetectionEngineIDs: []string{fakeDlpDetectionEngineID},
 	}
 
@@ -146,6 +147,9 @@ func TestApplyDlpEnforcementPolicyResponse_SettlesEmptyToNull(t *testing.T) {
 	}
 	if state.Principals != nil {
 		t.Error("empty principals with a nil prior must settle to nil (null set)")
+	}
+	if state.AgentScope != nil {
+		t.Error("ALL agent_scope with a nil prior must settle to null")
 	}
 	if state.DetectionEngineIDs.IsNull() {
 		t.Error("detection_engine_ids must map from the response")
@@ -418,6 +422,222 @@ resource "barndoor_dlp_enforcement_policy" "test" {
 }
 `, fakeDlpDetectionEngineID),
 				ExpectError: regexp.MustCompile(`MODEL_PROVIDER policies may not include mcp_targets`),
+			},
+		},
+	})
+}
+
+// --- agent_scope tests -------------------------------------------------------------
+
+const (
+	fakeDlpAgentOneID = "aaaaaaaa-0000-0000-0000-000000000001"
+	fakeDlpAgentTwoID = "aaaaaaaa-0000-0000-0000-000000000002"
+)
+
+func TestDlpEnforcementPolicyResource_agentScopeLifecycle(t *testing.T) {
+	fake := setupDlpTest(t)
+	fake.seedKnownAgentIDs(t, fakeDlpAgentOneID, fakeDlpAgentTwoID)
+	const resourceName = "barndoor_dlp_enforcement_policy.test"
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllDlpPoliciesDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				// Omitting agent_scope on create must settle to null (it
+				// defaults to every agent server-side) rather than drift.
+				Config: dlpPolicyConfig("tf-dlp-agent-scope", `
+  mcp_targets = [
+    { mcp_server_id = "*", direction = "BOTH" },
+  ]
+`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(resourceName, "agent_scope.mode"),
+				),
+			},
+			{
+				// A second plan over the same omitted block must be empty.
+				Config: dlpPolicyConfig("tf-dlp-agent-scope", `
+  mcp_targets = [
+    { mcp_server_id = "*", direction = "BOTH" },
+  ]
+`),
+				PlanOnly: true,
+			},
+			{
+				// ALL -> SELECTED.
+				Config: fmt.Sprintf(`
+resource "barndoor_dlp_enforcement_policy" "test" {
+  name                 = "tf-dlp-agent-scope"
+  action               = "POLICY_ACTION_TOKENIZE"
+  detection_engine_ids = [%q]
+  mcp_targets = [
+    { mcp_server_id = "*", direction = "BOTH" },
+  ]
+  agent_scope = {
+    mode      = "SELECTED"
+    agent_ids = [%q, %q]
+  }
+}
+`, fakeDlpDetectionEngineID, fakeDlpAgentOneID, fakeDlpAgentTwoID),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "agent_scope.mode", "SELECTED"),
+					resource.TestCheckResourceAttr(resourceName, "agent_scope.agent_ids.#", "2"),
+				),
+			},
+			{
+				Config: fmt.Sprintf(`
+resource "barndoor_dlp_enforcement_policy" "test" {
+  name                 = "tf-dlp-agent-scope"
+  action               = "POLICY_ACTION_TOKENIZE"
+  detection_engine_ids = [%q]
+  mcp_targets = [
+    { mcp_server_id = "*", direction = "BOTH" },
+  ]
+  agent_scope = {
+    mode      = "SELECTED"
+    agent_ids = [%q, %q]
+  }
+}
+`, fakeDlpDetectionEngineID, fakeDlpAgentOneID, fakeDlpAgentTwoID),
+				PlanOnly: true,
+			},
+			{
+				// SELECTED -> ALL: removing agent_scope from configuration
+				// must converge the policy back to every agent server-side
+				// (not leave the prior SELECTED scope in place) and settle
+				// state back to null.
+				Config: dlpPolicyConfig("tf-dlp-agent-scope", `
+  mcp_targets = [
+    { mcp_server_id = "*", direction = "BOTH" },
+  ]
+`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(resourceName, "agent_scope.mode"),
+				),
+			},
+			{
+				Config: dlpPolicyConfig("tf-dlp-agent-scope", `
+  mcp_targets = [
+    { mcp_server_id = "*", direction = "BOTH" },
+  ]
+`),
+				PlanOnly: true,
+			},
+			{
+				ResourceName:      resourceName,
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func TestDlpEnforcementPolicyResource_agentScopeImportSelected(t *testing.T) {
+	fake := setupDlpTest(t)
+	fake.seedKnownAgentIDs(t, fakeDlpAgentOneID)
+	const resourceName = "barndoor_dlp_enforcement_policy.test"
+
+	agentScopeConfig := fmt.Sprintf(`
+resource "barndoor_dlp_enforcement_policy" "test" {
+  name                 = "tf-dlp-agent-scope-import"
+  action               = "POLICY_ACTION_TOKENIZE"
+  detection_engine_ids = [%q]
+  mcp_targets = [
+    { mcp_server_id = "*", direction = "BOTH" },
+  ]
+  agent_scope = {
+    mode      = "SELECTED"
+    agent_ids = [%q]
+  }
+}
+`, fakeDlpDetectionEngineID, fakeDlpAgentOneID)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllDlpPoliciesDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: agentScopeConfig,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "agent_scope.mode", "SELECTED"),
+					resource.TestCheckResourceAttr(resourceName, "agent_scope.agent_ids.#", "1"),
+				),
+			},
+			{
+				ResourceName:      resourceName,
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func TestDlpEnforcementPolicyResource_unknownAgentIdIs422(t *testing.T) {
+	setupDlpTest(t)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: dlpPolicyConfig("tf-dlp-unknown-agent", fmt.Sprintf(`
+  mcp_targets = [
+    { mcp_server_id = "*", direction = "BOTH" },
+  ]
+  agent_scope = {
+    mode      = "SELECTED"
+    agent_ids = [%q]
+  }
+`, fakeDlpAgentOneID)),
+				ExpectError: regexp.MustCompile(`unknown agent id`),
+			},
+		},
+	})
+}
+
+func TestDlpEnforcementPolicyResource_agentScopeNotEnabledIs403(t *testing.T) {
+	fake := setupDlpTest(t)
+	fake.seedKnownAgentIDs(t, fakeDlpAgentOneID)
+	fake.setAgentScopeEnabled(t, false)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: dlpPolicyConfig("tf-dlp-scope-disabled", fmt.Sprintf(`
+  mcp_targets = [
+    { mcp_server_id = "*", direction = "BOTH" },
+  ]
+  agent_scope = {
+    mode      = "SELECTED"
+    agent_ids = [%q]
+  }
+`, fakeDlpAgentOneID)),
+				ExpectError: regexp.MustCompile(`Agent scope refused`),
+			},
+		},
+	})
+}
+
+func TestDlpEnforcementPolicyResource_agentDirectoryDownIs503(t *testing.T) {
+	fake := setupDlpTest(t)
+	fake.seedKnownAgentIDs(t, fakeDlpAgentOneID)
+	fake.setAgentDirectoryDown(t, true)
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: dlpPolicyConfig("tf-dlp-directory-down", fmt.Sprintf(`
+  mcp_targets = [
+    { mcp_server_id = "*", direction = "BOTH" },
+  ]
+  agent_scope = {
+    mode      = "SELECTED"
+    agent_ids = [%q]
+  }
+`, fakeDlpAgentOneID)),
+				ExpectError: regexp.MustCompile(`agent directory is temporarily unavailable`),
 			},
 		},
 	})
