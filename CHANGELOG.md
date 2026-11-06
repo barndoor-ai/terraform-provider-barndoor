@@ -8,6 +8,11 @@ FEATURES:
 * **New Resource:** `barndoor_dlp_mcp_baseline_policy` manages the organization's Baseline MCP policy, whose `rules` cover every MCP server without its own policy. It is a singleton; creating it takes over the existing Baseline policy, and `terraform destroy` clears its rules, since the Baseline policy itself can't be deleted.
 * Both keep rules you didn't change when you edit others, so their ids and agent checks carry over. Scope and mask pairings are checked at plan time. Both need an organization on MCP server policies: on one that isn't, the API refuses writes with a 409 and the provider says so.
 
+ENHANCEMENTS:
+
+* resource/`barndoor_dlp_enforcement_policy`: new `agent_scope` attribute limits a policy to selected AI agents instead of every agent. It combines with `principals` (a request must match both). Omit it, or set `mode = "ALL"`, to apply to every agent, including agents created later; `mode = "SELECTED"` requires 1-200 `agent_ids`. Selecting agents can be unavailable for an organization, in which case the API refuses it with a 403. Requires platform v2.45.0 or later.
+* resource/`barndoor_dlp_field_control_policy`: `rules` supports "all except" scopes — `agent_scope.mode = "EXCEPT"` and `principal_scope.mode = "EXCEPT"` (next to `principals`) apply a rule to every agent or principal other than the ones listed. The API stores and echoes rules verbatim, so these (and the pre-existing shape with no `principal_scope`) round-trip without drift. Requires platform v2.49.2 or later.
+
 NOTES:
 
 * resource/`barndoor_dlp_enforcement_policy`: organizations on MCP server policies (every organization since November 2026) can no longer create, update or delete `MCP_SERVER` enforcement policies; the API refuses with a 409. Move MCP protection to the new resources, and remove existing `MCP_SERVER` enforcement policies from state rather than destroying them. `MODEL_PROVIDER` policies are unaffected.

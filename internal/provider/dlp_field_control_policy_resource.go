@@ -121,9 +121,13 @@ func (r *dlpFieldControlPolicyResource) Schema(_ context.Context, _ resource.Sch
 					"is an object with `tool` (tool name), `direction` (only `\"output\"` is supported), " +
 					"optional `fields` (`[{path, action}]` with `action` of `pass`/`redact`/`block`), " +
 					"optional `when` predicates (`[{path, eq, action, scope}]`), optional `principals` " +
-					"(`[{type: GROUP|ROLE, id}]`), and an optional `default_action` (`pass`/`block`). The " +
-					"API validates the shape and rejects malformed rules with a 409. Omit for an empty " +
-					"rule set.",
+					"(`[{type: GROUP|ROLE, id}]`), optional `agent_scope` and `principal_scope` " +
+					"(`{mode: ALL|SELECTED|EXCEPT, agent_ids: [...]}` for `agent_scope`; `{mode: " +
+					"ALL|SELECTED|EXCEPT}` for `principal_scope`, next to `principals`) to restrict a rule " +
+					"to, or exempt, specific agents or principals, and an optional `default_action` " +
+					"(`pass`/`block`). Omitting `agent_scope` or `principal_scope` keeps the pre-existing " +
+					"behavior. The API validates the shape and rejects malformed rules with a 409. Omit " +
+					"for an empty rule set.",
 				Optional:   true,
 				CustomType: jsontypes.NormalizedType{},
 			},
