@@ -12,11 +12,6 @@ resource "barndoor_llm_routing_policy" "auto" {
     { model_alias = "mid", label = "Mid", description = "Everyday coding and analysis" },
     { model_alias = "strong", label = "Strong", description = "Hard reasoning, long documents" },
   ]
-
-  # Optional size floor: requests over 128k tokens go to slot 1 or above, over
-  # 512k to slot 2. One fewer breakpoint than slots. Omit it (the default, [])
-  # to let the determiner pick the slot at any request size.
-  context_breakpoints = [128000, 512000]
 }
 
 # To make callers go through routing policies instead of naming models

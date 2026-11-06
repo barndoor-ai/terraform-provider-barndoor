@@ -39,12 +39,16 @@ func TestLlmRoutingPolicyResource_Schema(t *testing.T) {
 
 	for _, attr := range []string{
 		"id", "org_id", "model_alias", "description", "enabled", "determiner_model_alias",
-		"determiner_prompt", "posture", "slots", "context_breakpoints", "router_input_max_chars",
+		"determiner_prompt", "posture", "slots", "router_input_max_chars",
 		"default_slot_on_failure", "created_at", "updated_at",
 	} {
 		if _, ok := resp.Schema.Attributes[attr]; !ok {
 			t.Errorf("schema missing attribute %q", attr)
 		}
+	}
+	// The size floor is retired on the platform; the attribute is gone.
+	if _, ok := resp.Schema.Attributes["context_breakpoints"]; ok {
+		t.Error("context_breakpoints should not be in the schema")
 	}
 	for _, required := range []string{"model_alias", "determiner_model_alias", "slots"} {
 		if !resp.Schema.Attributes[required].IsRequired() {
@@ -52,7 +56,7 @@ func TestLlmRoutingPolicyResource_Schema(t *testing.T) {
 		}
 	}
 	for _, computed := range []string{
-		"id", "org_id", "enabled", "posture", "context_breakpoints", "router_input_max_chars",
+		"id", "org_id", "enabled", "posture", "router_input_max_chars",
 		"default_slot_on_failure", "created_at", "updated_at",
 	} {
 		if !resp.Schema.Attributes[computed].IsComputed() {
@@ -143,7 +147,6 @@ func TestLlmRoutingPolicyResource_lifecycle(t *testing.T) {
   posture                 = "quality"
   router_input_max_chars  = 8000
   default_slot_on_failure = 0
-  context_breakpoints     = [200000]
   slots = [
     { model_alias = barndoor_llm_model_mapping.cheap.model_alias, label = "Cheap" },
     {
@@ -171,8 +174,6 @@ func TestLlmRoutingPolicyResource_lifecycle(t *testing.T) {
 					resource.TestCheckResourceAttr(resourceName, "slots.#", "3"),
 					resource.TestCheckResourceAttr(resourceName, "slots.2.model_alias", "strong"),
 					resource.TestCheckNoResourceAttr(resourceName, "slots.0.label"),
-					// No size floor by default.
-					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.#", "0"),
 					resource.TestCheckResourceAttr(resourceName, "router_input_max_chars", "12000"),
 					resource.TestCheckResourceAttr(resourceName, "default_slot_on_failure", "1"),
 					resource.TestCheckNoResourceAttr(resourceName, "description"),
@@ -205,7 +206,6 @@ func TestLlmRoutingPolicyResource_lifecycle(t *testing.T) {
 					resource.TestCheckNoResourceAttr(resourceName, "slots.0.description"),
 					resource.TestCheckResourceAttr(resourceName, "slots.1.model_alias", "Seeded openai/o3"),
 					resource.TestCheckResourceAttr(resourceName, "slots.1.description", "Hard reasoning, long documents"),
-					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.#", "1"),
 					resource.TestCheckResourceAttr(resourceName, "router_input_max_chars", "8000"),
 					resource.TestCheckResourceAttr(resourceName, "default_slot_on_failure", "0"),
 					func(*terraform.State) error {
@@ -229,15 +229,13 @@ func TestLlmRoutingPolicyResource_lifecycle(t *testing.T) {
 			{
 				// Back to minimal: description and determiner_prompt are
 				// cleared (sent as "", since the PUT reads null as "keep"),
-				// and the rest reset to their defaults, the size floor
-				// included.
+				// and the rest reset to their defaults.
 				Config: minimalConfig,
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckNoResourceAttr(resourceName, "description"),
 					resource.TestCheckNoResourceAttr(resourceName, "determiner_prompt"),
 					resource.TestCheckResourceAttr(resourceName, "posture", "balanced"),
 					resource.TestCheckResourceAttr(resourceName, "enabled", "true"),
-					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.#", "0"),
 					resource.TestCheckResourceAttr(resourceName, "default_slot_on_failure", "1"),
 					func(*terraform.State) error {
 						p := fake.routingPolicySnapshot(policyID)
@@ -263,89 +261,6 @@ func TestLlmRoutingPolicyResource_lifecycle(t *testing.T) {
 				ResourceName:      resourceName,
 				ImportState:       true,
 				ImportStateVerify: true,
-			},
-		},
-	})
-}
-
-// The size floor is optional: unset means none, at any slot count, an
-// explicit floor can be added, set on some slots only (0 = none), and
-// removed again.
-func TestLlmRoutingPolicyResource_sizeFloorIsOptional(t *testing.T) {
-	fake := setupLlmGatewayTest(t)
-	provider := fake.seedProvider()
-	const resourceName = "barndoor_llm_routing_policy.auto"
-	mappings := llmRoutingMappingsHCL(provider.ID)
-
-	twoSlots := mappings + llmRoutingPolicyHCL(`
-  slots = [
-    { model_alias = barndoor_llm_model_mapping.cheap.model_alias },
-    { model_alias = barndoor_llm_model_mapping.strong.model_alias },
-  ]`)
-	withFloor := mappings + llmRoutingPolicyHCL(llmRoutingThreeSlots+`
-  context_breakpoints = [128000, 512000]`)
-	// 0: the middle slot has no floor of its own; only 512k+ is lifted.
-	topOnly := mappings + llmRoutingPolicyHCL(llmRoutingThreeSlots+`
-  context_breakpoints = [0, 512000]`)
-
-	var policyID string
-	platformBreakpoints := func(want int) resource.TestCheckFunc {
-		return func(*terraform.State) error {
-			p := fake.routingPolicySnapshot(policyID)
-			if p == nil || len(p.ContextBreakpoints) != want {
-				return fmt.Errorf("platform context_breakpoints = %v, want %d entries", p, want)
-			}
-			return nil
-		}
-	}
-	resource.UnitTest(t, resource.TestCase{
-		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
-		CheckDestroy:             checkAllLlmRoutingDeleted(fake),
-		Steps: []resource.TestStep{
-			{
-				// Two slots and no breakpoints: the old default only fit three.
-				Config: twoSlots,
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.#", "0"),
-					func(s *terraform.State) error {
-						policyID = s.RootModule().Resources[resourceName].Primary.ID
-						return nil
-					},
-					platformBreakpoints(0),
-				),
-			},
-			{
-				Config: withFloor,
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.#", "2"),
-					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.1", "512000"),
-					platformBreakpoints(2),
-				),
-			},
-			{
-				Config: topOnly,
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.0", "0"),
-					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.1", "512000"),
-					platformBreakpoints(2),
-				),
-			},
-			{
-				Config:   topOnly,
-				PlanOnly: true,
-			},
-			{
-				// Dropping the floor and a slot in one apply sends [], which
-				// fits two slots, rather than keeping the three-slot floor.
-				Config: twoSlots,
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.#", "0"),
-					platformBreakpoints(0),
-				),
-			},
-			{
-				Config:   twoSlots,
-				PlanOnly: true,
 			},
 		},
 	})
@@ -412,38 +327,13 @@ resource "barndoor_llm_routing_policy" "auto" {
 	}{
 		{"one slot", policy("auto", slots("cheap")), `list must contain at least 2 elements`},
 		{
-			"explicit breakpoint count mismatch",
-			policy("auto", slots("a", "b", "c")+"  context_breakpoints = [1000]\n"),
-			`(?s)must be empty \(no size floor\) or have exactly 2 entries.*for 3 slots`,
-		},
-		{
-			"non-increasing breakpoints",
-			policy("auto", slots("a", "b", "c")+"  context_breakpoints = [512000, 128000]\n"),
-			`must be strictly increasing`,
-		},
-		{
-			"set breakpoints out of order around a 0",
-			policy("auto", slots("a", "b", "c", "d")+"  context_breakpoints = [32000, 0, 8000]\n"),
-			`must be strictly increasing`,
-		},
-		{
-			"equal breakpoints",
-			policy("auto", slots("a", "b", "c")+"  context_breakpoints = [1000, 1000]\n"),
-			`must be strictly increasing`,
-		},
-		{
-			"negative breakpoint",
-			policy("auto", slots("a", "b")+"  context_breakpoints = [-1]\n"),
-			`must be between 0 and`,
-		},
-		{
 			"default slot out of range",
 			policy("auto", slots("a", "b", "c")+"  default_slot_on_failure = 3\n"),
 			`default_slot_on_failure is 3 but the policy has 3 slots`,
 		},
 		{
 			"default slot out of range for two slots",
-			policy("auto", slots("a", "b")+"  context_breakpoints = [1000]\n  default_slot_on_failure = 2\n"),
+			policy("auto", slots("a", "b")+"  default_slot_on_failure = 2\n"),
 			`default_slot_on_failure is 2 but the policy has 2 slots`,
 		},
 		{
@@ -536,7 +426,6 @@ func TestLlmRoutingPolicyResource_aliasShadowingMappingIs400(t *testing.T) {
 resource "barndoor_llm_routing_policy" "shadow" {
   model_alias            = barndoor_llm_model_mapping.cheap.model_alias
   determiner_model_alias = "mid"
-  context_breakpoints    = [100000]
   slots = [
     { model_alias = barndoor_llm_model_mapping.mid.model_alias },
     { model_alias = barndoor_llm_model_mapping.strong.model_alias },

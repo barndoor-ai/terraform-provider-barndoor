@@ -20,7 +20,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
@@ -49,11 +48,6 @@ const (
 	llmRoutingMaxSlotDescriptionChars    = 2000
 )
 
-// llmRoutingDefaultBreakpoints is the platform's default context_breakpoints:
-// none, so there is no size floor and the determiner alone picks the slot at
-// any request size. It fits every slot count.
-var llmRoutingDefaultBreakpoints = []int64{}
-
 // llmRoutingPostures are the `Posture` enum values (snake_case on the wire).
 var llmRoutingPostures = []string{"savings", "balanced", "quality"}
 
@@ -69,8 +63,8 @@ type llmRoutingPolicyResource struct {
 }
 
 // llmRoutingPolicyResourceModel maps the resource schema to Go types. Slots
-// and breakpoints stay framework lists so a partially unknown configuration
-// can still be decoded at validation time.
+// stay a framework list so a partially unknown configuration can still be
+// decoded at validation time.
 type llmRoutingPolicyResourceModel struct {
 	ID                   types.String `tfsdk:"id"`
 	OrgID                types.String `tfsdk:"org_id"`
@@ -81,7 +75,6 @@ type llmRoutingPolicyResourceModel struct {
 	DeterminerPrompt     types.String `tfsdk:"determiner_prompt"`
 	Posture              types.String `tfsdk:"posture"`
 	Slots                types.List   `tfsdk:"slots"`
-	ContextBreakpoints   types.List   `tfsdk:"context_breakpoints"`
 	RouterInputMaxChars  types.Int64  `tfsdk:"router_input_max_chars"`
 	DefaultSlotOnFailure types.Int64  `tfsdk:"default_slot_on_failure"`
 	CreatedAt            types.String `tfsdk:"created_at"`
@@ -114,18 +107,13 @@ func (r *llmRoutingPolicyResource) Metadata(_ context.Context, req resource.Meta
 }
 
 func (r *llmRoutingPolicyResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
-	breakpointDefaults := make([]attr.Value, 0, len(llmRoutingDefaultBreakpoints))
-	for _, b := range llmRoutingDefaultBreakpoints {
-		breakpointDefaults = append(breakpointDefaults, types.Int64Value(b))
-	}
-
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "Manages an LLM Gateway routing policy: a caller-facing `model_alias` " +
 			"that, instead of naming one model, picks one of several model **slots** per request. A " +
 			"determiner model reads the request (and any `barndoor_llm_routing_rule` attached to the " +
-			"policy) and chooses a slot; optional `context_breakpoints` force larger-context slots " +
-			"as the request grows.\n\n" +
-			"List slots from cheapest to strongest: rules and breakpoints refer to slots by index, " +
+			"policy) and chooses a slot. Request size does not set a minimum slot; the platform keeps " +
+			"a request off any slot whose model's context window is too small to hold it.\n\n" +
+			"List slots from cheapest to strongest: rules refer to slots by index, " +
 			"and that ordering makes \"at least slot 1\" mean \"at least the mid tier\". The platform " +
 			"does not check it against prices. Each slot `model_alias` must already resolve to " +
 			"enabled routes: a bare-callable alias (a custom `barndoor_llm_model_mapping` alias, or a " +
@@ -133,11 +121,11 @@ func (r *llmRoutingPolicyResource) Schema(_ context.Context, _ resource.SchemaRe
 			"`<provider name>/<model>` of a 1:1 enablement. The policy's own `model_alias` must not " +
 			"already be a model mapping alias. The platform checks both on every write and answers " +
 			"with a 400 naming the offending target.\n\n" +
-			"Rules (`barndoor_llm_routing_rule`) name slots by position too, so removing or " +
-			"reordering slots changes what an existing rule's `floor_slot` and `deny_slots` mean; " +
-			"update the rules in the same apply. The Barndoor app edits a policy's rules inside the " +
-			"policy editor and saves the whole rule set, so a policy edited there can change or " +
-			"delete rules Terraform manages; that shows up as drift on the next plan.\n\n" +
+			"Rules (`barndoor_llm_routing_rule`) name slots by position, so removing or reordering " +
+			"slots changes what an existing rule's `floor_slot` and `deny_slots` mean; update the rules " +
+			"in the same apply. The Barndoor app edits a policy's rules inside the policy editor and " +
+			"saves the whole rule set, so a policy edited there can change or delete rules Terraform " +
+			"manages; that shows up as drift on the next plan.\n\n" +
 			"Every optional setting has the platform's default as its schema default and is sent on " +
 			"every write, so removing one from configuration resets it to that default rather than " +
 			"keeping a value set elsewhere. Pair the policy with `require_routing_policy` on " +
@@ -242,23 +230,6 @@ func (r *llmRoutingPolicyResource) Schema(_ context.Context, _ resource.SchemaRe
 					},
 				},
 			},
-			"context_breakpoints": schema.ListAttribute{
-				MarkdownDescription: "Optional request-size floor: one token threshold per slot after " +
-					"the first. A request at or above breakpoint N (from 0) is routed to slot N+1 or above. " +
-					"`0` gives that slot no floor of its own, so `[0, 100000]` lifts only 100k+ requests, to " +
-					"the third slot; the thresholds that are set must increase. Defaults to `[]`, no size " +
-					"floor (as is all `0`): the determiner picks the slot at " +
-					"any request size. Most models now have context windows of 200k tokens or more, and " +
-					"a floor that moves a conversation to another slot part-way through also discards " +
-					"the prompt cache built on the previous one.",
-				ElementType: types.Int64Type,
-				Optional:    true,
-				Computed:    true,
-				Default:     listdefault.StaticValue(types.ListValueMust(types.Int64Type, breakpointDefaults)),
-				Validators: []validator.List{
-					listvalidator.ValueInt64sAre(int64validator.Between(0, 1<<31-1)),
-				},
-			},
 			"router_input_max_chars": schema.Int64Attribute{
 				MarkdownDescription: "How many characters of the request the determiner is shown. " +
 					"Defaults to `12000`.",
@@ -352,36 +323,6 @@ func (r *llmRoutingPolicyResource) ValidateConfig(ctx context.Context, req resou
 	n := len(slots)
 	if n < 2 {
 		return
-	}
-
-	// Unset takes the default, no breakpoints, which fits any slot count.
-	if !cfg.ContextBreakpoints.IsNull() && !cfg.ContextBreakpoints.IsUnknown() {
-		breakpoints := cfg.ContextBreakpoints.Elements()
-		if len(breakpoints) != 0 && len(breakpoints) != n-1 {
-			resp.Diagnostics.AddAttributeError(path.Root("context_breakpoints"),
-				"Wrong number of context_breakpoints",
-				fmt.Sprintf("context_breakpoints must be empty (no size floor) or have exactly %d "+
-					"entries for %d slots (one fewer than the slots), got %d.", n-1, n, len(breakpoints)))
-		}
-		var prev *int64
-		for i, v := range breakpoints {
-			b, ok := v.(types.Int64)
-			if !ok || b.IsNull() || b.IsUnknown() {
-				prev = nil
-				continue
-			}
-			cur := b.ValueInt64()
-			// 0 is a slot with no floor of its own; only the set ones are ordered.
-			if cur == 0 {
-				continue
-			}
-			if prev != nil && cur <= *prev {
-				resp.Diagnostics.AddAttributeError(path.Root("context_breakpoints").AtListIndex(i),
-					"context_breakpoints must be strictly increasing",
-					fmt.Sprintf("Breakpoint %d (%d) must be greater than the last non-zero one before it (%d).", i, cur, *prev))
-			}
-			prev = &cur
-		}
 	}
 
 	defaultSlot := int64(llmRoutingDefaultSlotOnFailure)
@@ -569,7 +510,6 @@ type llmRoutingPolicyRequest struct {
 	DeterminerPrompt     *string                 `json:"determiner_prompt,omitempty"`
 	Posture              string                  `json:"posture"`
 	Slots                []llmRoutingSlotPayload `json:"slots"`
-	ContextBreakpoints   []int32                 `json:"context_breakpoints"`
 	RouterInputMaxChars  int32                   `json:"router_input_max_chars"`
 	DefaultSlotOnFailure int32                   `json:"default_slot_on_failure"`
 }
@@ -585,7 +525,6 @@ type llmRoutingPolicyResponse struct {
 	DeterminerPrompt     *string                 `json:"determiner_prompt"`
 	Posture              string                  `json:"posture"`
 	Slots                []llmRoutingSlotPayload `json:"slots"`
-	ContextBreakpoints   []int32                 `json:"context_breakpoints"`
 	RouterInputMaxChars  int32                   `json:"router_input_max_chars"`
 	DefaultSlotOnFailure int32                   `json:"default_slot_on_failure"`
 	CreatedAt            string                  `json:"created_at"`
@@ -613,8 +552,6 @@ func buildLlmRoutingPolicyRequest(ctx context.Context, plan *llmRoutingPolicyRes
 
 	var slots []llmRoutingSlotModel
 	diags.Append(plan.Slots.ElementsAs(ctx, &slots, false)...)
-	var breakpoints []int64
-	diags.Append(plan.ContextBreakpoints.ElementsAs(ctx, &breakpoints, false)...)
 	if diags.HasError() {
 		return nil, diags
 	}
@@ -627,7 +564,6 @@ func buildLlmRoutingPolicyRequest(ctx context.Context, plan *llmRoutingPolicyRes
 		DeterminerPrompt:     llmClearableString(plan.DeterminerPrompt, update),
 		Posture:              plan.Posture.ValueString(),
 		Slots:                make([]llmRoutingSlotPayload, 0, len(slots)),
-		ContextBreakpoints:   make([]int32, 0, len(breakpoints)),
 		RouterInputMaxChars:  int32(plan.RouterInputMaxChars.ValueInt64()),
 		DefaultSlotOnFailure: int32(plan.DefaultSlotOnFailure.ValueInt64()),
 	}
@@ -640,9 +576,6 @@ func buildLlmRoutingPolicyRequest(ctx context.Context, plan *llmRoutingPolicyRes
 			slot.Description = &v
 		}
 		body.Slots = append(body.Slots, slot)
-	}
-	for _, b := range breakpoints {
-		body.ContextBreakpoints = append(body.ContextBreakpoints, int32(b))
 	}
 	return body, diags
 }
@@ -675,13 +608,6 @@ func applyLlmRoutingPolicyResponse(ctx context.Context, policy *llmRoutingPolicy
 	slots, d := types.ListValue(types.ObjectType{AttrTypes: llmRoutingSlotAttrTypes}, slotValues)
 	diags.Append(d...)
 
-	breakpointValues := make([]attr.Value, 0, len(policy.ContextBreakpoints))
-	for _, b := range policy.ContextBreakpoints {
-		breakpointValues = append(breakpointValues, types.Int64Value(int64(b)))
-	}
-	breakpoints, d := types.ListValue(types.Int64Type, breakpointValues)
-	diags.Append(d...)
-
 	determiner := ""
 	if policy.DeterminerModelAlias != nil {
 		determiner = *policy.DeterminerModelAlias
@@ -697,7 +623,6 @@ func applyLlmRoutingPolicyResponse(ctx context.Context, policy *llmRoutingPolicy
 		DeterminerPrompt:     optionalStringFromPtr(policy.DeterminerPrompt, prior.DeterminerPrompt),
 		Posture:              types.StringValue(policy.Posture),
 		Slots:                slots,
-		ContextBreakpoints:   breakpoints,
 		RouterInputMaxChars:  types.Int64Value(int64(policy.RouterInputMaxChars)),
 		DefaultSlotOnFailure: types.Int64Value(int64(policy.DefaultSlotOnFailure)),
 		CreatedAt:            types.StringValue(policy.CreatedAt),
