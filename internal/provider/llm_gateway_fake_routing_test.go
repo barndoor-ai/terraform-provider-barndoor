@@ -52,7 +52,6 @@ type fakeLlmRoutingPolicy struct {
 	DeterminerPrompt     *string
 	Posture              string
 	Slots                []fakeLlmRoutingSlot
-	ContextBreakpoints   []int64
 	RouterInputMaxChars  int64
 	DefaultSlotOnFailure int64
 	CreatedAt            string
@@ -85,10 +84,6 @@ func routingPolicyJSON(p *fakeLlmRoutingPolicy) map[string]any {
 	if slots == nil {
 		slots = []fakeLlmRoutingSlot{}
 	}
-	breakpoints := p.ContextBreakpoints
-	if breakpoints == nil {
-		breakpoints = []int64{}
-	}
 	return map[string]any{
 		"id":                      p.ID,
 		"org_id":                  fakeLlmOrgID,
@@ -99,7 +94,6 @@ func routingPolicyJSON(p *fakeLlmRoutingPolicy) map[string]any {
 		"determiner_prompt":       p.DeterminerPrompt,
 		"posture":                 p.Posture,
 		"slots":                   slots,
-		"context_breakpoints":     breakpoints,
 		"router_input_max_chars":  p.RouterInputMaxChars,
 		"default_slot_on_failure": p.DefaultSlotOnFailure,
 		"created_at":              p.CreatedAt,
@@ -202,26 +196,12 @@ func validRoutingPolicyDraft(w http.ResponseWriter, p *fakeLlmRoutingPolicy) boo
 	if len(p.Slots) < 2 {
 		return fail("at least two model slots are required")
 	}
-	if len(p.ContextBreakpoints) != len(p.Slots)-1 {
-		return fail(fmt.Sprintf("context_breakpoints must have exactly %d entries for %d slots",
-			len(p.Slots)-1, len(p.Slots)))
-	}
 	for i, slot := range p.Slots {
 		if strings.TrimSpace(slot.ModelAlias) == "" {
 			return fail(fmt.Sprintf("slot %d model_alias is required", i))
 		}
 		if strings.EqualFold(fakeLlmTargetAlias(slot.ModelAlias), p.ModelAlias) {
 			return fail("routing policy alias cannot appear as a slot target")
-		}
-	}
-	for _, b := range p.ContextBreakpoints {
-		if b <= 0 {
-			return fail("context breakpoints must be positive")
-		}
-	}
-	for i := 1; i < len(p.ContextBreakpoints); i++ {
-		if p.ContextBreakpoints[i-1] >= p.ContextBreakpoints[i] {
-			return fail("context breakpoints must be strictly increasing")
 		}
 	}
 	if p.RouterInputMaxChars <= 0 {
@@ -315,7 +295,6 @@ func (f *fakeLlmGatewayServer) createRoutingPolicy(w http.ResponseWriter, r *htt
 		DeterminerPrompt     *string              `json:"determiner_prompt"`
 		Posture              *string              `json:"posture"`
 		Slots                []fakeLlmRoutingSlot `json:"slots"`
-		ContextBreakpoints   *[]int64             `json:"context_breakpoints"`
 		RouterInputMaxChars  *int64               `json:"router_input_max_chars"`
 		DefaultSlotOnFailure *int64               `json:"default_slot_on_failure"`
 	}
@@ -334,7 +313,6 @@ func (f *fakeLlmGatewayServer) createRoutingPolicy(w http.ResponseWriter, r *htt
 		DeterminerPrompt:     body.DeterminerPrompt,
 		Posture:              "balanced",
 		Slots:                body.Slots,
-		ContextBreakpoints:   []int64{128000, 512000},
 		RouterInputMaxChars:  12000,
 		DefaultSlotOnFailure: 1,
 		CreatedAt:            stamp,
@@ -345,9 +323,6 @@ func (f *fakeLlmGatewayServer) createRoutingPolicy(w http.ResponseWriter, r *htt
 	}
 	if body.Posture != nil {
 		p.Posture = *body.Posture
-	}
-	if body.ContextBreakpoints != nil {
-		p.ContextBreakpoints = *body.ContextBreakpoints
 	}
 	if body.RouterInputMaxChars != nil {
 		p.RouterInputMaxChars = *body.RouterInputMaxChars
@@ -386,7 +361,6 @@ func (f *fakeLlmGatewayServer) updateRoutingPolicy(w http.ResponseWriter, r *htt
 		DeterminerPrompt     *string               `json:"determiner_prompt"`
 		Posture              *string               `json:"posture"`
 		Slots                *[]fakeLlmRoutingSlot `json:"slots"`
-		ContextBreakpoints   *[]int64              `json:"context_breakpoints"`
 		RouterInputMaxChars  *int64                `json:"router_input_max_chars"`
 		DefaultSlotOnFailure *int64                `json:"default_slot_on_failure"`
 	}
@@ -416,9 +390,6 @@ func (f *fakeLlmGatewayServer) updateRoutingPolicy(w http.ResponseWriter, r *htt
 	}
 	if body.Slots != nil {
 		merged.Slots = *body.Slots
-	}
-	if body.ContextBreakpoints != nil {
-		merged.ContextBreakpoints = *body.ContextBreakpoints
 	}
 	if body.RouterInputMaxChars != nil {
 		merged.RouterInputMaxChars = *body.RouterInputMaxChars
@@ -452,7 +423,6 @@ func (f *fakeLlmGatewayServer) seedRoutingPolicy(alias string, slots ...string) 
 		Enabled:              true,
 		DeterminerModelAlias: &determiner,
 		Posture:              "balanced",
-		ContextBreakpoints:   []int64{128000, 512000}[:len(slots)-1],
 		RouterInputMaxChars:  12000,
 		DefaultSlotOnFailure: 1,
 		CreatedAt:            fakeLlmTime,

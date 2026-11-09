@@ -39,12 +39,16 @@ func TestLlmRoutingPolicyResource_Schema(t *testing.T) {
 
 	for _, attr := range []string{
 		"id", "org_id", "model_alias", "description", "enabled", "determiner_model_alias",
-		"determiner_prompt", "posture", "slots", "context_breakpoints", "router_input_max_chars",
+		"determiner_prompt", "posture", "slots", "router_input_max_chars",
 		"default_slot_on_failure", "created_at", "updated_at",
 	} {
 		if _, ok := resp.Schema.Attributes[attr]; !ok {
 			t.Errorf("schema missing attribute %q", attr)
 		}
+	}
+	// The size floor is retired on the platform; the attribute is gone.
+	if _, ok := resp.Schema.Attributes["context_breakpoints"]; ok {
+		t.Error("context_breakpoints should not be in the schema")
 	}
 	for _, required := range []string{"model_alias", "determiner_model_alias", "slots"} {
 		if !resp.Schema.Attributes[required].IsRequired() {
@@ -52,7 +56,7 @@ func TestLlmRoutingPolicyResource_Schema(t *testing.T) {
 		}
 	}
 	for _, computed := range []string{
-		"id", "org_id", "enabled", "posture", "context_breakpoints", "router_input_max_chars",
+		"id", "org_id", "enabled", "posture", "router_input_max_chars",
 		"default_slot_on_failure", "created_at", "updated_at",
 	} {
 		if !resp.Schema.Attributes[computed].IsComputed() {
@@ -143,7 +147,6 @@ func TestLlmRoutingPolicyResource_lifecycle(t *testing.T) {
   posture                 = "quality"
   router_input_max_chars  = 8000
   default_slot_on_failure = 0
-  context_breakpoints     = [200000]
   slots = [
     { model_alias = barndoor_llm_model_mapping.cheap.model_alias, label = "Cheap" },
     {
@@ -171,9 +174,6 @@ func TestLlmRoutingPolicyResource_lifecycle(t *testing.T) {
 					resource.TestCheckResourceAttr(resourceName, "slots.#", "3"),
 					resource.TestCheckResourceAttr(resourceName, "slots.2.model_alias", "strong"),
 					resource.TestCheckNoResourceAttr(resourceName, "slots.0.label"),
-					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.#", "2"),
-					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.0", "128000"),
-					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.1", "512000"),
 					resource.TestCheckResourceAttr(resourceName, "router_input_max_chars", "12000"),
 					resource.TestCheckResourceAttr(resourceName, "default_slot_on_failure", "1"),
 					resource.TestCheckNoResourceAttr(resourceName, "description"),
@@ -206,7 +206,6 @@ func TestLlmRoutingPolicyResource_lifecycle(t *testing.T) {
 					resource.TestCheckNoResourceAttr(resourceName, "slots.0.description"),
 					resource.TestCheckResourceAttr(resourceName, "slots.1.model_alias", "Seeded openai/o3"),
 					resource.TestCheckResourceAttr(resourceName, "slots.1.description", "Hard reasoning, long documents"),
-					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.#", "1"),
 					resource.TestCheckResourceAttr(resourceName, "router_input_max_chars", "8000"),
 					resource.TestCheckResourceAttr(resourceName, "default_slot_on_failure", "0"),
 					func(*terraform.State) error {
@@ -237,7 +236,6 @@ func TestLlmRoutingPolicyResource_lifecycle(t *testing.T) {
 					resource.TestCheckNoResourceAttr(resourceName, "determiner_prompt"),
 					resource.TestCheckResourceAttr(resourceName, "posture", "balanced"),
 					resource.TestCheckResourceAttr(resourceName, "enabled", "true"),
-					resource.TestCheckResourceAttr(resourceName, "context_breakpoints.#", "2"),
 					resource.TestCheckResourceAttr(resourceName, "default_slot_on_failure", "1"),
 					func(*terraform.State) error {
 						p := fake.routingPolicySnapshot(policyID)
@@ -329,43 +327,13 @@ resource "barndoor_llm_routing_policy" "auto" {
 	}{
 		{"one slot", policy("auto", slots("cheap")), `list must contain at least 2 elements`},
 		{
-			"two slots without breakpoints",
-			policy("auto", slots("cheap", "strong")),
-			`(?s)needs exactly 1 context_breakpoints.*default \[128000, 512000\]`,
-		},
-		{
-			"four slots without breakpoints",
-			policy("auto", slots("a", "b", "c", "d")),
-			`(?s)needs exactly 3 context_breakpoints`,
-		},
-		{
-			"explicit breakpoint count mismatch",
-			policy("auto", slots("a", "b", "c")+"  context_breakpoints = [1000]\n"),
-			`must have exactly 2 entries for 3 slots`,
-		},
-		{
-			"non-increasing breakpoints",
-			policy("auto", slots("a", "b", "c")+"  context_breakpoints = [512000, 128000]\n"),
-			`must be strictly increasing`,
-		},
-		{
-			"equal breakpoints",
-			policy("auto", slots("a", "b", "c")+"  context_breakpoints = [1000, 1000]\n"),
-			`must be strictly increasing`,
-		},
-		{
-			"non-positive breakpoint",
-			policy("auto", slots("a", "b")+"  context_breakpoints = [0]\n"),
-			`must be between 1 and`,
-		},
-		{
 			"default slot out of range",
 			policy("auto", slots("a", "b", "c")+"  default_slot_on_failure = 3\n"),
 			`default_slot_on_failure is 3 but the policy has 3 slots`,
 		},
 		{
 			"default slot out of range for two slots",
-			policy("auto", slots("a", "b")+"  context_breakpoints = [1000]\n  default_slot_on_failure = 2\n"),
+			policy("auto", slots("a", "b")+"  default_slot_on_failure = 2\n"),
 			`default_slot_on_failure is 2 but the policy has 2 slots`,
 		},
 		{
@@ -458,7 +426,6 @@ func TestLlmRoutingPolicyResource_aliasShadowingMappingIs400(t *testing.T) {
 resource "barndoor_llm_routing_policy" "shadow" {
   model_alias            = barndoor_llm_model_mapping.cheap.model_alias
   determiner_model_alias = "mid"
-  context_breakpoints    = [100000]
   slots = [
     { model_alias = barndoor_llm_model_mapping.mid.model_alias },
     { model_alias = barndoor_llm_model_mapping.strong.model_alias },
