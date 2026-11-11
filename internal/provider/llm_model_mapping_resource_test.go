@@ -40,7 +40,7 @@ func TestLlmModelMappingResource_Schema(t *testing.T) {
 	for _, attr := range []string{
 		"id", "provider_id", "model_alias", "upstream_model", "kind", "enabled", "priority",
 		"retry_on_429_count", "retry_on_429_max_wait_secs", "bare_alias",
-		"stream_idle_timeout_secs", "request_timeout_secs",
+		"stream_idle_timeout_secs", "request_timeout_secs", "reasoning_effort_support",
 	} {
 		if _, ok := resp.Schema.Attributes[attr]; !ok {
 			t.Errorf("schema missing attribute %q", attr)
@@ -53,7 +53,7 @@ func TestLlmModelMappingResource_Schema(t *testing.T) {
 	}
 	for _, computed := range []string{
 		"id", "kind", "enabled", "priority", "retry_on_429_count", "retry_on_429_max_wait_secs",
-		"bare_alias", "stream_idle_timeout_secs", "request_timeout_secs",
+		"bare_alias", "stream_idle_timeout_secs", "request_timeout_secs", "reasoning_effort_support",
 	} {
 		if !resp.Schema.Attributes[computed].IsComputed() {
 			t.Errorf("%s should be Computed", computed)

@@ -5,6 +5,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 
@@ -60,6 +61,8 @@ type llmModelMappingResourceModel struct {
 	BareAlias             types.Bool   `tfsdk:"bare_alias"`
 	StreamIdleTimeoutSecs types.Int64  `tfsdk:"stream_idle_timeout_secs"`
 	RequestTimeoutSecs    types.Int64  `tfsdk:"request_timeout_secs"`
+
+	ReasoningEffortSupport types.String `tfsdk:"reasoning_effort_support"`
 
 	CooldownFailureThreshold types.Int64 `tfsdk:"cooldown_failure_threshold"`
 	CooldownWindowSecs       types.Int64 `tfsdk:"cooldown_window_secs"`
@@ -208,6 +211,23 @@ func (r *llmModelMappingResource) Schema(_ context.Context, _ resource.SchemaReq
 					int64planmodifier.UseStateForUnknown(),
 				},
 			},
+			"reasoning_effort_support": schema.StringAttribute{
+				MarkdownDescription: "Whether the gateway sends a client's reasoning-effort hint to this model as " +
+					"`reasoning_effort`, on OpenAI-compatible providers. `auto` uses what the gateway detects from " +
+					"the model name; `supported` always sends it (for a model the gateway does not recognise, such " +
+					"as a self-hosted one); `unsupported` never sends it, removing a value the client sent too (for " +
+					"a model that rejects the parameter). Only for `kind = \"model\"`: every route to the model " +
+					"inherits it. Leave unset to not manage it, so a value set in the Barndoor app is kept; set " +
+					"`auto` to return the model to detection.",
+				Optional: true,
+				Computed: true,
+				Validators: []validator.String{
+					stringvalidator.OneOf(reasoningEffortAuto, reasoningEffortSupported, reasoningEffortUnsupported),
+				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
 			"cooldown_failure_threshold": llmCooldownAttribute(
 				"Upstream failures within `cooldown_window_secs` that cool the route (0–100). Defaults to "+
 					"`10`. `0` disables every cooldown of the shared route (rolling failures, 429 and 529); "+
@@ -261,13 +281,27 @@ func llmCooldownAttribute(description string, lower, upper int64) schema.Int64At
 // ValidateConfig checks an explicit `kind = "model"` at plan time: an
 // enablement is named after its model and is never bare-callable.
 func (r *llmModelMappingResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
-	var kind, alias, upstream types.String
+	var kind, alias, upstream, reasoning types.String
 	var bare types.Bool
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("kind"), &kind)...)
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("model_alias"), &alias)...)
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("upstream_model"), &upstream)...)
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("bare_alias"), &bare)...)
-	if resp.Diagnostics.HasError() || kind.IsNull() || kind.IsUnknown() || kind.ValueString() != "model" {
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("reasoning_effort_support"), &reasoning)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	// reasoning_effort_support is a property of the model, so only its own row
+	// takes it; the platform refuses it on a route with a 400.
+	if _, ok := knownString(reasoning); ok {
+		if k, ok := configuredMappingKind(kind, alias, upstream, bare); ok && k != "model" {
+			resp.Diagnostics.AddAttributeError(path.Root("reasoning_effort_support"),
+				"reasoning_effort_support needs kind = \"model\"",
+				"reasoning_effort_support is set on the model itself (kind = \"model\"), not on a route: every "+
+					"route to the model inherits it. Set it on the model's enablement mapping instead.")
+		}
+	}
+	if kind.IsNull() || kind.IsUnknown() || kind.ValueString() != "model" {
 		return
 	}
 	if b, ok := bare.ValueBool(), !bare.IsNull() && !bare.IsUnknown(); ok && b {
@@ -281,6 +315,24 @@ func (r *llmModelMappingResource) ValidateConfig(ctx context.Context, req resour
 				"kind = \"model\" requires model_alias to equal upstream_model. Use kind = \"route\" for a custom alias.")
 		}
 	}
+}
+
+// configuredMappingKind resolves the row kind from config the way
+// llmMappingKind does at create: the stated kind, else inferred from the name
+// and bare_alias. ok is false while anything it needs is still unknown.
+func configuredMappingKind(kind, alias, upstream types.String, bare types.Bool) (string, bool) {
+	if k, ok := knownString(kind); ok {
+		return k, true
+	}
+	a, okA := knownString(alias)
+	u, okU := knownString(upstream)
+	if !okA || !okU || bare.IsUnknown() {
+		return "", false
+	}
+	if a == u && !bare.ValueBool() {
+		return "model", true
+	}
+	return "route", true
 }
 
 func (r *llmModelMappingResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
@@ -375,8 +427,45 @@ func (r *llmModelMappingResource) Create(ctx context.Context, req resource.Creat
 		return
 	}
 
+	// A create folding into an existing enablement keeps its stored setting
+	// when the field is omitted, and `auto` is sent as omitted: bring it to
+	// the planned value with the update endpoint, the one that can clear it.
+	if !reasoningEffortMatches(plan.ReasoningEffortSupport, mapping.ReasoningEffortSupport) {
+		r.reconcileReasoningEffort(ctx, &plan, &mapping, &resp.Diagnostics)
+	}
+
 	state := applyLlmModelMappingResponse(&mapping, plan.ChangeNote)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+}
+
+// reconcileReasoningEffort writes the planned reasoning_effort_support with
+// the update endpoint and reports a platform that does not apply it (one that
+// predates the field ignores it). It carries change_note, which the update
+// endpoint otherwise clears.
+func (r *llmModelMappingResource) reconcileReasoningEffort(ctx context.Context, plan *llmModelMappingResourceModel,
+	mapping *llmModelMappingResponse, diags *diag.Diagnostics) {
+	body := &llmModelMappingUpdateRequest{
+		ReasoningEffortSupport: reasoningEffortWire(plan.ReasoningEffortSupport),
+		ChangeNote:             stringPtrIfKnown(plan.ChangeNote),
+	}
+	if err := doJSON(ctx, r.client, http.MethodPut,
+		llmGatewayAPIPrefix+"/model-mappings/"+mapping.ID, body, mapping); err != nil {
+		addLlmGatewayAPIError(diags, "LLM model mapping", "set reasoning_effort_support on the LLM model mapping", err)
+		return
+	}
+	checkReasoningEffortApplied(plan.ReasoningEffortSupport, mapping, diags)
+}
+
+// checkReasoningEffortApplied turns a platform that silently ignored the field
+// into a clear error, rather than Terraform's generic inconsistent-result one.
+func checkReasoningEffortApplied(planned types.String, mapping *llmModelMappingResponse, diags *diag.Diagnostics) {
+	if reasoningEffortMatches(planned, mapping.ReasoningEffortSupport) {
+		return
+	}
+	diags.AddAttributeError(path.Root("reasoning_effort_support"), "reasoning_effort_support was not applied",
+		fmt.Sprintf("The Barndoor platform returned %q after the provider set %q. Your Barndoor platform version "+
+			"may not support reasoning_effort_support yet; remove the attribute, or upgrade the platform.",
+			reasoningEffortValue(mapping.ReasoningEffortSupport), planned.ValueString()))
 }
 
 // Read refreshes the mapping from the org-wide listing: the admin API has no
@@ -427,6 +516,11 @@ func (r *llmModelMappingResource) Update(ctx context.Context, req resource.Updat
 	if err := doJSON(ctx, r.client, http.MethodPut,
 		llmGatewayAPIPrefix+"/model-mappings/"+plan.ID.ValueString(), body, &mapping); err != nil {
 		addLlmGatewayAPIError(&resp.Diagnostics, "LLM model mapping", "update the LLM model mapping", err)
+		return
+	}
+
+	checkReasoningEffortApplied(plan.ReasoningEffortSupport, &mapping, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
@@ -485,7 +579,10 @@ type llmModelMappingCreateRequest struct {
 	BareAlias             *bool   `json:"bare_alias,omitempty"`
 	StreamIdleTimeoutSecs *int32  `json:"stream_idle_timeout_secs,omitempty"`
 	RequestTimeoutSecs    *int32  `json:"request_timeout_secs,omitempty"`
-	ChangeNote            *string `json:"change_note,omitempty"`
+	// Upsert semantics on create: a value sets it, omitted keeps it. Only
+	// `supported`/`unsupported` are sent; Create reconciles the rest.
+	ReasoningEffortSupport *bool   `json:"reasoning_effort_support,omitempty"`
+	ChangeNote             *string `json:"change_note,omitempty"`
 	llmCooldownFields
 }
 
@@ -503,7 +600,11 @@ type llmModelMappingUpdateRequest struct {
 	BareAlias             *bool   `json:"bare_alias,omitempty"`
 	StreamIdleTimeoutSecs *int32  `json:"stream_idle_timeout_secs,omitempty"`
 	RequestTimeoutSecs    *int32  `json:"request_timeout_secs,omitempty"`
-	ChangeNote            *string `json:"change_note,omitempty"`
+	// Tri-state: omitted keeps the stored value, JSON null returns the model to
+	// detection (`auto`), a bool sets it. A RawMessage, because a nil pointer
+	// cannot be told apart from an explicit null.
+	ReasoningEffortSupport json.RawMessage `json:"reasoning_effort_support,omitempty"`
+	ChangeNote             *string         `json:"change_note,omitempty"`
 	llmCooldownFields
 }
 
@@ -536,6 +637,8 @@ type llmModelMappingResponse struct {
 	BareAlias             bool   `json:"bare_alias"`
 	StreamIdleTimeoutSecs *int32 `json:"stream_idle_timeout_secs"`
 	RequestTimeoutSecs    *int32 `json:"request_timeout_secs"`
+	// Absent from a platform that predates it, which reads as `auto`.
+	ReasoningEffortSupport *bool `json:"reasoning_effort_support"`
 
 	CooldownFailureThreshold int32 `json:"cooldown_failure_threshold"`
 	CooldownWindowSecs       int32 `json:"cooldown_window_secs"`
@@ -586,19 +689,20 @@ func llmMappingKind(plan *llmModelMappingResourceModel) string {
 func buildLlmModelMappingCreateRequest(plan *llmModelMappingResourceModel) *llmModelMappingCreateRequest {
 	kind := llmMappingKind(plan)
 	return &llmModelMappingCreateRequest{
-		Kind:                  &kind,
-		ProviderID:            plan.ProviderID.ValueString(),
-		ModelAlias:            plan.ModelAlias.ValueString(),
-		UpstreamModel:         plan.UpstreamModel.ValueString(),
-		Enabled:               boolPtrFromBool(plan.Enabled),
-		Priority:              int32PtrFromInt64(plan.Priority),
-		RetryOn429Count:       int32PtrFromInt64(plan.RetryOn429Count),
-		RetryOn429MaxWaitSecs: int32PtrFromInt64(plan.RetryOn429MaxWaitSecs),
-		BareAlias:             boolPtrFromBool(plan.BareAlias),
-		StreamIdleTimeoutSecs: int32PtrFromInt64(plan.StreamIdleTimeoutSecs),
-		RequestTimeoutSecs:    int32PtrFromInt64(plan.RequestTimeoutSecs),
-		ChangeNote:            stringPtrIfKnown(plan.ChangeNote),
-		llmCooldownFields:     plannedCooldown(plan),
+		Kind:                   &kind,
+		ProviderID:             plan.ProviderID.ValueString(),
+		ModelAlias:             plan.ModelAlias.ValueString(),
+		UpstreamModel:          plan.UpstreamModel.ValueString(),
+		Enabled:                boolPtrFromBool(plan.Enabled),
+		Priority:               int32PtrFromInt64(plan.Priority),
+		RetryOn429Count:        int32PtrFromInt64(plan.RetryOn429Count),
+		RetryOn429MaxWaitSecs:  int32PtrFromInt64(plan.RetryOn429MaxWaitSecs),
+		BareAlias:              boolPtrFromBool(plan.BareAlias),
+		StreamIdleTimeoutSecs:  int32PtrFromInt64(plan.StreamIdleTimeoutSecs),
+		RequestTimeoutSecs:     int32PtrFromInt64(plan.RequestTimeoutSecs),
+		ReasoningEffortSupport: reasoningEffortCreateWire(plan.ReasoningEffortSupport),
+		ChangeNote:             stringPtrIfKnown(plan.ChangeNote),
+		llmCooldownFields:      plannedCooldown(plan),
 	}
 }
 
@@ -608,17 +712,18 @@ func buildLlmModelMappingUpdateRequest(plan *llmModelMappingResourceModel) *llmM
 	modelAlias := plan.ModelAlias.ValueString()
 	upstreamModel := plan.UpstreamModel.ValueString()
 	return &llmModelMappingUpdateRequest{
-		ModelAlias:            &modelAlias,
-		UpstreamModel:         &upstreamModel,
-		Enabled:               boolPtrFromBool(plan.Enabled),
-		Priority:              int32PtrFromInt64(plan.Priority),
-		RetryOn429Count:       int32PtrFromInt64(plan.RetryOn429Count),
-		RetryOn429MaxWaitSecs: int32PtrFromInt64(plan.RetryOn429MaxWaitSecs),
-		BareAlias:             boolPtrFromBool(plan.BareAlias),
-		StreamIdleTimeoutSecs: int32PtrFromInt64(plan.StreamIdleTimeoutSecs),
-		RequestTimeoutSecs:    int32PtrFromInt64(plan.RequestTimeoutSecs),
-		ChangeNote:            stringPtrIfKnown(plan.ChangeNote),
-		llmCooldownFields:     plannedCooldown(plan),
+		ModelAlias:             &modelAlias,
+		UpstreamModel:          &upstreamModel,
+		Enabled:                boolPtrFromBool(plan.Enabled),
+		Priority:               int32PtrFromInt64(plan.Priority),
+		RetryOn429Count:        int32PtrFromInt64(plan.RetryOn429Count),
+		RetryOn429MaxWaitSecs:  int32PtrFromInt64(plan.RetryOn429MaxWaitSecs),
+		BareAlias:              boolPtrFromBool(plan.BareAlias),
+		StreamIdleTimeoutSecs:  int32PtrFromInt64(plan.StreamIdleTimeoutSecs),
+		RequestTimeoutSecs:     int32PtrFromInt64(plan.RequestTimeoutSecs),
+		ReasoningEffortSupport: reasoningEffortWire(plan.ReasoningEffortSupport),
+		ChangeNote:             stringPtrIfKnown(plan.ChangeNote),
+		llmCooldownFields:      plannedCooldown(plan),
 	}
 }
 
@@ -641,6 +746,8 @@ func applyLlmModelMappingResponse(mapping *llmModelMappingResponse, changeNote t
 		StreamIdleTimeoutSecs: int64FromInt32Ptr(mapping.StreamIdleTimeoutSecs),
 		RequestTimeoutSecs:    int64FromInt32Ptr(mapping.RequestTimeoutSecs),
 
+		ReasoningEffortSupport: types.StringValue(reasoningEffortValue(mapping.ReasoningEffortSupport)),
+
 		CooldownFailureThreshold: types.Int64Value(int64(mapping.CooldownFailureThreshold)),
 		CooldownWindowSecs:       types.Int64Value(int64(mapping.CooldownWindowSecs)),
 		CooldownBaseSecs:         types.Int64Value(int64(mapping.CooldownBaseSecs)),
@@ -650,4 +757,69 @@ func applyLlmModelMappingResponse(mapping *llmModelMappingResponse, changeNote t
 
 		ChangeNote: changeNote,
 	}
+}
+
+// The three reasoning_effort_support values, which map onto the API's
+// nullable bool: `auto` is null (the gateway's detection), the others
+// true/false.
+const (
+	reasoningEffortAuto        = "auto"
+	reasoningEffortSupported   = "supported"
+	reasoningEffortUnsupported = "unsupported"
+)
+
+// reasoningEffortValue is the attribute value for the API's nullable bool.
+func reasoningEffortValue(v *bool) string {
+	switch {
+	case v == nil:
+		return reasoningEffortAuto
+	case *v:
+		return reasoningEffortSupported
+	default:
+		return reasoningEffortUnsupported
+	}
+}
+
+// reasoningEffortBool is the API value for a known attribute value: nil for
+// `auto`.
+func reasoningEffortBool(v string) *bool {
+	switch v {
+	case reasoningEffortSupported:
+		b := true
+		return &b
+	case reasoningEffortUnsupported:
+		b := false
+		return &b
+	default:
+		return nil
+	}
+}
+
+// reasoningEffortWire is the update body's value: omitted while unknown (the
+// attribute is unset and nothing is in state yet), else null or a bool.
+func reasoningEffortWire(v types.String) json.RawMessage {
+	s, ok := knownString(v)
+	if !ok {
+		return nil
+	}
+	raw, _ := json.Marshal(reasoningEffortBool(s))
+	return raw
+}
+
+// reasoningEffortCreateWire is the create body's value. The create endpoint
+// cannot clear the setting (omitted and null both keep it), so `auto` is
+// omitted and left to Create's reconcile.
+func reasoningEffortCreateWire(v types.String) *bool {
+	s, ok := knownString(v)
+	if !ok {
+		return nil
+	}
+	return reasoningEffortBool(s)
+}
+
+// reasoningEffortMatches reports whether the response carries the planned
+// value. An unknown plan (attribute unset) accepts whatever the platform has.
+func reasoningEffortMatches(planned types.String, got *bool) bool {
+	s, ok := knownString(planned)
+	return !ok || s == reasoningEffortValue(got)
 }

@@ -20,3 +20,15 @@ resource "barndoor_llm_model_mapping" "fast" {
 
   depends_on = [barndoor_llm_model_mapping.gpt_4o]
 }
+
+# A self-hosted reasoning model the gateway can't recognise by name: always
+# send the client's reasoning-effort hint (Claude Code's effort level) as
+# reasoning_effort. Leave reasoning_effort_support unset to keep whatever is
+# set in the Barndoor app; "auto" returns the model to name-based detection.
+resource "barndoor_llm_model_mapping" "internal_r1" {
+  provider_id    = "22222222-2222-2222-2222-222222222222" # a custom (OpenAI-compatible) provider
+  model_alias    = "internal-r1"
+  upstream_model = "internal-r1"
+
+  reasoning_effort_support = "supported"
+}
