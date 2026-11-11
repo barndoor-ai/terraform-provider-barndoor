@@ -111,8 +111,11 @@ type fakeLlmModelMapping struct {
 	BareAlias             bool
 	StreamIdleTimeoutSecs int64
 	RequestTimeoutSecs    int64
-	Cooldown              fakeLlmCooldown
-	LastChangeNote        *string
+	// ReasoningEffortSupport: nil is "auto" (the gateway's detection). Only
+	// a kind = "model" row may carry a value (the platform's V94 CHECK).
+	ReasoningEffortSupport *bool
+	Cooldown               fakeLlmCooldown
+	LastChangeNote         *string
 }
 
 // fakeLlmCooldown is a route's passive cooldown policy (BCP-2671 H5): six NOT
@@ -334,6 +337,10 @@ type fakeLlmGatewayServer struct {
 	// governance is the org's singleton governance_config row; nil means no
 	// row yet (the API then reports the column defaults).
 	governance *bool
+	// predatesReasoningEffort makes the fake behave like a platform release
+	// without model_mappings.reasoning_effort_support: the field is ignored
+	// on writes and absent from responses.
+	predatesReasoningEffort bool
 	// defaultModelAccess ("" = allow) and requireRoutingPolicy are the later
 	// governance_config columns (V70, V78).
 	defaultModelAccess   string
@@ -1238,6 +1245,11 @@ func (f *fakeLlmGatewayServer) findMapping(id string) *fakeLlmModelMapping {
 	return nil
 }
 
+// fakeReasoningEffortRouteError is the platform's 400 for
+// reasoning_effort_support on a route row.
+const fakeReasoningEffortRouteError = "reasoning_effort_support is set on the model itself (kind: model), " +
+	"not on a route target; every route to the model inherits it"
+
 func mappingJSON(f *fakeLlmGatewayServer, m *fakeLlmModelMapping, withProvider bool) map[string]any {
 	out := map[string]any{
 		"id":                         m.ID,
@@ -1253,6 +1265,9 @@ func mappingJSON(f *fakeLlmGatewayServer, m *fakeLlmModelMapping, withProvider b
 		"stream_idle_timeout_secs":   m.StreamIdleTimeoutSecs,
 		"request_timeout_secs":       m.RequestTimeoutSecs,
 		"last_change_note":           m.LastChangeNote,
+	}
+	if !f.predatesReasoningEffort {
+		out["reasoning_effort_support"] = m.ReasoningEffortSupport
 	}
 	raw, _ := json.Marshal(m.Cooldown)
 	_ = json.Unmarshal(raw, &out)
@@ -1334,12 +1349,17 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 		BareAlias             *bool   `json:"bare_alias"`
 		StreamIdleTimeoutSecs *int64  `json:"stream_idle_timeout_secs"`
 		RequestTimeoutSecs    *int64  `json:"request_timeout_secs"`
-		ChangeNote            *string `json:"change_note"`
+		// Upsert semantics: a value sets it; omitted or null keeps it.
+		ReasoningEffortSupport *bool   `json:"reasoning_effort_support"`
+		ChangeNote             *string `json:"change_note"`
 		fakeLlmCooldownPatch
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if f.predatesReasoningEffort {
+		body.ReasoningEffortSupport = nil
 	}
 	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
 	if !ok {
@@ -1381,6 +1401,10 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 			writeLlmError(w, http.StatusBadRequest, "an enablement is never bare-callable; create a route instead")
 			return
 		}
+	}
+	if body.ReasoningEffortSupport != nil && kind != "model" {
+		writeLlmError(w, http.StatusBadRequest, fakeReasoningEffortRouteError)
+		return
 	}
 	// Bare-callable by default for routes, never for enablements.
 	bareAlias := kind == "route"
@@ -1429,6 +1453,9 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 		if body.RequestTimeoutSecs != nil {
 			anchor.RequestTimeoutSecs = *body.RequestTimeoutSecs
 		}
+		if body.ReasoningEffortSupport != nil {
+			anchor.ReasoningEffortSupport = body.ReasoningEffortSupport
+		}
 		_ = json.NewEncoder(w).Encode(mappingJSON(f, anchor, false))
 		return
 	}
@@ -1448,20 +1475,21 @@ func (f *fakeLlmGatewayServer) createModelMapping(w http.ResponseWriter, r *http
 	}
 
 	m := &fakeLlmModelMapping{
-		Kind:                  kind,
-		ID:                    f.newID("bbbb"),
-		ProviderID:            body.ProviderID,
-		ModelAlias:            body.ModelAlias,
-		UpstreamModel:         body.UpstreamModel,
-		Enabled:               enabled,
-		Priority:              body.Priority,
-		RetryOn429Count:       body.RetryOn429Count,
-		RetryOn429MaxWaitSecs: body.RetryOn429MaxWaitSecs,
-		BareAlias:             bareAlias,
-		StreamIdleTimeoutSecs: streamIdle,
-		RequestTimeoutSecs:    requestTimeout,
-		Cooldown:              cooldown,
-		LastChangeNote:        note,
+		Kind:                   kind,
+		ID:                     f.newID("bbbb"),
+		ProviderID:             body.ProviderID,
+		ModelAlias:             body.ModelAlias,
+		UpstreamModel:          body.UpstreamModel,
+		Enabled:                enabled,
+		Priority:               body.Priority,
+		RetryOn429Count:        body.RetryOn429Count,
+		RetryOn429MaxWaitSecs:  body.RetryOn429MaxWaitSecs,
+		BareAlias:              bareAlias,
+		StreamIdleTimeoutSecs:  streamIdle,
+		RequestTimeoutSecs:     requestTimeout,
+		ReasoningEffortSupport: body.ReasoningEffortSupport,
+		Cooldown:               cooldown,
+		LastChangeNote:         note,
 	}
 	f.mappings = append(f.mappings, m)
 	_ = json.NewEncoder(w).Encode(mappingJSON(f, m, false))
@@ -1484,16 +1512,34 @@ func (f *fakeLlmGatewayServer) updateModelMapping(w http.ResponseWriter, r *http
 		BareAlias             *bool   `json:"bare_alias"`
 		StreamIdleTimeoutSecs *int64  `json:"stream_idle_timeout_secs"`
 		RequestTimeoutSecs    *int64  `json:"request_timeout_secs"`
-		ChangeNote            *string `json:"change_note"`
+		// Tri-state: omitted keeps, null clears (back to detection), a bool sets.
+		ReasoningEffortSupport json.RawMessage `json:"reasoning_effort_support"`
+		ChangeNote             *string         `json:"change_note"`
 		fakeLlmCooldownPatch
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeLlmError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if f.predatesReasoningEffort {
+		body.ReasoningEffortSupport = nil
+	}
 	note, ok := fakeLlmChangeNote(w, body.ChangeNote)
 	if !ok {
 		return
+	}
+
+	reasoningSet := len(body.ReasoningEffortSupport) > 0
+	var reasoning *bool
+	if reasoningSet {
+		if err := json.Unmarshal(body.ReasoningEffortSupport, &reasoning); err != nil {
+			writeLlmError(w, http.StatusBadRequest, "reasoning_effort_support must be a boolean or null")
+			return
+		}
+		if reasoning != nil && m.Kind != "model" {
+			writeLlmError(w, http.StatusBadRequest, fakeReasoningEffortRouteError)
+			return
+		}
 	}
 
 	if m.Kind == "model" && ((body.ModelAlias != nil && *body.ModelAlias != m.ModelAlias) ||
@@ -1532,6 +1578,9 @@ func (f *fakeLlmGatewayServer) updateModelMapping(w http.ResponseWriter, r *http
 	}
 	if body.RequestTimeoutSecs != nil {
 		updated.RequestTimeoutSecs = *body.RequestTimeoutSecs
+	}
+	if reasoningSet {
+		updated.ReasoningEffortSupport = reasoning
 	}
 	retryCount := updated.RetryOn429Count
 	retryMaxWait := updated.RetryOn429MaxWaitSecs
