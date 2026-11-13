@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.12.0 (2026-11-13)
 
 FEATURES:
 
@@ -18,7 +18,7 @@ ENHANCEMENTS:
 NOTES:
 
 * resource/`barndoor_dlp_enforcement_policy`: organizations on MCP server policies (every organization since November 2026) can no longer create, update or delete `MCP_SERVER` enforcement policies; the API refuses with a 409. Move MCP protection to the new resources, and remove existing `MCP_SERVER` enforcement policies from state rather than destroying them. `MODEL_PROVIDER` policies are unaffected.
-* resource/`barndoor_llm_routing_policy`: the `context_breakpoints` attribute is removed. The platform no longer routes on request size (a large request is not a harder one, and moving a conversation to another slot part-way through discards its prompt cache); it keeps a request off any slot whose model's context window is too small to hold it. Remove `context_breakpoints` from configurations; existing state that holds it upgrades without error. Requires a platform with the size floor retired; an older platform applies its own default floor to policies this version creates.
+* resource/`barndoor_llm_routing_policy`: the `context_breakpoints` attribute is removed. The platform no longer routes on request size (a large request is not a harder one, and moving a conversation to another slot part-way through discards its prompt cache); it keeps a request off any slot whose model's context window is too small to hold it. Remove `context_breakpoints` from configurations; existing state that holds it upgrades without error. Requires platform v2.57.0 or later; an older platform applies its own default floor to policies this version creates.
 
 ## 0.11.0 (2026-10-28)
 
