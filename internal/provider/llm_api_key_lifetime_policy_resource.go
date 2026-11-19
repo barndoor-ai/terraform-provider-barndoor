@@ -38,9 +38,10 @@ const llmLifetimePolicyIntro = "The policy limits how long API keys that users c
 	"created or rotated.\n\n" +
 	"Which policy applies to a user: their own `barndoor_llm_api_key_lifetime_user_override` if they " +
 	"have one; otherwise the strictest of their groups' `barndoor_llm_api_key_lifetime_group_override`s " +
-	"(the shortest maximum, and an expiry required if any requires one); otherwise the organization " +
-	"default (`barndoor_llm_api_key_lifetime_policy`). An override replaces what it overrides, so it can " +
-	"be longer or shorter, and one with no limits set exempts its group or user."
+	"and their IdP roles' `barndoor_llm_api_key_lifetime_role_override`s, taken together (the shortest " +
+	"maximum, and an expiry required if any requires one); otherwise the organization default " +
+	"(`barndoor_llm_api_key_lifetime_policy`). An override replaces what it overrides, so it can be " +
+	"longer or shorter, and one with no limits set exempts its group, role or user."
 
 // llmLifetimeLimitAttributes are the three limit settings every lifetime
 // policy resource carries.
@@ -120,11 +121,20 @@ type llmLifetimeUserOverrideRow struct {
 	llmLifetimeLimitWire
 }
 
+// llmLifetimeRoleOverrideRow is a stored role override.
+type llmLifetimeRoleOverrideRow struct {
+	ID       string `json:"id"`
+	RoleName string `json:"role_name"`
+	llmLifetimeLimitWire
+}
+
 // llmLifetimePolicies is the GET (and PUT default) response. users is absent
-// from platforms that predate user overrides.
+// from platforms that predate user overrides, and roles from platforms that
+// predate role overrides.
 type llmLifetimePolicies struct {
 	Default *llmLifetimePolicyRow        `json:"default"`
 	Groups  []llmLifetimePolicyRow       `json:"groups"`
+	Roles   []llmLifetimeRoleOverrideRow `json:"roles"`
 	Users   []llmLifetimeUserOverrideRow `json:"users"`
 }
 

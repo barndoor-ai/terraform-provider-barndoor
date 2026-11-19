@@ -149,6 +149,7 @@ func (p *BarndoorProvider) Resources(ctx context.Context) []func() resource.Reso
 		NewIdpResource,
 		NewLlmAPIKeyLifetimeGroupOverrideResource,
 		NewLlmAPIKeyLifetimePolicyResource,
+		NewLlmAPIKeyLifetimeRoleOverrideResource,
 		NewLlmAPIKeyLifetimeUserOverrideResource,
 		NewLlmAPIKeyResource,
 		NewLlmConnectionResource,

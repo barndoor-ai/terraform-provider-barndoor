@@ -346,10 +346,11 @@ type fakeLlmGatewayServer struct {
 	defaultModelAccess   string
 	requireRoutingPolicy bool
 
-	// lifetimeDefault, lifetimeGroups and lifetimeUsers back the API key
+	// lifetimeDefault, lifetimeGroups, lifetimeRoles and lifetimeUsers back the API key
 	// lifetime policy family; see llm_gateway_fake_lifetime_test.go.
 	lifetimeDefault *fakeLlmLifetimeRow
 	lifetimeGroups  []*fakeLlmLifetimeRow
+	lifetimeRoles   []*fakeLlmLifetimeRow
 	lifetimeUsers   []*fakeLlmLifetimeRow
 	// apiKeys backs the API key family; see llm_gateway_fake_api_keys_test.go.
 	apiKeys []*fakeLlmAPIKey

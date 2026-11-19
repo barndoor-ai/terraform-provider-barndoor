@@ -23,13 +23,13 @@ import (
 	"github.com/barndoor-ai/terraform-provider-barndoor/internal/client"
 )
 
-// llmLifetimeOverrideKind is what differs between the group and user
+// llmLifetimeOverrideKind is what differs between the group, role and user
 // override resources: the subject they override for, and its API path.
 type llmLifetimeOverrideKind struct {
 	typeSuffix  string // resource type name after the provider prefix
-	segment     string // API path segment: "groups" or "users"
-	subjectAttr string // schema attribute and wire field: "group_name" or "user_id"
-	noun        string // "group" or "user", for messages
+	segment     string // API path segment: "groups", "roles" or "users"
+	subjectAttr string // schema attribute and wire field: "group_name", "role_name" or "user_id"
+	noun        string // "group", "role" or "user", for messages
 	subjectDoc  string
 	description string
 }
@@ -44,6 +44,19 @@ var (
 			"group and answers 409 on a second. Changing it forces a new override.",
 		description: "Manages an LLM Gateway API key lifetime **group override**: the policy for members " +
 			"of one IdP group, replacing the organization default for them.",
+	}
+	llmLifetimeRoleOverride = llmLifetimeOverrideKind{
+		typeSuffix:  "_llm_api_key_lifetime_role_override",
+		segment:     "roles",
+		subjectAttr: "role_name",
+		noun:        "role",
+		subjectDoc: "IdP role whose holders this override applies to: a role synced from the identity " +
+			"provider, the same kind Model Access matches, not the platform admin role. The platform allows " +
+			"one override per role and answers 409 on a second. Changing it forces a new override.",
+		description: "Manages an LLM Gateway API key lifetime **role override**: the policy for users " +
+			"with one IdP role, replacing the organization default for them. Role overrides count " +
+			"alongside group overrides. Requires a platform that serves role overrides (API version " +
+			"2.39.0 or later).",
 	}
 	llmLifetimeUserOverride = llmLifetimeOverrideKind{
 		typeSuffix:  "_llm_api_key_lifetime_user_override",
@@ -76,6 +89,12 @@ var (
 // barndoor_llm_api_key_lifetime_group_override resource.
 func NewLlmAPIKeyLifetimeGroupOverrideResource() resource.Resource {
 	return &llmAPIKeyLifetimeOverrideResource{kind: llmLifetimeGroupOverride}
+}
+
+// NewLlmAPIKeyLifetimeRoleOverrideResource returns a new
+// barndoor_llm_api_key_lifetime_role_override resource.
+func NewLlmAPIKeyLifetimeRoleOverrideResource() resource.Resource {
+	return &llmAPIKeyLifetimeOverrideResource{kind: llmLifetimeRoleOverride}
 }
 
 // NewLlmAPIKeyLifetimeUserOverrideResource returns a new
@@ -236,20 +255,28 @@ func (r *llmAPIKeyLifetimeOverrideResource) ImportState(ctx context.Context, req
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
 }
 
-// llmLifetimeOverrideRow is a group or user override as this resource sees
-// it: whichever subject field applies is set.
+// llmLifetimeOverrideRow is a group, role or user override as this resource
+// sees it: whichever subject field applies is set.
 type llmLifetimeOverrideRow struct {
 	ID        string  `json:"id"`
 	GroupName *string `json:"group_name"`
+	RoleName  *string `json:"role_name"`
 	UserID    *string `json:"user_id"`
 	llmLifetimeLimitWire
 }
 
 func (r *llmAPIKeyLifetimeOverrideResource) rows(p *llmLifetimePolicies) []llmLifetimeOverrideRow {
 	var out []llmLifetimeOverrideRow
-	if r.kind.segment == "groups" {
+	switch r.kind.segment {
+	case "groups":
 		for _, g := range p.Groups {
 			out = append(out, llmLifetimeOverrideRow{ID: g.ID, GroupName: g.GroupName, llmLifetimeLimitWire: g.llmLifetimeLimitWire})
+		}
+		return out
+	case "roles":
+		for _, ro := range p.Roles {
+			roleName := ro.RoleName
+			out = append(out, llmLifetimeOverrideRow{ID: ro.ID, RoleName: &roleName, llmLifetimeLimitWire: ro.llmLifetimeLimitWire})
 		}
 		return out
 	}
@@ -261,13 +288,18 @@ func (r *llmAPIKeyLifetimeOverrideResource) rows(p *llmLifetimePolicies) []llmLi
 }
 
 // setState records the server's view. The subject keeps the configured
-// spelling while it still names the same group or user, so a difference the
-// platform normalizes away doesn't plan a replacement: it trims a group name,
-// and a UUID may come back in a different case. Group names are otherwise
-// case-sensitive.
+// spelling while it still names the same group, role or user, so a difference
+// the platform normalizes away doesn't plan a replacement: it trims group and
+// role names, and a UUID may come back in a different case. Group and role
+// names are otherwise case-sensitive.
 func (r *llmAPIKeyLifetimeOverrideResource) setState(ctx context.Context, state *tfsdk.State, row *llmLifetimeOverrideRow, prior types.String, diags *diag.Diagnostics) {
-	server := row.GroupName
-	if r.kind.subjectAttr == "user_id" {
+	var server *string
+	switch r.kind.subjectAttr {
+	case "group_name":
+		server = row.GroupName
+	case "role_name":
+		server = row.RoleName
+	case "user_id":
 		server = row.UserID
 	}
 	subject := prior

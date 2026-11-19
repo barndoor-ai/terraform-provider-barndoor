@@ -17,16 +17,18 @@ import (
 // Mirrors `routes/admin/api_key_lifetime_policies.rs` and
 // `db/api_key_lifetime_policy.rs`:
 //
-//   - GET returns {default, groups, users}; PUT /default answers the same
+//   - GET returns {default, groups, roles, users}; PUT /default answers the same
 //     shape. Writing no limit (no max, require_expiry false) to the default
 //     removes its row.
 //   - LifetimeLimitInput::validate: max_lifetime_days in 1..=3650, and
 //     fixed_lifetime needs a maximum (400 each).
 //   - POST /groups trims group_name (400 when empty) and validates; one
 //     override per group (409). POST /users validates, then requires the user
-//     to belong to the org (400); one override per user (409).
-//   - PUT and DELETE {groups,users}/{id} are org-scoped and 404 on an unknown
-//     id (a group id never matches the default row).
+//     to belong to the org (400); one override per user (409). POST /roles
+//     trims role_name (400 when empty) and validates; one override per role
+//     (409).
+//   - PUT and DELETE {groups,roles,users}/{id} are org-scoped and 404 on an
+//     unknown id (a group id never matches the default row).
 
 // fakeLlmOutsiderUserID is a user the fake treats as outside the org.
 const fakeLlmOutsiderUserID = "99999999-9999-9999-9999-999999999999"
@@ -34,6 +36,7 @@ const fakeLlmOutsiderUserID = "99999999-9999-9999-9999-999999999999"
 type fakeLlmLifetimeRow struct {
 	ID              string
 	GroupName       *string // nil = the org default (in lifetimeDefault)
+	RoleName        string  // set on role overrides
 	UserID          string  // set on user overrides
 	MaxLifetimeDays *int32
 	RequireExpiry   bool
@@ -73,6 +76,25 @@ func (row *fakeLlmLifetimeRow) policyJSON() map[string]any {
 	}
 }
 
+func (row *fakeLlmLifetimeRow) roleJSON() map[string]any {
+	return map[string]any{
+		"id": row.ID, "role_name": row.RoleName,
+		"max_lifetime_days": row.MaxLifetimeDays, "require_expiry": row.RequireExpiry,
+		"fixed_lifetime": row.FixedLifetime, "updated_at": fakeLlmTime, "updated_by_user_id": nil,
+	}
+}
+
+// overrideJSON renders a group, role or user override for its segment.
+func (row *fakeLlmLifetimeRow) overrideJSON(seg string) map[string]any {
+	switch seg {
+	case "roles":
+		return row.roleJSON()
+	case "users":
+		return row.userJSON()
+	}
+	return row.policyJSON()
+}
+
 func (row *fakeLlmLifetimeRow) userJSON() map[string]any {
 	return map[string]any{
 		"id": row.ID, "user_id": row.UserID,
@@ -91,11 +113,15 @@ func (f *fakeLlmGatewayServer) lifetimePoliciesJSON() map[string]any {
 	for _, g := range f.lifetimeGroups {
 		groups = append(groups, g.policyJSON())
 	}
+	roles := []any{}
+	for _, ro := range f.lifetimeRoles {
+		roles = append(roles, ro.roleJSON())
+	}
 	users := []any{}
 	for _, u := range f.lifetimeUsers {
 		users = append(users, u.userJSON())
 	}
-	return map[string]any{"default": def, "groups": groups, "users": users}
+	return map[string]any{"default": def, "groups": groups, "roles": roles, "users": users}
 }
 
 func (f *fakeLlmGatewayServer) handleAPIKeyLifetimePolicies(w http.ResponseWriter, r *http.Request) {
@@ -104,6 +130,7 @@ func (f *fakeLlmGatewayServer) handleAPIKeyLifetimePolicies(w http.ResponseWrite
 
 	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/llm-gateway/admin/api-key-lifetime-policies"), "/")
 	seg, id, _ := strings.Cut(rest, "/")
+	isOverride := seg == "groups" || seg == "roles" || seg == "users"
 
 	switch {
 	case rest == "" && r.Method == http.MethodGet:
@@ -128,23 +155,27 @@ func (f *fakeLlmGatewayServer) handleAPIKeyLifetimePolicies(w http.ResponseWrite
 		}
 		_ = json.NewEncoder(w).Encode(f.lifetimePoliciesJSON())
 
-	case (seg == "groups" || seg == "users") && id == "" && r.Method == http.MethodPost:
+	case isOverride && id == "" && r.Method == http.MethodPost:
 		var body struct {
 			fakeLlmLifetimeInput
 			GroupName *string `json:"group_name"`
+			RoleName  *string `json:"role_name"`
 			UserID    *string `json:"user_id"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "Failed to parse the request body as JSON: "+err.Error(), http.StatusUnprocessableEntity)
 			return
 		}
-		if seg == "groups" {
+		switch seg {
+		case "groups":
 			f.createLifetimeGroup(w, body.GroupName, body.fakeLlmLifetimeInput)
-		} else {
+		case "roles":
+			f.createLifetimeRole(w, body.RoleName, body.fakeLlmLifetimeInput)
+		default:
 			f.createLifetimeUser(w, body.UserID, body.fakeLlmLifetimeInput)
 		}
 
-	case (seg == "groups" || seg == "users") && id != "" && r.Method == http.MethodPut:
+	case isOverride && id != "" && r.Method == http.MethodPut:
 		row := f.findLifetimeOverride(seg, id)
 		var in fakeLlmLifetimeInput
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
@@ -159,20 +190,19 @@ func (f *fakeLlmGatewayServer) handleAPIKeyLifetimePolicies(w http.ResponseWrite
 			return
 		}
 		row.apply(in)
-		if seg == "groups" {
-			_ = json.NewEncoder(w).Encode(row.policyJSON())
-		} else {
-			_ = json.NewEncoder(w).Encode(row.userJSON())
-		}
+		_ = json.NewEncoder(w).Encode(row.overrideJSON(seg))
 
-	case (seg == "groups" || seg == "users") && id != "" && r.Method == http.MethodDelete:
+	case isOverride && id != "" && r.Method == http.MethodDelete:
 		if f.findLifetimeOverride(seg, id) == nil {
 			writeLlmError(w, http.StatusNotFound, fmt.Sprintf("key lifetime override %s not found", id))
 			return
 		}
-		if seg == "groups" {
+		switch seg {
+		case "groups":
 			f.lifetimeGroups = removeLifetimeRow(f.lifetimeGroups, id)
-		} else {
+		case "roles":
+			f.lifetimeRoles = removeLifetimeRow(f.lifetimeRoles, id)
+		default:
 			f.lifetimeUsers = removeLifetimeRow(f.lifetimeUsers, id)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]bool{"deleted": true})
@@ -210,6 +240,34 @@ func (f *fakeLlmGatewayServer) createLifetimeGroup(w http.ResponseWriter, name *
 	_ = json.NewEncoder(w).Encode(row.policyJSON())
 }
 
+// createLifetimeRole mirrors create_role_lifetime_policy. Callers hold f.mu.
+func (f *fakeLlmGatewayServer) createLifetimeRole(w http.ResponseWriter, name *string, in fakeLlmLifetimeInput) {
+	if name == nil {
+		http.Error(w, "Failed to deserialize the JSON body into the target type: missing field `role_name`",
+			http.StatusUnprocessableEntity)
+		return
+	}
+	role := strings.TrimSpace(*name)
+	if role == "" {
+		writeLlmError(w, http.StatusBadRequest, "role_name is required.")
+		return
+	}
+	if !in.validate(w) {
+		return
+	}
+	for _, ro := range f.lifetimeRoles {
+		if ro.RoleName == role {
+			writeLlmError(w, http.StatusConflict,
+				fmt.Sprintf("The %s role already has a key lifetime override. Edit it instead.", role))
+			return
+		}
+	}
+	row := &fakeLlmLifetimeRow{ID: f.newID("4d4d"), RoleName: role}
+	row.apply(in)
+	f.lifetimeRoles = append(f.lifetimeRoles, row)
+	_ = json.NewEncoder(w).Encode(row.roleJSON())
+}
+
 // createLifetimeUser mirrors create_user_lifetime_policy. Callers hold f.mu.
 func (f *fakeLlmGatewayServer) createLifetimeUser(w http.ResponseWriter, userID *string, in fakeLlmLifetimeInput) {
 	if userID == nil {
@@ -238,10 +296,13 @@ func (f *fakeLlmGatewayServer) createLifetimeUser(w http.ResponseWriter, userID 
 	_ = json.NewEncoder(w).Encode(row.userJSON())
 }
 
-// findLifetimeOverride finds a group or user override by id. Callers hold f.mu.
+// findLifetimeOverride finds a group, role or user override by id. Callers hold f.mu.
 func (f *fakeLlmGatewayServer) findLifetimeOverride(seg, id string) *fakeLlmLifetimeRow {
 	rows := f.lifetimeGroups
-	if seg == "users" {
+	switch seg {
+	case "roles":
+		rows = f.lifetimeRoles
+	case "users":
 		rows = f.lifetimeUsers
 	}
 	for _, row := range rows {
@@ -263,7 +324,7 @@ func removeLifetimeRow(rows []*fakeLlmLifetimeRow, id string) []*fakeLlmLifetime
 }
 
 // checkLlmLifetimePoliciesCleared is the CheckDestroy for lifetime policy
-// tests: no default, group or user override may survive a destroy.
+// tests: no default, group, role or user override may survive a destroy.
 func checkLlmLifetimePoliciesCleared(fake *fakeLlmGatewayServer) func(*terraform.State) error {
 	return func(*terraform.State) error {
 		fake.mu.Lock()
@@ -271,7 +332,7 @@ func checkLlmLifetimePoliciesCleared(fake *fakeLlmGatewayServer) func(*terraform
 		if fake.lifetimeDefault != nil {
 			return fmt.Errorf("default lifetime policy still set after destroy")
 		}
-		if n := len(fake.lifetimeGroups) + len(fake.lifetimeUsers); n > 0 {
+		if n := len(fake.lifetimeGroups) + len(fake.lifetimeRoles) + len(fake.lifetimeUsers); n > 0 {
 			return fmt.Errorf("%d lifetime override(s) still present after destroy", n)
 		}
 		return nil

@@ -25,6 +25,7 @@ func TestLlmAPIKeyLifetimeResources_MetadataAndSchema(t *testing.T) {
 	}{
 		{NewLlmAPIKeyLifetimePolicyResource, "barndoor_llm_api_key_lifetime_policy", ""},
 		{NewLlmAPIKeyLifetimeGroupOverrideResource, "barndoor_llm_api_key_lifetime_group_override", "group_name"},
+		{NewLlmAPIKeyLifetimeRoleOverrideResource, "barndoor_llm_api_key_lifetime_role_override", "role_name"},
 		{NewLlmAPIKeyLifetimeUserOverrideResource, "barndoor_llm_api_key_lifetime_user_override", "user_id"},
 	}
 	for _, tc := range cases {
@@ -337,6 +338,228 @@ resource "barndoor_llm_api_key_lifetime_group_override" "eng" {
 				PreConfig: func() {
 					fake.mu.Lock()
 					fake.lifetimeGroups = nil
+					fake.mu.Unlock()
+				},
+				Config: config,
+				Check: func(s *terraform.State) error {
+					if id := s.RootModule().Resources[resourceName].Primary.ID; id == firstID {
+						return fmt.Errorf("expected a new override after an out-of-band delete, still %s", id)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// --- role overrides -----------------------------------------------------------------
+
+func TestLlmAPIKeyLifetimeRoleOverrideResource_lifecycle(t *testing.T) {
+	fake := setupLlmGatewayTest(t)
+	const resourceName = "barndoor_llm_api_key_lifetime_role_override.intern"
+
+	fixedConfig := `
+resource "barndoor_llm_api_key_lifetime_role_override" "intern" {
+  role_name         = "intern"
+  max_lifetime_days = 7
+  fixed_lifetime    = true
+}
+`
+	exemptConfig := `
+resource "barndoor_llm_api_key_lifetime_role_override" "intern" {
+  role_name = "intern"
+}
+`
+	renamedConfig := `
+resource "barndoor_llm_api_key_lifetime_role_override" "intern" {
+  role_name = "contractor"
+}
+`
+
+	var firstID string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkLlmLifetimePoliciesCleared(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: fixedConfig,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet(resourceName, "id"),
+					resource.TestCheckResourceAttr(resourceName, "role_name", "intern"),
+					resource.TestCheckResourceAttr(resourceName, "max_lifetime_days", "7"),
+					// Stored as sent: the platform reads a maximum as requiring
+					// an expiry when it resolves the limit, not in the row.
+					resource.TestCheckResourceAttr(resourceName, "require_expiry", "false"),
+					resource.TestCheckResourceAttr(resourceName, "fixed_lifetime", "true"),
+					captureID(resourceName, &firstID),
+					func(*terraform.State) error {
+						fake.mu.Lock()
+						defer fake.mu.Unlock()
+						if len(fake.lifetimeRoles) != 1 || len(fake.lifetimeGroups) != 0 || len(fake.lifetimeUsers) != 0 {
+							return fmt.Errorf("want exactly one role override and nothing else, have %d role, %d group, %d user",
+								len(fake.lifetimeRoles), len(fake.lifetimeGroups), len(fake.lifetimeUsers))
+						}
+						row := fake.lifetimeRoles[0]
+						if row.RoleName != "intern" || row.MaxLifetimeDays == nil || *row.MaxLifetimeDays != 7 || !row.FixedLifetime {
+							return fmt.Errorf("stored role override = %+v", *row)
+						}
+						return nil
+					},
+				),
+			},
+			{Config: fixedConfig, PlanOnly: true},
+			{
+				// Loosened to an exemption in place.
+				Config: exemptConfig,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(resourceName, plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckNoResourceAttr(resourceName, "max_lifetime_days"),
+					resource.TestCheckResourceAttr(resourceName, "require_expiry", "false"),
+					resource.TestCheckResourceAttr(resourceName, "fixed_lifetime", "false"),
+					checkIDUnchanged(resourceName, &firstID),
+				),
+			},
+			{
+				ResourceName:      resourceName,
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			{
+				// A different role is a different override.
+				Config: renamedConfig,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction(resourceName, plancheck.ResourceActionDestroyBeforeCreate),
+					},
+				},
+				Check: func(*terraform.State) error {
+					fake.mu.Lock()
+					defer fake.mu.Unlock()
+					if len(fake.lifetimeRoles) != 1 || fake.lifetimeRoles[0].RoleName != "contractor" {
+						return fmt.Errorf("want only the contractor override, have %d override(s)", len(fake.lifetimeRoles))
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// A group and a role may share a name; each resource must read its own row,
+// not the other kind's, or one of them would plan a change on every run.
+func TestLlmAPIKeyLifetimeRoleOverrideResource_groupWithTheSameNameIsSeparate(t *testing.T) {
+	fake := setupLlmGatewayTest(t)
+	config := `
+resource "barndoor_llm_api_key_lifetime_group_override" "eng" {
+  group_name        = "eng"
+  max_lifetime_days = 60
+}
+
+resource "barndoor_llm_api_key_lifetime_role_override" "eng" {
+  role_name         = "eng"
+  max_lifetime_days = 7
+}
+`
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkLlmLifetimePoliciesCleared(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("barndoor_llm_api_key_lifetime_group_override.eng", "max_lifetime_days", "60"),
+					resource.TestCheckResourceAttr("barndoor_llm_api_key_lifetime_role_override.eng", "max_lifetime_days", "7"),
+				),
+			},
+			{Config: config, PlanOnly: true},
+		},
+	})
+}
+
+// The platform trims the role name; whitespace in configuration must not plan
+// a replacement on every run.
+func TestLlmAPIKeyLifetimeRoleOverrideResource_trimmedNameIsStable(t *testing.T) {
+	setupLlmGatewayTest(t)
+	config := `
+resource "barndoor_llm_api_key_lifetime_role_override" "admin" {
+  role_name = " admin "
+}
+`
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{Config: config},
+			{Config: config, PlanOnly: true},
+		},
+	})
+}
+
+func TestLlmAPIKeyLifetimeRoleOverrideResource_rejections(t *testing.T) {
+	setupLlmGatewayTest(t)
+	cases := []struct {
+		name, config string
+		want         *regexp.Regexp
+		planOnly     bool
+	}{
+		{
+			name: "fixed without a maximum",
+			config: `resource "barndoor_llm_api_key_lifetime_role_override" "x" {
+  role_name      = "viewer"
+  fixed_lifetime = true
+}`,
+			want:     regexp.MustCompile(`(?s)fixed_lifetime.*max_lifetime_days`),
+			planOnly: true,
+		},
+		{
+			name: "duplicate",
+			config: `
+resource "barndoor_llm_api_key_lifetime_role_override" "a" {
+  role_name         = "intern"
+  max_lifetime_days = 7
+}
+resource "barndoor_llm_api_key_lifetime_role_override" "b" {
+  role_name  = "intern"
+  depends_on = [barndoor_llm_api_key_lifetime_role_override.a]
+}`,
+			want: regexp.MustCompile(`The intern role already has a key lifetime override`),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+				Steps: []resource.TestStep{{
+					Config:      tc.config,
+					PlanOnly:    tc.planOnly,
+					ExpectError: tc.want,
+				}},
+			})
+		})
+	}
+}
+
+func TestLlmAPIKeyLifetimeRoleOverrideResource_outOfBandDeletePlansRecreate(t *testing.T) {
+	fake := setupLlmGatewayTest(t)
+	const resourceName = "barndoor_llm_api_key_lifetime_role_override.admin"
+	config := `
+resource "barndoor_llm_api_key_lifetime_role_override" "admin" {
+  role_name         = "admin"
+  max_lifetime_days = 365
+}
+`
+	var firstID string
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{Config: config, Check: captureID(resourceName, &firstID)},
+			{
+				PreConfig: func() {
+					fake.mu.Lock()
+					fake.lifetimeRoles = nil
 					fake.mu.Unlock()
 				},
 				Config: config,
