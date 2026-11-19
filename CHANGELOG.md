@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+FEATURES:
+
+* **New Resource:** `barndoor_llm_api_key_lifetime_role_override` overrides the API key lifetime default for users with one IdP role (a role synced from the identity provider, the same kind Model Access matches, not the platform admin role). Role overrides count alongside group overrides: a user covered by several gets the strictest, and a user override still wins over both. An override with no limits exempts the role. Changing `role_name` forces a new override; import is by id. Rejects `fixed_lifetime` without `max_lifetime_days` at plan time. Requires a platform that serves role overrides (API version 2.39.0 or later).
+
 ## 0.12.0 (2026-11-13)
 
 FEATURES:

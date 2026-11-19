@@ -5,7 +5,7 @@ subcategory: ""
 description: |-
   Manages an LLM Gateway API key lifetime user override: the policy for one user. It wins over that user's group overrides and the organization default, so it can grant an exception in either direction.
   The policy limits how long API keys that users create for themselves (self-serve, from their own settings) may live. Keys created by admins are exempt. Existing keys keep their expiry: the policy is checked when a key is created or rotated.
-  Which policy applies to a user: their own barndoor_llm_api_key_lifetime_user_override if they have one; otherwise the strictest of their groups' barndoor_llm_api_key_lifetime_group_overrides (the shortest maximum, and an expiry required if any requires one); otherwise the organization default (barndoor_llm_api_key_lifetime_policy). An override replaces what it overrides, so it can be longer or shorter, and one with no limits set exempts its group or user.
+  Which policy applies to a user: their own barndoor_llm_api_key_lifetime_user_override if they have one; otherwise the strictest of their groups' barndoor_llm_api_key_lifetime_group_overrides and their IdP roles' barndoor_llm_api_key_lifetime_role_overrides, taken together (the shortest maximum, and an expiry required if any requires one); otherwise the organization default (barndoor_llm_api_key_lifetime_policy). An override replaces what it overrides, so it can be longer or shorter, and one with no limits set exempts its group, role or user.
 ---
 
 # barndoor_llm_api_key_lifetime_user_override (Resource)
@@ -14,7 +14,7 @@ Manages an LLM Gateway API key lifetime **user override**: the policy for one us
 
 The policy limits how long API keys that users create for themselves (self-serve, from their own settings) may live. Keys created by admins are exempt. Existing keys keep their expiry: the policy is checked when a key is created or rotated.
 
-Which policy applies to a user: their own `barndoor_llm_api_key_lifetime_user_override` if they have one; otherwise the strictest of their groups' `barndoor_llm_api_key_lifetime_group_override`s (the shortest maximum, and an expiry required if any requires one); otherwise the organization default (`barndoor_llm_api_key_lifetime_policy`). An override replaces what it overrides, so it can be longer or shorter, and one with no limits set exempts its group or user.
+Which policy applies to a user: their own `barndoor_llm_api_key_lifetime_user_override` if they have one; otherwise the strictest of their groups' `barndoor_llm_api_key_lifetime_group_override`s and their IdP roles' `barndoor_llm_api_key_lifetime_role_override`s, taken together (the shortest maximum, and an expiry required if any requires one); otherwise the organization default (`barndoor_llm_api_key_lifetime_policy`). An override replaces what it overrides, so it can be longer or shorter, and one with no limits set exempts its group, role or user.
 
 ## Example Usage
 
