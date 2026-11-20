@@ -52,8 +52,10 @@ resource "barndoor_dlp_mcp_baseline_policy" "this" {
 - `created_at` (String) When the Baseline policy was first saved (RFC 3339).
 - `created_by` (String) Subject that first saved the Baseline policy (empty when the platform could not attribute it).
 - `id` (String) UUID of the Baseline policy, assigned by the API on its first save.
+- `status` (String) The Baseline policy's lifecycle state. Read-only in this provider version.
 - `updated_at` (String) When the Baseline policy was last updated (RFC 3339).
 - `updated_by` (String) Subject that last updated the Baseline policy.
+- `version` (Number) The Baseline policy's revision number; null until its first recorded change.
 
 <a id="nestedatt--rules"></a>
 ### Nested Schema for `rules`
@@ -68,7 +70,7 @@ Optional:
 
 - `agent_scope` (Attributes) AI agents the rule applies to. Omit to apply to every agent, including agents created later. (see [below for nested schema](#nestedatt--rules--agent_scope))
 - `dry_run` (Boolean) Whether the rule only observes (records findings without acting). Defaults to `false`.
-- `label` (String) Optional display label for the rule, up to 120 characters.
+- `label` (String) Optional display label for the rule, up to 120 characters, with no leading or trailing whitespace. Omit it for no label.
 - `mask_format` (Attributes) Partial-redaction shape: keep a prefix or suffix of the matched value readable and mask the rest. Only valid with `action = "POLICY_ACTION_MASK"`; omit it to mask the whole value. (see [below for nested schema](#nestedatt--rules--mask_format))
 - `principal_scope` (Attributes) Users the rule applies to, by IdP group or role. Omit to apply to every user. A user matches the list when any of their groups or roles is in it. (see [below for nested schema](#nestedatt--rules--principal_scope))
 

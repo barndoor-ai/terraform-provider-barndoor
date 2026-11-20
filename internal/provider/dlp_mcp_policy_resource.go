@@ -51,6 +51,8 @@ type dlpMcpPolicyResourceModel struct {
 	Name         types.String      `tfsdk:"name"`
 	McpServerIDs types.Set         `tfsdk:"mcp_server_ids"`
 	Rules        []dlpMcpRuleModel `tfsdk:"rules"`
+	Status       types.String      `tfsdk:"status"`
+	Version      types.Int64       `tfsdk:"version"`
 	CreatedBy    types.String      `tfsdk:"created_by"`
 	UpdatedBy    types.String      `tfsdk:"updated_by"`
 	CreatedAt    types.String      `tfsdk:"created_at"`
@@ -66,8 +68,8 @@ func (r *dlpMcpPolicyResource) Schema(_ context.Context, _ resource.SchemaReques
 		MarkdownDescription: "Manages a Data Protection (DLP) MCP server policy: the rules that protect tool " +
 			"traffic to a set of MCP servers.\n\n" +
 			"Each MCP server belongs to at most one policy. Servers that no policy claims follow the " +
-			"Baseline policy (`barndoor_dlp_mcp_baseline_policy`), and destroying a policy hands its servers " +
-			"back to the Baseline policy.\n\n" +
+			"Baseline policy (`barndoor_dlp_mcp_baseline_policy`). Destroying a policy archives it: its " +
+			"servers go back to the Baseline policy and its name is free to use again.\n\n" +
 			"The organization must be on MCP server policies. While it still manages MCP traffic through " +
 			"`barndoor_dlp_enforcement_policy`, this API is read-only and writes fail with a 409.",
 		Attributes: map[string]schema.Attribute{
@@ -103,6 +105,18 @@ func (r *dlpMcpPolicyResource) Schema(_ context.Context, _ resource.SchemaReques
 			},
 			"rules": dlpMcpRulesAttribute("Rules applied to the policy's servers, in order. Use `[]` for a " +
 				"policy with no rules, which exempts its servers from the Baseline policy. At most 50."),
+			"status": schema.StringAttribute{
+				MarkdownDescription: "The policy's lifecycle state (`ACTIVE`, `DRAFT` or `INACTIVE`). " +
+					"Read-only in this provider version: only an `ACTIVE` policy governs traffic.",
+				Computed: true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"version": schema.Int64Attribute{
+				MarkdownDescription: "The policy's revision number; null until its first recorded change.",
+				Computed:            true,
+			},
 			"created_by": schema.StringAttribute{
 				MarkdownDescription: "Subject that created the policy (empty when the platform could not " +
 					"attribute it).",
@@ -181,6 +195,7 @@ func (r *dlpMcpPolicyResource) Create(ctx context.Context, req resource.CreateRe
 		resp.Diagnostics.AddError("Failed to map the Data Protection API response", err.Error())
 		return
 	}
+	warnDlpMcpPolicyInactive(&resp.Diagnostics, &policy)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -207,6 +222,13 @@ func (r *dlpMcpPolicyResource) Read(ctx context.Context, req resource.ReadReques
 		addDlpMcpPolicyAPIError(&resp.Diagnostics, "read the MCP policy", err)
 		return
 	}
+	if policy.Status == dlpMcpStatusArchived {
+		// Archived outside Terraform (an organization on policy lifecycle
+		// reads it back instead of returning 404); drop it so Terraform
+		// plans a recreate.
+		resp.State.RemoveResource(ctx)
+		return
+	}
 	if policy.IsBaseline {
 		resp.Diagnostics.AddError(
 			"This is the Baseline policy",
@@ -222,6 +244,7 @@ func (r *dlpMcpPolicyResource) Read(ctx context.Context, req resource.ReadReques
 		resp.Diagnostics.AddError("Failed to map the Data Protection API response", err.Error())
 		return
 	}
+	warnDlpMcpPolicyInactive(&resp.Diagnostics, &policy)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
 
@@ -247,7 +270,15 @@ func (r *dlpMcpPolicyResource) Update(ctx context.Context, req resource.UpdateRe
 	policyPath := dlpAPIPrefix + "/mcp-policies/" + plan.ID.ValueString()
 	var stored dlpMcpPolicyResponse
 	if err := doJSON(ctx, r.client, http.MethodGet, policyPath, nil, &stored); err != nil {
+		if isNotFound(err) {
+			addDlpMcpPolicyGoneDiagnostic(&resp.Diagnostics)
+			return
+		}
 		addDlpMcpPolicyAPIError(&resp.Diagnostics, "read the MCP policy before updating it", err)
+		return
+	}
+	if stored.Status == dlpMcpStatusArchived {
+		addDlpMcpPolicyGoneDiagnostic(&resp.Diagnostics)
 		return
 	}
 	assignDlpMcpRuleIDs(body.Rules, stored.Rules)
@@ -263,6 +294,7 @@ func (r *dlpMcpPolicyResource) Update(ctx context.Context, req resource.UpdateRe
 		resp.Diagnostics.AddError("Failed to map the Data Protection API response", err.Error())
 		return
 	}
+	warnDlpMcpPolicyInactive(&resp.Diagnostics, &policy)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
 
@@ -341,11 +373,34 @@ func applyDlpMcpPolicyResponse(ctx context.Context, policy *dlpMcpPolicyResponse
 		Name:         types.StringValue(policy.Name),
 		McpServerIDs: servers,
 		Rules:        rules,
+		Status:       types.StringValue(policy.Status),
+		Version:      types.Int64PointerValue(policy.Version),
 		CreatedBy:    types.StringValue(policy.CreatedBy),
 		UpdatedBy:    types.StringValue(policy.UpdatedBy),
 		CreatedAt:    types.StringValue(policy.CreatedAt),
 		UpdatedAt:    types.StringValue(policy.UpdatedAt),
 	}, nil
+}
+
+// warnDlpMcpPolicyInactive warns about a policy that exists but, because it
+// is not ACTIVE, does not govern traffic.
+func warnDlpMcpPolicyInactive(diags *diag.Diagnostics, policy *dlpMcpPolicyResponse) {
+	if policy.Status == "DRAFT" || policy.Status == "INACTIVE" {
+		diags.AddWarning(
+			"MCP policy does not govern traffic",
+			fmt.Sprintf("MCP policy %q has status %s, so it does not currently govern traffic. This provider "+
+				"version can't change a policy's status.", policy.Name, policy.Status),
+		)
+	}
+}
+
+// addDlpMcpPolicyGoneDiagnostic reports a policy that was archived or deleted
+// between the last refresh and an update.
+func addDlpMcpPolicyGoneDiagnostic(diags *diag.Diagnostics) {
+	diags.AddError(
+		"MCP policy no longer exists",
+		"The policy was archived or deleted outside Terraform. Run `terraform plan` again to recreate it.",
+	)
 }
 
 // dlpMcpNotBaselineName rejects the name the API reserves for the Baseline

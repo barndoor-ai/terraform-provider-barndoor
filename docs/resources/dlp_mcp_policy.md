@@ -4,7 +4,7 @@ page_title: "barndoor_dlp_mcp_policy Resource - Barndoor"
 subcategory: ""
 description: |-
   Manages a Data Protection (DLP) MCP server policy: the rules that protect tool traffic to a set of MCP servers.
-  Each MCP server belongs to at most one policy. Servers that no policy claims follow the Baseline policy (barndoor_dlp_mcp_baseline_policy), and destroying a policy hands its servers back to the Baseline policy.
+  Each MCP server belongs to at most one policy. Servers that no policy claims follow the Baseline policy (barndoor_dlp_mcp_baseline_policy). Destroying a policy archives it: its servers go back to the Baseline policy and its name is free to use again.
   The organization must be on MCP server policies. While it still manages MCP traffic through barndoor_dlp_enforcement_policy, this API is read-only and writes fail with a 409.
 ---
 
@@ -12,7 +12,7 @@ description: |-
 
 Manages a Data Protection (DLP) MCP server policy: the rules that protect tool traffic to a set of MCP servers.
 
-Each MCP server belongs to at most one policy. Servers that no policy claims follow the Baseline policy (`barndoor_dlp_mcp_baseline_policy`), and destroying a policy hands its servers back to the Baseline policy.
+Each MCP server belongs to at most one policy. Servers that no policy claims follow the Baseline policy (`barndoor_dlp_mcp_baseline_policy`). Destroying a policy archives it: its servers go back to the Baseline policy and its name is free to use again.
 
 The organization must be on MCP server policies. While it still manages MCP traffic through `barndoor_dlp_enforcement_policy`, this API is read-only and writes fail with a 409.
 
@@ -78,8 +78,10 @@ resource "barndoor_dlp_mcp_policy" "engineering_tools" {
 - `created_at` (String) When the policy was created (RFC 3339).
 - `created_by` (String) Subject that created the policy (empty when the platform could not attribute it).
 - `id` (String) Policy UUID assigned by the API; also the `terraform import` key.
+- `status` (String) The policy's lifecycle state (`ACTIVE`, `DRAFT` or `INACTIVE`). Read-only in this provider version: only an `ACTIVE` policy governs traffic.
 - `updated_at` (String) When the policy was last updated (RFC 3339).
 - `updated_by` (String) Subject that last updated the policy.
+- `version` (Number) The policy's revision number; null until its first recorded change.
 
 <a id="nestedatt--rules"></a>
 ### Nested Schema for `rules`
@@ -94,7 +96,7 @@ Optional:
 
 - `agent_scope` (Attributes) AI agents the rule applies to. Omit to apply to every agent, including agents created later. (see [below for nested schema](#nestedatt--rules--agent_scope))
 - `dry_run` (Boolean) Whether the rule only observes (records findings without acting). Defaults to `false`.
-- `label` (String) Optional display label for the rule, up to 120 characters.
+- `label` (String) Optional display label for the rule, up to 120 characters, with no leading or trailing whitespace. Omit it for no label.
 - `mask_format` (Attributes) Partial-redaction shape: keep a prefix or suffix of the matched value readable and mask the rest. Only valid with `action = "POLICY_ACTION_MASK"`; omit it to mask the whole value. (see [below for nested schema](#nestedatt--rules--mask_format))
 - `principal_scope` (Attributes) Users the rule applies to, by IdP group or role. Omit to apply to every user. A user matches the list when any of their groups or roles is in it. (see [below for nested schema](#nestedatt--rules--principal_scope))
 
