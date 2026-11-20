@@ -668,6 +668,18 @@ func (f *fakeDlpMcpServer) markPolicyArchived(t *testing.T, id string) {
 	p.Version++
 }
 
+// setPolicyStatus sets a policy's lifecycle status, as an admin would in the app.
+func (f *fakeDlpMcpServer) setPolicyStatus(t *testing.T, id, status string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.policies[id]
+	if !ok {
+		t.Fatalf("fake: no MCP policy %s", id)
+	}
+	p.Status = status
+}
+
 func (f *fakeDlpMcpServer) archivedCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

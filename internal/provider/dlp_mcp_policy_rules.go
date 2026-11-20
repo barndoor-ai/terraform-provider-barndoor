@@ -439,9 +439,7 @@ func buildDlpMcpRulePayloads(ctx context.Context, rules []dlpMcpRuleModel) ([]dl
 // them (which would churn rule ids and re-check every listed agent against
 // the agent directory). A planned rule identical to a stored one keeps that
 // rule's id wherever it moved; a rule that changed keeps the id of the stored
-// rule it is unambiguously paired with: the only unmatched stored rule when
-// exactly one planned rule is unmatched, or the rule at the same position when
-// the unmatched planned and stored positions are the same set. Anything left
+// rule at its own position, if that one is still unclaimed. Anything left
 // over is sent without an id and created.
 func assignDlpMcpRuleIDs(planned, stored []dlpMcpRulePayload) {
 	used := make([]bool, len(stored))
@@ -461,26 +459,15 @@ func assignDlpMcpRuleIDs(planned, stored []dlpMcpRulePayload) {
 			}
 		}
 	}
-	// Pass 2 pairs rules that changed, by position, only when the pairing is
-	// unambiguous: a wrong pairing hands a rule an id (and the agent-liveness
-	// skip that comes with it) that was never checked against its content.
-	var planUnmatched, storedUnmatched []int
+	// Pass 2 pairs a rule that changed with the stored rule at the same index,
+	// when that one is still unclaimed. Nothing else is paired: a different
+	// position could be an edit or a delete plus an unrelated add, and a wrong
+	// pairing hands a rule an id (and the agent-liveness skip that comes with
+	// it) that was never checked against its content.
 	for i := range planned {
-		if !matched[i] {
-			planUnmatched = append(planUnmatched, i)
-		}
-	}
-	for j := range stored {
-		if !used[j] && stored[j].ID != nil {
-			storedUnmatched = append(storedUnmatched, j)
-		}
-	}
-	switch {
-	case len(planUnmatched) == 1 && len(storedUnmatched) == 1:
-		planned[planUnmatched[0]].ID = stored[storedUnmatched[0]].ID
-	case len(planUnmatched) > 1 && slices.Equal(planUnmatched, storedUnmatched):
-		for _, i := range planUnmatched {
+		if !matched[i] && i < len(stored) && !used[i] && stored[i].ID != nil {
 			planned[i].ID = stored[i].ID
+			used[i] = true
 		}
 	}
 }

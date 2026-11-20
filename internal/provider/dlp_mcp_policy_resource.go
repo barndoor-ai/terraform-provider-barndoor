@@ -281,6 +281,19 @@ func (r *dlpMcpPolicyResource) Update(ctx context.Context, req resource.UpdateRe
 		addDlpMcpPolicyGoneDiagnostic(&resp.Diagnostics)
 		return
 	}
+	var current dlpMcpPolicyResourceModel
+	resp.Diagnostics.Append(req.State.Get(ctx, &current)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if !current.Status.IsNull() && !current.Status.IsUnknown() && stored.Status != current.Status.ValueString() {
+		resp.Diagnostics.AddError(
+			"MCP policy status changed outside Terraform",
+			fmt.Sprintf("The policy's status is now %s, but Terraform planned this change for status %s. Run "+
+				"`terraform plan` again.", stored.Status, current.Status.ValueString()),
+		)
+		return
+	}
 	assignDlpMcpRuleIDs(body.Rules, stored.Rules)
 
 	var policy dlpMcpPolicyResponse

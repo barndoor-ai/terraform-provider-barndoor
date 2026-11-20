@@ -16,6 +16,7 @@ import (
 	frameworkresource "github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 )
 
@@ -98,11 +99,10 @@ func TestAssignDlpMcpRuleIDs(t *testing.T) {
 			got = append(got, *r.ID)
 		}
 	}
-	// B keeps its id by content wherever it moved. The edited A and the new
-	// rule are unmatched, and so are stored A and C, but at different
-	// positions: pairing them could hand a rule another rule's id (and skip
-	// its agent check), so both are created.
-	want := []string{"id-b", "<new>", "<new>"}
+	// B keeps its id by content wherever it moved. The edited A (index 1) has
+	// no unclaimed stored rule at its index, so it is created. The new rule
+	// sits at index 2, where C was dropped, and takes over C's id.
+	want := []string{"id-b", "<new>", "id-c"}
 	if !slices.Equal(got, want) {
 		t.Errorf("assigned ids = %v, want %v", got, want)
 	}
@@ -138,25 +138,21 @@ func TestAssignDlpMcpRuleIDs_PositionFallback(t *testing.T) {
 		planned []dlpMcpRulePayload
 		want    []string
 	}{
-		"delete first and edit another: no false pairing": {
-			planned: []dlpMcpRulePayload{edit(b), c},
-			want:    []string{"<new>", "id-c"},
+		"delete first and append: appended rule gets no id": {
+			planned: []dlpMcpRulePayload{b, c, fresh},
+			want:    []string{"id-b", "id-c", "<new>"},
 		},
-		"reorder and edit one: paired": {
+		"reorder and edit one: edited rule moved, no id": {
 			planned: []dlpMcpRulePayload{c, edit(a), b},
-			want:    []string{"id-c", "id-a", "id-b"},
+			want:    []string{"id-c", "<new>", "id-b"},
 		},
 		"insert in the middle: no id stolen": {
 			planned: []dlpMcpRulePayload{a, fresh, c, b},
 			want:    []string{"id-a", "<new>", "id-c", "id-b"},
 		},
-		"insert in the middle and edit the next: no id stolen": {
-			planned: []dlpMcpRulePayload{a, fresh, edit(b), c},
-			want:    []string{"id-a", "<new>", "<new>", "id-c"},
-		},
-		"swap and edit one: paired": {
+		"swap and edit one: edited rule moved, no id": {
 			planned: []dlpMcpRulePayload{edit(b), a, c},
-			want:    []string{"id-b", "id-a", "id-c"},
+			want:    []string{"<new>", "id-a", "id-c"},
 		},
 		"edits in place: paired": {
 			planned: []dlpMcpRulePayload{edit(a), edit(b), c},
@@ -377,8 +373,8 @@ func TestDlpMcpPolicyResource_lifecycle(t *testing.T) {
 					resource.TestCheckNoResourceAttr(resourceName, "rules.0.agent_scope"),
 					resource.TestCheckNoResourceAttr(resourceName, "rules.0.principal_scope"),
 					func(*terraform.State) error {
-						if got := fake.ruleIDs(policyID); len(got) != 1 || slices.Contains(firstRuleIDs, got[0]) {
-							return fmt.Errorf("rule ids = %v, want one new id: the remaining rule changed and no stored rule is an unambiguous match (originals %v)", got, firstRuleIDs)
+						if got := fake.ruleIDs(policyID); len(got) != 1 || got[0] != firstRuleIDs[0] {
+							return fmt.Errorf("rule ids = %v, want the first stored id %s kept by position", got, firstRuleIDs[0])
 						}
 						return nil
 					},
@@ -703,5 +699,93 @@ func TestDlpMcpPolicyResource_destroyThenCreateSameNameAndServers(t *testing.T) 
 	})
 	if n := fake.archivedCount(); n != 2 {
 		t.Fatalf("%d archived policies after the second destroy, want 2", n)
+	}
+}
+
+// beforeApplyCheck is a plan check that runs after the plan and before the
+// apply, so the change under test reaches Update instead of Read.
+type beforeApplyCheck func()
+
+func (c beforeApplyCheck) CheckPlan(context.Context, plancheck.CheckPlanRequest, *plancheck.CheckPlanResponse) {
+	c()
+}
+
+func TestDlpMcpPolicyResource_updateOfPolicyChangedAfterPlan(t *testing.T) {
+	const resourceName = "barndoor_dlp_mcp_policy.test"
+	initial := dlpMcpPolicyConfig("tf-mcp-race", `["github"]`, "[]")
+	changed := dlpMcpPolicyConfig("tf-mcp-race", `["github", "jira"]`, "[]")
+
+	for name, tc := range map[string]struct {
+		policiesV2 bool
+		disturb    func(t *testing.T, fake *fakeDlpMcpServer, id string)
+		want       string
+	}{
+		"archived, flag off (404)": {
+			disturb: func(t *testing.T, f *fakeDlpMcpServer, id string) { f.markPolicyArchived(t, id) },
+			want:    "MCP policy no longer exists",
+		},
+		"archived, flag on (200 ARCHIVED)": {
+			policiesV2: true,
+			disturb:    func(t *testing.T, f *fakeDlpMcpServer, id string) { f.markPolicyArchived(t, id) },
+			want:       "MCP policy no longer exists",
+		},
+		"deactivated": {
+			policiesV2: true,
+			disturb:    func(t *testing.T, f *fakeDlpMcpServer, id string) { f.setPolicyStatus(t, id, "INACTIVE") },
+			want:       "MCP policy status changed outside Terraform",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake := setupDlpMcpTest(t)
+			fake.setPoliciesV2(tc.policiesV2)
+
+			var id string
+			var puts int
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+				Steps: []resource.TestStep{
+					{
+						Config: initial,
+						Check: func(s *terraform.State) error {
+							id = s.RootModule().Resources[resourceName].Primary.ID
+							puts = fake.putCount()
+							return nil
+						},
+					},
+					{
+						Config: changed,
+						ConfigPlanChecks: resource.ConfigPlanChecks{
+							PreApply: []plancheck.PlanCheck{
+								beforeApplyCheck(func() { tc.disturb(t, fake, id) }),
+							},
+						},
+						ExpectError: regexp.MustCompile(tc.want),
+					},
+					{
+						// The failed apply must not have sent a PUT.
+						PreConfig: func() {
+							if n := fake.putCount(); n != puts {
+								t.Errorf("%d PUTs sent despite the error, want %d", n, puts)
+							}
+							fake.setPolicyStatus(t, id, "ACTIVE")
+						},
+						Config:  initial,
+						Destroy: true,
+					},
+				},
+			})
+		})
+	}
+}
+
+func TestWarnDlpMcpPolicyInactive(t *testing.T) {
+	for status, want := range map[string]int{"ACTIVE": 0, "DRAFT": 1, "INACTIVE": 1} {
+		t.Run(status, func(t *testing.T) {
+			var diags diag.Diagnostics
+			warnDlpMcpPolicyInactive(&diags, &dlpMcpPolicyResponse{Name: "p", Status: status})
+			if got := len(diags.Warnings()); got != want || diags.HasError() {
+				t.Errorf("status %s: %d warnings (want %d), diagnostics %+v", status, got, want, diags)
+			}
+		})
 	}
 }
