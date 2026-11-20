@@ -93,7 +93,7 @@ func (r *dlpMcpBaselinePolicyResource) Schema(_ context.Context, _ resource.Sche
 				MarkdownDescription: "The Baseline policy's lifecycle state. Read-only in this provider version.",
 				Computed:            true,
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
+					stringplanmodifier.UseNonNullStateForUnknown(),
 				},
 			},
 			"version": schema.Int64Attribute{

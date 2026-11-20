@@ -16,7 +16,6 @@ BUG FIXES:
 * resource/`barndoor_dlp_mcp_policy` and `barndoor_dlp_mcp_baseline_policy`: a rule `label` with leading or trailing whitespace, or only whitespace, is rejected at plan time. The API trims it, so it used to fail with "Provider produced inconsistent result".
 * resource/`barndoor_dlp_mcp_policy`: a policy that was archived outside Terraform is dropped from state and recreated on the next apply, whether the API reports it as not found or as archived.
 * resource/`barndoor_dlp_mcp_policy`: updating a policy that was archived or deleted since the last refresh now says so and asks you to run `terraform plan` again, as does a policy whose status changed between plan and apply. A 409 `policy_archived` or `policies_v2_not_enabled` is reported as such instead of as a name conflict.
-* resource/`barndoor_dlp_mcp_policy` and `barndoor_dlp_mcp_baseline_policy`: when rules change, a changed rule keeps its id only if it stays at the same position; otherwise it is sent as a new rule. A changed rule is no longer paired with a rule at a different position, so it can't inherit another rule's agent check.
 
 ## 0.12.0 (2026-11-13)
 

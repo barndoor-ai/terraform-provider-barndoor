@@ -110,7 +110,7 @@ func (r *dlpMcpPolicyResource) Schema(_ context.Context, _ resource.SchemaReques
 					"Read-only in this provider version: only an `ACTIVE` policy governs traffic.",
 				Computed: true,
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
+					stringplanmodifier.UseNonNullStateForUnknown(),
 				},
 			},
 			"version": schema.Int64Attribute{

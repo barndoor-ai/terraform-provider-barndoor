@@ -14,7 +14,11 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	frameworkresource "github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
@@ -785,6 +789,44 @@ func TestWarnDlpMcpPolicyInactive(t *testing.T) {
 			warnDlpMcpPolicyInactive(&diags, &dlpMcpPolicyResponse{Name: "p", Status: status})
 			if got := len(diags.Warnings()); got != want || diags.HasError() {
 				t.Errorf("status %s: %d warnings (want %d), diagnostics %+v", status, got, want, diags)
+			}
+		})
+	}
+}
+
+// State written before `status` existed holds null for it. The plan must leave
+// it unknown then, not copy the null, or apply fails with "was null, but now".
+func TestDlpMcpStatusPlanModifierIgnoresNullState(t *testing.T) {
+	for name, newResource := range map[string]func() frameworkresource.Resource{
+		"policy":   NewDlpMcpPolicyResource,
+		"baseline": NewDlpMcpBaselinePolicyResource,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var resp frameworkresource.SchemaResponse
+			newResource().Schema(context.Background(), frameworkresource.SchemaRequest{}, &resp)
+			attr, ok := resp.Schema.Attributes["status"].(schema.StringAttribute)
+			if !ok {
+				t.Fatal("status is not a string attribute")
+			}
+			for _, tc := range []struct {
+				state, want types.String
+			}{
+				{types.StringNull(), types.StringUnknown()},
+				{types.StringValue("ACTIVE"), types.StringValue("ACTIVE")},
+			} {
+				req := planmodifier.StringRequest{
+					StateValue:  tc.state,
+					PlanValue:   types.StringUnknown(),
+					ConfigValue: types.StringNull(),
+					Plan:        tfsdk.Plan{Raw: tftypes.NewValue(tftypes.Object{}, nil)},
+				}
+				mresp := &planmodifier.StringResponse{PlanValue: types.StringUnknown()}
+				for _, m := range attr.PlanModifiers {
+					m.PlanModifyString(context.Background(), req, mresp)
+				}
+				if !mresp.PlanValue.Equal(tc.want) {
+					t.Errorf("state %v: planned %v, want %v", tc.state, mresp.PlanValue, tc.want)
+				}
 			}
 		})
 	}
