@@ -28,6 +28,13 @@ resource "barndoor_dlp_mcp_policy" "engineering_tools" {
   # barndoor_mcp_server.github.id).
   mcp_server_ids = ["github-server-id", "jira-server-id"]
 
+  # Optional. Without it a new policy is created ACTIVE and Terraform leaves
+  # its status alone afterwards. Set DRAFT to stage a policy that does not
+  # govern traffic yet, then ACTIVE to start enforcing it; INACTIVE stops
+  # enforcing without deleting it. Needs policy lifecycle to be enabled for the
+  # organization.
+  status = "ACTIVE"
+
   rules = [
     {
       # Tokenize PII in everything the tools return.
@@ -73,12 +80,15 @@ resource "barndoor_dlp_mcp_policy" "engineering_tools" {
 - `name` (String) Policy name, unique among the organization's MCP policies. `Baseline policy` is reserved.
 - `rules` (Attributes List) Rules applied to the policy's servers, in order. Use `[]` for a policy with no rules, which exempts its servers from the Baseline policy. At most 50. (see [below for nested schema](#nestedatt--rules))
 
+### Optional
+
+- `status` (String) The policy's lifecycle state: `ACTIVE`, `DRAFT` or `INACTIVE`. Only an `ACTIVE` policy governs traffic. A `DRAFT` or `INACTIVE` policy owns no servers (they follow another policy, or the Baseline policy) and may list servers that other policies also list. Unlike `barndoor_policy`, a new policy is created as `ACTIVE` when `status` is not set. A new policy can only be created as `ACTIVE` or `DRAFT`; to reach `INACTIVE` create it as `ACTIVE` and change the status in a later apply. `ARCHIVED` is not configurable: archiving is what `terraform destroy` does. When `status` is not set Terraform does not manage it, so a status changed in the app is left alone. Setting `status` requires policy lifecycle to be enabled for the organization; without it the API rejects any request that carries a status, so leave it unset (a policy is then always `ACTIVE`).
+
 ### Read-Only
 
 - `created_at` (String) When the policy was created (RFC 3339).
 - `created_by` (String) Subject that created the policy (empty when the platform could not attribute it).
 - `id` (String) Policy UUID assigned by the API; also the `terraform import` key.
-- `status` (String) The policy's lifecycle state (`ACTIVE`, `DRAFT` or `INACTIVE`). Read-only in this provider version: only an `ACTIVE` policy governs traffic.
 - `updated_at` (String) When the policy was last updated (RFC 3339).
 - `updated_by` (String) Subject that last updated the policy.
 - `version` (Number) The policy's revision number; null until its first recorded change.

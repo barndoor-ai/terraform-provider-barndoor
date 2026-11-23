@@ -7,6 +7,13 @@ resource "barndoor_dlp_mcp_policy" "engineering_tools" {
   # barndoor_mcp_server.github.id).
   mcp_server_ids = ["github-server-id", "jira-server-id"]
 
+  # Optional. Without it a new policy is created ACTIVE and Terraform leaves
+  # its status alone afterwards. Set DRAFT to stage a policy that does not
+  # govern traffic yet, then ACTIVE to start enforcing it; INACTIVE stops
+  # enforcing without deleting it. Needs policy lifecycle to be enabled for the
+  # organization.
+  status = "ACTIVE"
+
   rules = [
     {
       # Tokenize PII in everything the tools return.

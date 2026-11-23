@@ -61,6 +61,12 @@ const (
 	dlpMcpPolicyArchivedCode       = "policy_archived"
 	dlpMcpPoliciesV2NotEnabledCode = "policies_v2_not_enabled"
 
+	// Stable `code`s of the API's errors for a status change.
+	dlpMcpInvalidStatusTransitionCode = "invalid_status_transition"
+	dlpMcpInvalidInitialStatusCode    = "invalid_initial_status"
+	dlpMcpStatusChangeWithEditsCode   = "status_change_with_edits"
+	dlpMcpDependencyUnavailableCode   = "dependency_unavailable"
+
 	// dlpMcpStatusArchived is the status of a policy that was destroyed.
 	dlpMcpStatusArchived = "ARCHIVED"
 
@@ -606,8 +612,16 @@ func addDlpMcpPolicyAPIError(diags *diag.Diagnostics, action string, err error) 
 		case dlpErrorCode(apiErr) == dlpMcpPoliciesV2NotEnabledCode:
 			diags.AddError(
 				"Policy lifecycle is not enabled for this organization",
-				fmt.Sprintf("Failed to %s: %s\n\nThe request needs a platform feature that is not enabled "+
-					"for this organization.", action, apiErr.displayBody()),
+				fmt.Sprintf("Failed to %s: %s\n\nPolicy status requires policy lifecycle to be enabled for "+
+					"this organization. Remove `status` from the configuration, or set it to `ACTIVE`.",
+					action, apiErr.displayBody()),
+			)
+		case dlpErrorCode(apiErr) == dlpMcpInvalidStatusTransitionCode:
+			diags.AddError(
+				"Status change not allowed",
+				fmt.Sprintf("Failed to %s: %s\n\nA policy can change from DRAFT to ACTIVE, from ACTIVE to "+
+					"INACTIVE, and from INACTIVE to ACTIVE. It can't go from DRAFT straight to INACTIVE: "+
+					"apply `status = \"ACTIVE\"` first, then INACTIVE.", action, apiErr.displayBody()),
 			)
 		case dlpErrorCode(apiErr) == dlpMcpServerAlreadyAssignedCode:
 			diags.AddError(
@@ -632,10 +646,26 @@ func addDlpMcpPolicyAPIError(diags *diag.Diagnostics, action string, err error) 
 				action, apiErr.displayBody()),
 		)
 	case http.StatusUnprocessableEntity:
+		if dlpErrorCode(apiErr) == dlpMcpInvalidInitialStatusCode {
+			diags.AddError(
+				"Invalid initial status",
+				fmt.Sprintf("Failed to %s: %s\n\nA new policy can only be created as `ACTIVE` or `DRAFT`.",
+					action, apiErr.displayBody()),
+			)
+			return
+		}
 		// The API's validation message (rule number and what is wrong with
 		// it) is the most specific thing we can show; surface it verbatim.
 		diags.AddError("MCP policy rejected by the Data Protection API", apiErr.displayBody())
 	case http.StatusServiceUnavailable:
+		if dlpErrorCode(apiErr) == dlpMcpDependencyUnavailableCode {
+			diags.AddError(
+				"Platform service temporarily unavailable",
+				fmt.Sprintf("Failed to %s: %s\n\nThe Data Protection API could not read the MCP server "+
+					"registry to check the policy's servers. Retry the apply.", action, apiErr.displayBody()),
+			)
+			return
+		}
 		diags.AddError(
 			"Agent directory unavailable",
 			fmt.Sprintf("Failed to %s: %s\n\nThe Data Protection API could not check the listed agents "+
@@ -653,6 +683,24 @@ func addDlpMcpPolicyAPIError(diags *diag.Diagnostics, action string, err error) 
 	default:
 		diags.AddError("Failed to "+action, apiErr.Error())
 	}
+}
+
+// addDlpMcpPolicyStatusAPIError is addDlpMcpPolicyAPIError for a request that
+// may carry a status: an activation that collides with another active policy
+// gets its own explanation, since the usual fix (removing the server from the
+// other policy) differs.
+func addDlpMcpPolicyStatusAPIError(diags *diag.Diagnostics, action string, err error) {
+	if apiErr, ok := asAPIError(err); ok && apiErr.status == http.StatusConflict &&
+		dlpErrorCode(apiErr) == dlpMcpServerAlreadyAssignedCode && strings.HasPrefix(action, "activate") {
+		diags.AddError(
+			"Cannot activate: an MCP server already belongs to another active policy",
+			fmt.Sprintf("Failed to %s: %s\n\nOnly one active policy can cover an MCP server. Remove the "+
+				"server from the other policy's `mcp_server_ids`, or deactivate that policy, then apply "+
+				"again.", action, apiErr.displayBody()),
+		)
+		return
+	}
+	addDlpMcpPolicyAPIError(diags, action, err)
 }
 
 // dlpErrorCode extracts the `code` field of a JSON error body, or "".

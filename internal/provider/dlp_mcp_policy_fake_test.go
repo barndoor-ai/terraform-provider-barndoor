@@ -40,13 +40,27 @@ type fakeMcpPolicy struct {
 	IsBaseline bool
 	Servers    []string
 	Rules      []dlpMcpRulePayload
-	// Status is ACTIVE unless a test archives the policy (DELETE does).
+	// Status is ACTIVE unless created as DRAFT, changed with a status PUT, or
+	// archived (DELETE does).
 	Status string
 	// Version is the revision number, 0 (served as null) until a first write.
 	Version int
 }
 
-const fakeMcpStatusActive = "ACTIVE"
+const (
+	fakeMcpStatusActive   = "ACTIVE"
+	fakeMcpStatusDraft    = "DRAFT"
+	fakeMcpStatusInactive = "INACTIVE"
+)
+
+// fakeMcpAllowedTransitions is the API's status matrix (a same-status request
+// is a no-op).
+var fakeMcpAllowedTransitions = map[string][]string{
+	fakeMcpStatusDraft:    {fakeMcpStatusActive, dlpMcpStatusArchived},
+	fakeMcpStatusActive:   {fakeMcpStatusInactive, dlpMcpStatusArchived},
+	fakeMcpStatusInactive: {fakeMcpStatusActive, dlpMcpStatusArchived},
+	dlpMcpStatusArchived:  {fakeMcpStatusDraft},
+}
 
 // fakeMcpContent is the part of a policy whose change bumps its version.
 type fakeMcpContent struct {
@@ -80,6 +94,9 @@ type fakeDlpMcpServer struct {
 	policiesV2 bool
 	// puts counts PUT requests the fake received.
 	puts int
+	// writeLog records each policy write, e.g. "POST status=none",
+	// "PUT content" or "PUT status=ACTIVE", in arrival order.
+	writeLog []string
 
 	// createdRuleIDs records every rule id the fake minted, so tests can tell
 	// a kept rule from a recreated one.
@@ -384,15 +401,16 @@ func (f *fakeDlpMcpServer) normalizeServers(w http.ResponseWriter, in []string) 
 	return out, true
 }
 
-// refuseConflicts writes the production 409 when another policy owns one of
-// servers, or another policy has name.
-func (f *fakeDlpMcpServer) refuseConflicts(w http.ResponseWriter, name string, servers []string, exceptID string) bool {
+// refuseConflicts writes the production 409 when another ACTIVE policy owns
+// one of servers (checked only when checkServers: a DRAFT or INACTIVE policy
+// owns none and may overlap), or another policy has name.
+func (f *fakeDlpMcpServer) refuseConflicts(w http.ResponseWriter, name string, servers []string, exceptID string, checkServers bool) bool {
 	for _, p := range f.policies {
 		if p.ID == exceptID || p.archived() {
 			continue
 		}
 		for _, s := range servers {
-			if slices.Contains(p.Servers, s) {
+			if checkServers && p.Status == fakeMcpStatusActive && slices.Contains(p.Servers, s) {
 				writeJSONStatus(w, http.StatusConflict, map[string]string{
 					"message": fmt.Sprintf("Each MCP server can belong to only one policy. Some of the servers "+
 						"you selected already belong to '%s'. Remove them from those policies first.", p.Name),
@@ -462,9 +480,28 @@ func (f *fakeDlpMcpServer) createPolicy(w http.ResponseWriter, r *http.Request) 
 		Name         string               `json:"name"`
 		McpServerIDs []string             `json:"mcp_server_ids"`
 		Rules        []fakeMcpRuleRequest `json:"rules"`
+		Status       *string              `json:"status"`
 	}
 	if !decodeStrict(w, r, &body) {
 		return
+	}
+	status := fakeMcpStatusActive
+	if body.Status == nil {
+		f.writeLog = append(f.writeLog, "POST status=none")
+	} else {
+		f.writeLog = append(f.writeLog, "POST status="+*body.Status)
+		if !f.policiesV2 {
+			f.refuseStatusNotEnabled(w)
+			return
+		}
+		if *body.Status != fakeMcpStatusActive && *body.Status != fakeMcpStatusDraft {
+			writeJSONStatus(w, http.StatusUnprocessableEntity, map[string]string{
+				"message": "A new policy can only be created as DRAFT or ACTIVE.",
+				"code":    dlpMcpInvalidInitialStatusCode,
+			})
+			return
+		}
+		status = *body.Status
 	}
 	name, ok := fakeMcpValidName(w, body.Name)
 	if !ok {
@@ -478,7 +515,7 @@ func (f *fakeDlpMcpServer) createPolicy(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	if !f.refuseConflicts(w, name, servers, "") {
+	if !f.refuseConflicts(w, name, servers, "", status == fakeMcpStatusActive) {
 		return
 	}
 	f.nextPolicyID++
@@ -487,7 +524,7 @@ func (f *fakeDlpMcpServer) createPolicy(w http.ResponseWriter, r *http.Request) 
 		Name:    name,
 		Servers: servers,
 		Rules:   rules,
-		Status:  fakeMcpStatusActive,
+		Status:  status,
 		Version: 1,
 	}
 	f.policies[p.ID] = p
@@ -502,6 +539,7 @@ func (f *fakeDlpMcpServer) updatePolicy(w http.ResponseWriter, r *http.Request, 
 		Name         *string               `json:"name"`
 		McpServerIDs *[]string             `json:"mcp_server_ids"`
 		Rules        *[]fakeMcpRuleRequest `json:"rules"`
+		Status       *string               `json:"status"`
 	}
 	if !decodeStrict(w, r, &body) {
 		return
@@ -511,6 +549,12 @@ func (f *fakeDlpMcpServer) updatePolicy(w http.ResponseWriter, r *http.Request, 
 		writeJSONMessage(w, http.StatusNotFound, fmt.Sprintf("MCP policy %s not found", id))
 		return
 	}
+	if body.Status != nil {
+		f.writeLog = append(f.writeLog, "PUT status="+*body.Status)
+		f.changeStatus(w, p, body.Status, body.Name != nil || body.McpServerIDs != nil || body.Rules != nil)
+		return
+	}
+	f.writeLog = append(f.writeLog, "PUT content")
 	if p.archived() {
 		writeJSONStatus(w, http.StatusConflict, map[string]string{
 			"message": "This policy is archived and can't be changed.",
@@ -543,7 +587,7 @@ func (f *fakeDlpMcpServer) updatePolicy(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 	}
-	if !f.refuseConflicts(w, name, servers, id) {
+	if !f.refuseConflicts(w, name, servers, id, p.Status == fakeMcpStatusActive) {
 		return
 	}
 	before := p.content()
@@ -551,6 +595,47 @@ func (f *fakeDlpMcpServer) updatePolicy(w http.ResponseWriter, r *http.Request, 
 	if !reflect.DeepEqual(before, p.content()) {
 		p.Version++
 	}
+	writeJSONStatus(w, http.StatusOK, fakeMcpPolicyJSON(p))
+}
+
+func (f *fakeDlpMcpServer) refuseStatusNotEnabled(w http.ResponseWriter) {
+	writeJSONStatus(w, http.StatusConflict, map[string]string{
+		"message": "Policy lifecycle is not enabled for this organization.",
+		"code":    dlpMcpPoliciesV2NotEnabledCode,
+	})
+}
+
+// changeStatus serves a PUT that carries status: it must be alone, the
+// organization must have policy lifecycle, the transition must be allowed, and
+// activating must not take a server from another ACTIVE policy.
+func (f *fakeDlpMcpServer) changeStatus(w http.ResponseWriter, p *fakeMcpPolicy, status *string, withEdits bool) {
+	if !f.policiesV2 {
+		f.refuseStatusNotEnabled(w)
+		return
+	}
+	if withEdits {
+		writeJSONStatus(w, http.StatusUnprocessableEntity, map[string]string{
+			"message": "A status change can't be combined with other edits.",
+			"code":    dlpMcpStatusChangeWithEditsCode,
+		})
+		return
+	}
+	if *status == p.Status {
+		writeJSONStatus(w, http.StatusOK, fakeMcpPolicyJSON(p))
+		return
+	}
+	if !slices.Contains(fakeMcpAllowedTransitions[p.Status], *status) {
+		writeJSONStatus(w, http.StatusConflict, map[string]string{
+			"message": fmt.Sprintf("A policy can't change from %s to %s.", p.Status, *status),
+			"code":    dlpMcpInvalidStatusTransitionCode,
+		})
+		return
+	}
+	if *status == fakeMcpStatusActive && !f.refuseConflicts(w, p.Name, p.Servers, p.ID, true) {
+		return
+	}
+	p.Status = *status
+	p.Version++
 	writeJSONStatus(w, http.StatusOK, fakeMcpPolicyJSON(p))
 }
 
@@ -690,6 +775,13 @@ func (f *fakeDlpMcpServer) archivedCount() int {
 		}
 	}
 	return n
+}
+
+// writes returns the recorded policy writes, in arrival order.
+func (f *fakeDlpMcpServer) writes() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.writeLog)
 }
 
 func (f *fakeDlpMcpServer) putCount() int {
