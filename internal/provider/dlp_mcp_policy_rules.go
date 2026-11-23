@@ -55,6 +55,15 @@ const (
 	// for a save that would put an MCP server in a second policy.
 	dlpMcpServerAlreadyAssignedCode = "mcp_server_already_assigned"
 
+	// dlpMcpPolicyArchivedCode is the stable `code` of the API's 409 for a
+	// write to an archived policy, and dlpMcpPoliciesV2NotEnabledCode of its
+	// 409 for a request that needs a feature the organization doesn't have.
+	dlpMcpPolicyArchivedCode       = "policy_archived"
+	dlpMcpPoliciesV2NotEnabledCode = "policies_v2_not_enabled"
+
+	// dlpMcpStatusArchived is the status of a policy that was destroyed.
+	dlpMcpStatusArchived = "ARCHIVED"
+
 	// dlpMcpNotConvertedFragment identifies the API's 409 for an
 	// organization that still manages MCP traffic through enforcement
 	// policies, where the MCP-policy routes are read-only.
@@ -118,11 +127,12 @@ func dlpMcpRulesAttribute(description string) schema.ListNestedAttribute {
 		NestedObject: schema.NestedAttributeObject{
 			Attributes: map[string]schema.Attribute{
 				"label": schema.StringAttribute{
-					MarkdownDescription: fmt.Sprintf("Optional display label for the rule, up to %d characters.",
+					MarkdownDescription: fmt.Sprintf("Optional display label for the rule, up to %d characters, with no leading or trailing whitespace. Omit it for no label.",
 						dlpMcpMaxLabelChars),
 					Optional: true,
 					Validators: []validator.String{
 						stringvalidator.LengthBetween(1, dlpMcpMaxLabelChars),
+						noSurroundingWhitespace,
 					},
 				},
 				"runtime_boundary": schema.StringAttribute{
@@ -366,6 +376,8 @@ type dlpMcpPolicyResponse struct {
 	ID           string              `json:"id"`
 	Name         string              `json:"name"`
 	IsBaseline   bool                `json:"is_baseline"`
+	Status       string              `json:"status"`
+	Version      *int64              `json:"version"`
 	McpServerIDs []string            `json:"mcp_server_ids"`
 	Rules        []dlpMcpRulePayload `json:"rules"`
 	CreatedBy    string              `json:"created_by"`
@@ -427,8 +439,8 @@ func buildDlpMcpRulePayloads(ctx context.Context, rules []dlpMcpRuleModel) ([]dl
 // them (which would churn rule ids and re-check every listed agent against
 // the agent directory). A planned rule identical to a stored one keeps that
 // rule's id wherever it moved; a rule that changed keeps the id of the stored
-// rule at its position, if that one is still unclaimed. Anything left over is
-// sent without an id and created.
+// rule at its own position, if that one is still unclaimed. Anything left
+// over is sent without an id and created.
 func assignDlpMcpRuleIDs(planned, stored []dlpMcpRulePayload) {
 	used := make([]bool, len(stored))
 	storedKeys := make([]string, len(stored))
@@ -447,6 +459,11 @@ func assignDlpMcpRuleIDs(planned, stored []dlpMcpRulePayload) {
 			}
 		}
 	}
+	// Pass 2 pairs a rule that changed with the stored rule at the same index,
+	// when that one is still unclaimed. Nothing else is paired: a different
+	// position could be an edit or a delete plus an unrelated add, and a wrong
+	// pairing hands a rule an id (and the agent-liveness skip that comes with
+	// it) that was never checked against its content.
 	for i := range planned {
 		if !matched[i] && i < len(stored) && !used[i] && stored[i].ID != nil {
 			planned[i].ID = stored[i].ID
@@ -578,6 +595,19 @@ func addDlpMcpPolicyAPIError(diags *diag.Diagnostics, action string, err error) 
 					"enforcement policies, so the MCP policy API is read-only for it. Keep using "+
 					"`barndoor_dlp_enforcement_policy` until the organization moves to MCP server policies.",
 					action, apiErr.displayBody()),
+			)
+		case dlpErrorCode(apiErr) == dlpMcpPolicyArchivedCode:
+			diags.AddError(
+				"MCP policy is archived",
+				fmt.Sprintf("Failed to %s: %s\n\nThe policy was archived outside Terraform, and an archived "+
+					"policy can't be changed. Run `terraform plan` again so the provider recreates it.",
+					action, apiErr.displayBody()),
+			)
+		case dlpErrorCode(apiErr) == dlpMcpPoliciesV2NotEnabledCode:
+			diags.AddError(
+				"Policy lifecycle is not enabled for this organization",
+				fmt.Sprintf("Failed to %s: %s\n\nThe request needs a platform feature that is not enabled "+
+					"for this organization.", action, apiErr.displayBody()),
 			)
 		case dlpErrorCode(apiErr) == dlpMcpServerAlreadyAssignedCode:
 			diags.AddError(

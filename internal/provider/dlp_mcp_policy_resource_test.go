@@ -14,8 +14,13 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	frameworkresource "github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 )
 
@@ -44,7 +49,7 @@ func TestDlpMcpPolicyResource_Schema(t *testing.T) {
 	if diags := resp.Schema.ValidateImplementation(context.Background()); diags.HasError() {
 		t.Fatalf("schema failed framework validation: %+v", diags)
 	}
-	for _, attr := range []string{"id", "name", "mcp_server_ids", "rules", "created_by", "updated_by", "created_at", "updated_at"} {
+	for _, attr := range []string{"id", "name", "mcp_server_ids", "rules", "status", "version", "created_by", "updated_by", "created_at", "updated_at"} {
 		if _, ok := resp.Schema.Attributes[attr]; !ok {
 			t.Errorf("schema missing attribute %q", attr)
 		}
@@ -98,10 +103,9 @@ func TestAssignDlpMcpRuleIDs(t *testing.T) {
 			got = append(got, *r.ID)
 		}
 	}
-	// B keeps its id by content wherever it moved. Edited A sits at position
-	// 1, whose stored rule (B) is already claimed, so it is created. The new
-	// rule sits at position 2, where C was dropped, and so takes over C's id
-	// as an in-place edit.
+	// B keeps its id by content wherever it moved. The edited A (index 1) has
+	// no unclaimed stored rule at its index, so it is created. The new rule
+	// sits at index 2, where C was dropped, and takes over C's id.
 	want := []string{"id-b", "<new>", "id-c"}
 	if !slices.Equal(got, want) {
 		t.Errorf("assigned ids = %v, want %v", got, want)
@@ -124,6 +128,60 @@ func TestAssignDlpMcpRuleIDs_EditInPlaceKeepsID(t *testing.T) {
 	}
 	if planned[1].ID == nil || *planned[1].ID != "id-b" {
 		t.Errorf("rule edited in place should keep id-b, got %v", planned[1].ID)
+	}
+}
+
+func TestAssignDlpMcpRuleIDs_PositionFallback(t *testing.T) {
+	a := testMcpRule("TOOL_INPUT", "POLICY_ACTION_BLOCK")
+	b := testMcpRule("TOOL_OUTPUT", "POLICY_ACTION_REDACT")
+	c := testMcpRule("BOTH", "POLICY_ACTION_ALERT_ONLY")
+	edit := func(r dlpMcpRulePayload) dlpMcpRulePayload { r.DryRun = true; return r }
+	fresh := testMcpRule("TOOL_INPUT", "POLICY_ACTION_OMIT")
+
+	for name, tc := range map[string]struct {
+		planned []dlpMcpRulePayload
+		want    []string
+	}{
+		"delete first and append: appended rule gets no id": {
+			planned: []dlpMcpRulePayload{b, c, fresh},
+			want:    []string{"id-b", "id-c", "<new>"},
+		},
+		"reorder and edit one: edited rule moved, no id": {
+			planned: []dlpMcpRulePayload{c, edit(a), b},
+			want:    []string{"id-c", "<new>", "id-b"},
+		},
+		"insert in the middle: no id stolen": {
+			planned: []dlpMcpRulePayload{a, fresh, c, b},
+			want:    []string{"id-a", "<new>", "id-c", "id-b"},
+		},
+		"swap and edit one: edited rule moved, no id": {
+			planned: []dlpMcpRulePayload{edit(b), a, c},
+			want:    []string{"<new>", "id-a", "id-c"},
+		},
+		"edits in place: paired": {
+			planned: []dlpMcpRulePayload{edit(a), edit(b), c},
+			want:    []string{"id-a", "id-b", "id-c"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			storedA, storedB, storedC := a, b, c
+			storedA.ID, storedB.ID, storedC.ID = strPtr("id-a"), strPtr("id-b"), strPtr("id-c")
+			planned := slices.Clone(tc.planned)
+
+			assignDlpMcpRuleIDs(planned, []dlpMcpRulePayload{storedA, storedB, storedC})
+
+			got := []string{}
+			for _, r := range planned {
+				if r.ID == nil {
+					got = append(got, "<new>")
+				} else {
+					got = append(got, *r.ID)
+				}
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("assigned ids = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -178,6 +236,16 @@ func TestAddDlpMcpPolicyAPIError(t *testing.T) {
 			status: http.StatusConflict,
 			body:   `{"message":"Each MCP server can belong to only one policy.","code":"mcp_server_already_assigned"}`,
 			want:   "MCP server already belongs to another policy",
+		},
+		"policy archived": {
+			status: http.StatusConflict,
+			body:   `{"message":"This policy is archived.","code":"policy_archived"}`,
+			want:   "MCP policy is archived",
+		},
+		"policies v2 not enabled": {
+			status: http.StatusConflict,
+			body:   `{"message":"Not available.","code":"policies_v2_not_enabled"}`,
+			want:   "Policy lifecycle is not enabled for this organization",
 		},
 		"name taken": {
 			status: http.StatusConflict,
@@ -479,6 +547,14 @@ func TestDlpMcpPolicyResource_planTimeValidation(t *testing.T) {
 			rule: fmt.Sprintf(`agent_scope = { mode = "ONLY", agent_ids = [%q] }`, strings.ToUpper(testMcpAgentA)),
 			want: "must be a lowercase UUID",
 		},
+		"padded label": {
+			rule: `label = " padded "`,
+			want: "rules[0].label must not be empty or have",
+		},
+		"blank label": {
+			rule: `label = "   "`,
+			want: "rules[0].label must not be empty or have",
+		},
 		"reserved name": {
 			name: "baseline POLICY",
 			want: "reserved for the Baseline policy",
@@ -506,6 +582,252 @@ func TestDlpMcpPolicyResource_planTimeValidation(t *testing.T) {
 					},
 				},
 			})
+		})
+	}
+}
+
+func TestDlpMcpPolicyResource_statusAndVersion(t *testing.T) {
+	fake := setupDlpMcpTest(t)
+	const resourceName = "barndoor_dlp_mcp_policy.test"
+	config := dlpMcpPolicyConfig("tf-mcp-version", `["github"]`, "[]")
+
+	var policyID string
+	var putsAfterCreate int
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllDlpMcpPoliciesDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "status", "ACTIVE"),
+					resource.TestCheckResourceAttr(resourceName, "version", "1"),
+					func(s *terraform.State) error {
+						policyID = s.RootModule().Resources[resourceName].Primary.ID
+						putsAfterCreate = fake.putCount()
+						return nil
+					},
+				),
+			},
+			{
+				// Nothing changed: no PUT, and the revision number stays.
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "version", "1"),
+					func(*terraform.State) error {
+						if n := fake.putCount(); n != putsAfterCreate {
+							return fmt.Errorf("an unchanged apply sent %d PUTs, want %d", n, putsAfterCreate)
+						}
+						if v := fake.policyVersion(policyID); v != 1 {
+							return fmt.Errorf("stored version = %d after an unchanged apply, want 1", v)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: dlpMcpPolicyConfig("tf-mcp-version", `["github", "jira"]`, "[]"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "status", "ACTIVE"),
+					resource.TestCheckResourceAttr(resourceName, "version", "2"),
+				),
+			},
+		},
+	})
+}
+
+func TestDlpMcpPolicyResource_archivedOutsideTerraformIsRecreated(t *testing.T) {
+	for name, policiesV2 := range map[string]bool{
+		"lifecycle flag off (archived reads 404)": false,
+		"lifecycle flag on (archived reads 200)":  true,
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake := setupDlpMcpTest(t)
+			fake.setPoliciesV2(policiesV2)
+			const resourceName = "barndoor_dlp_mcp_policy.test"
+			config := dlpMcpPolicyConfig("tf-mcp-archived", `["github"]`, "[]")
+
+			var firstID string
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+				CheckDestroy:             checkAllDlpMcpPoliciesDeleted(fake),
+				Steps: []resource.TestStep{
+					{
+						Config: config,
+						Check: func(s *terraform.State) error {
+							firstID = s.RootModule().Resources[resourceName].Primary.ID
+							return nil
+						},
+					},
+					{
+						PreConfig: func() { fake.markPolicyArchived(t, firstID) },
+						Config:    config,
+						Check: resource.ComposeAggregateTestCheckFunc(
+							resource.TestCheckResourceAttr(resourceName, "status", "ACTIVE"),
+							func(s *terraform.State) error {
+								if id := s.RootModule().Resources[resourceName].Primary.ID; id == firstID {
+									return fmt.Errorf("expected a new policy after the old one was archived, still %s", firstID)
+								}
+								return nil
+							},
+						),
+					},
+				},
+			})
+		})
+	}
+}
+
+// Destroying archives the policy; its name and servers must be free to use
+// again immediately.
+func TestDlpMcpPolicyResource_destroyThenCreateSameNameAndServers(t *testing.T) {
+	fake := setupDlpMcpTest(t)
+	config := dlpMcpPolicyConfig("tf-mcp-reuse", `["github", "jira"]`, "[]")
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllDlpMcpPoliciesDeleted(fake),
+		Steps:                    []resource.TestStep{{Config: config}},
+	})
+	if n := fake.archivedCount(); n != 1 {
+		t.Fatalf("%d archived policies after destroy, want 1 (destroy should archive)", n)
+	}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllDlpMcpPoliciesDeleted(fake),
+		Steps: []resource.TestStep{{
+			Config: config,
+			Check:  resource.TestCheckResourceAttr("barndoor_dlp_mcp_policy.test", "name", "tf-mcp-reuse"),
+		}},
+	})
+	if n := fake.archivedCount(); n != 2 {
+		t.Fatalf("%d archived policies after the second destroy, want 2", n)
+	}
+}
+
+// beforeApplyCheck is a plan check that runs after the plan and before the
+// apply, so the change under test reaches Update instead of Read.
+type beforeApplyCheck func()
+
+func (c beforeApplyCheck) CheckPlan(context.Context, plancheck.CheckPlanRequest, *plancheck.CheckPlanResponse) {
+	c()
+}
+
+func TestDlpMcpPolicyResource_updateOfPolicyChangedAfterPlan(t *testing.T) {
+	const resourceName = "barndoor_dlp_mcp_policy.test"
+	initial := dlpMcpPolicyConfig("tf-mcp-race", `["github"]`, "[]")
+	changed := dlpMcpPolicyConfig("tf-mcp-race", `["github", "jira"]`, "[]")
+
+	for name, tc := range map[string]struct {
+		policiesV2 bool
+		disturb    func(t *testing.T, fake *fakeDlpMcpServer, id string)
+		want       string
+	}{
+		"archived, flag off (404)": {
+			disturb: func(t *testing.T, f *fakeDlpMcpServer, id string) { f.markPolicyArchived(t, id) },
+			want:    "MCP policy no longer exists",
+		},
+		"archived, flag on (200 ARCHIVED)": {
+			policiesV2: true,
+			disturb:    func(t *testing.T, f *fakeDlpMcpServer, id string) { f.markPolicyArchived(t, id) },
+			want:       "MCP policy no longer exists",
+		},
+		"deactivated": {
+			policiesV2: true,
+			disturb:    func(t *testing.T, f *fakeDlpMcpServer, id string) { f.setPolicyStatus(t, id, "INACTIVE") },
+			want:       "MCP policy status changed outside Terraform",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake := setupDlpMcpTest(t)
+			fake.setPoliciesV2(tc.policiesV2)
+
+			var id string
+			var puts int
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+				Steps: []resource.TestStep{
+					{
+						Config: initial,
+						Check: func(s *terraform.State) error {
+							id = s.RootModule().Resources[resourceName].Primary.ID
+							puts = fake.putCount()
+							return nil
+						},
+					},
+					{
+						Config: changed,
+						ConfigPlanChecks: resource.ConfigPlanChecks{
+							PreApply: []plancheck.PlanCheck{
+								beforeApplyCheck(func() { tc.disturb(t, fake, id) }),
+							},
+						},
+						ExpectError: regexp.MustCompile(tc.want),
+					},
+					{
+						// The failed apply must not have sent a PUT.
+						PreConfig: func() {
+							if n := fake.putCount(); n != puts {
+								t.Errorf("%d PUTs sent despite the error, want %d", n, puts)
+							}
+							fake.setPolicyStatus(t, id, "ACTIVE")
+						},
+						Config:  initial,
+						Destroy: true,
+					},
+				},
+			})
+		})
+	}
+}
+
+func TestWarnDlpMcpPolicyInactive(t *testing.T) {
+	for status, want := range map[string]int{"ACTIVE": 0, "DRAFT": 1, "INACTIVE": 1} {
+		t.Run(status, func(t *testing.T) {
+			var diags diag.Diagnostics
+			warnDlpMcpPolicyInactive(&diags, &dlpMcpPolicyResponse{Name: "p", Status: status})
+			if got := len(diags.Warnings()); got != want || diags.HasError() {
+				t.Errorf("status %s: %d warnings (want %d), diagnostics %+v", status, got, want, diags)
+			}
+		})
+	}
+}
+
+// State written before `status` existed holds null for it. The plan must leave
+// it unknown then, not copy the null, or apply fails with "was null, but now".
+func TestDlpMcpStatusPlanModifierIgnoresNullState(t *testing.T) {
+	for name, newResource := range map[string]func() frameworkresource.Resource{
+		"policy":   NewDlpMcpPolicyResource,
+		"baseline": NewDlpMcpBaselinePolicyResource,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var resp frameworkresource.SchemaResponse
+			newResource().Schema(context.Background(), frameworkresource.SchemaRequest{}, &resp)
+			attr, ok := resp.Schema.Attributes["status"].(schema.StringAttribute)
+			if !ok {
+				t.Fatal("status is not a string attribute")
+			}
+			for _, tc := range []struct {
+				state, want types.String
+			}{
+				{types.StringNull(), types.StringUnknown()},
+				{types.StringValue("ACTIVE"), types.StringValue("ACTIVE")},
+			} {
+				req := planmodifier.StringRequest{
+					StateValue:  tc.state,
+					PlanValue:   types.StringUnknown(),
+					ConfigValue: types.StringNull(),
+					Plan:        tfsdk.Plan{Raw: tftypes.NewValue(tftypes.Object{}, nil)},
+				}
+				mresp := &planmodifier.StringResponse{PlanValue: types.StringUnknown()}
+				for _, m := range attr.PlanModifiers {
+					m.PlanModifyString(context.Background(), req, mresp)
+				}
+				if !mresp.PlanValue.Equal(tc.want) {
+					t.Errorf("state %v: planned %v, want %v", tc.state, mresp.PlanValue, tc.want)
+				}
+			}
 		})
 	}
 }

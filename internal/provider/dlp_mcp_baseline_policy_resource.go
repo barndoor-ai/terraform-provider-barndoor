@@ -46,6 +46,8 @@ type dlpMcpBaselinePolicyResource struct {
 type dlpMcpBaselinePolicyResourceModel struct {
 	ID        types.String      `tfsdk:"id"`
 	Rules     []dlpMcpRuleModel `tfsdk:"rules"`
+	Status    types.String      `tfsdk:"status"`
+	Version   types.Int64       `tfsdk:"version"`
 	CreatedBy types.String      `tfsdk:"created_by"`
 	UpdatedBy types.String      `tfsdk:"updated_by"`
 	CreatedAt types.String      `tfsdk:"created_at"`
@@ -87,6 +89,17 @@ func (r *dlpMcpBaselinePolicyResource) Schema(_ context.Context, _ resource.Sche
 			},
 			"rules": dlpMcpRulesAttribute("Rules applied to every MCP server without its own policy, in order. " +
 				"Use `[]` for no rules. At most 50."),
+			"status": schema.StringAttribute{
+				MarkdownDescription: "The Baseline policy's lifecycle state. Read-only in this provider version.",
+				Computed:            true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseNonNullStateForUnknown(),
+				},
+			},
+			"version": schema.Int64Attribute{
+				MarkdownDescription: "The Baseline policy's revision number; null until its first recorded change.",
+				Computed:            true,
+			},
 			"created_by": schema.StringAttribute{
 				MarkdownDescription: "Subject that first saved the Baseline policy (empty when the platform " +
 					"could not attribute it).",
@@ -260,6 +273,8 @@ func applyDlpMcpBaselineResponse(ctx context.Context, policy *dlpMcpPolicyRespon
 	return dlpMcpBaselinePolicyResourceModel{
 		ID:        types.StringValue(policy.ID),
 		Rules:     rules,
+		Status:    types.StringValue(policy.Status),
+		Version:   types.Int64PointerValue(policy.Version),
 		CreatedBy: types.StringValue(policy.CreatedBy),
 		UpdatedBy: types.StringValue(policy.UpdatedBy),
 		CreatedAt: types.StringValue(policy.CreatedAt),

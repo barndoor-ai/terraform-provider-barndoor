@@ -6,6 +6,17 @@ FEATURES:
 
 * **New Resource:** `barndoor_llm_api_key_lifetime_role_override` overrides the API key lifetime default for users with one IdP role (a role synced from the identity provider, the same kind Model Access matches, not the platform admin role). Role overrides count alongside group overrides: a user covered by several gets the strictest, and a user override still wins over both. An override with no limits exempts the role. Changing `role_name` forces a new override; import is by id. Rejects `fixed_lifetime` without `max_lifetime_days` at plan time. Requires a platform that serves role overrides (API version 2.39.0 or later).
 
+ENHANCEMENTS:
+
+* resource/`barndoor_dlp_mcp_policy` and `barndoor_dlp_mcp_baseline_policy`: new read-only `status` and `version` attributes. `status` is the policy's lifecycle state (`ACTIVE`, `DRAFT` or `INACTIVE`); `version` is its revision number, null until its first recorded change. A `barndoor_dlp_mcp_policy` whose status is `DRAFT` or `INACTIVE` raises a warning, since it does not govern traffic. This version can't change a policy's status.
+* resource/`barndoor_dlp_mcp_policy`: the docs now say that destroying a policy archives it, which frees its name and servers for reuse.
+
+BUG FIXES:
+
+* resource/`barndoor_dlp_mcp_policy` and `barndoor_dlp_mcp_baseline_policy`: a rule `label` with leading or trailing whitespace, or only whitespace, is rejected at plan time. The API trims it, so it used to fail with "Provider produced inconsistent result".
+* resource/`barndoor_dlp_mcp_policy`: a policy that was archived outside Terraform is dropped from state and recreated on the next apply, whether the API reports it as not found or as archived.
+* resource/`barndoor_dlp_mcp_policy`: updating a policy that was archived or deleted since the last refresh now says so and asks you to run `terraform plan` again, as does a policy whose status changed between plan and apply. A 409 `policy_archived` or `policies_v2_not_enabled` is reported as such instead of as a name conflict.
+
 ## 0.12.0 (2026-11-13)
 
 FEATURES:

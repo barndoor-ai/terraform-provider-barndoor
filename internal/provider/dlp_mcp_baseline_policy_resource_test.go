@@ -137,6 +137,8 @@ func TestDlpMcpBaselinePolicyResource_createsOnFirstSave(t *testing.T) {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr(resourceName, "id", fakeMcpBaselineID),
 					resource.TestCheckResourceAttr(resourceName, "rules.0.runtime_boundary", "TOOL_INPUT"),
+					resource.TestCheckResourceAttr(resourceName, "status", "ACTIVE"),
+					resource.TestCheckResourceAttr(resourceName, "version", "1"),
 				),
 			},
 			{Config: config, PlanOnly: true},
