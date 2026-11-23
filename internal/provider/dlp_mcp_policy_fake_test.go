@@ -636,7 +636,8 @@ func (f *fakeDlpMcpServer) changeStatus(w http.ResponseWriter, p *fakeMcpPolicy,
 	}
 	if *status == fakeMcpStatusActive {
 		// Activating keeps only servers that still exist in the registry
-		// (a typo'd id counts as deleted); none left is a 409.
+		// (the real API also drops unknown and non-UUID ids; this fake drops only
+		// ids registered with markServerDeleted); none left is a 409.
 		kept := []string{}
 		for _, srv := range p.Servers {
 			if !f.deletedServers[srv] {
