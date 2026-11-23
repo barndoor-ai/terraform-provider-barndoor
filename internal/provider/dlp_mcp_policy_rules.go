@@ -67,6 +67,9 @@ const (
 	dlpMcpStatusChangeWithEditsCode   = "status_change_with_edits"
 	dlpMcpDependencyUnavailableCode   = "dependency_unavailable"
 
+	dlpMcpRestoreServersUnavailableCode = "restore_servers_unavailable"
+	dlpMcpInvalidPolicyRulesCode        = "invalid_policy_rules"
+
 	// dlpMcpStatusArchived is the status of a policy that was destroyed.
 	dlpMcpStatusArchived = "ARCHIVED"
 
@@ -619,9 +622,21 @@ func addDlpMcpPolicyAPIError(diags *diag.Diagnostics, action string, err error) 
 		case dlpErrorCode(apiErr) == dlpMcpInvalidStatusTransitionCode:
 			diags.AddError(
 				"Status change not allowed",
-				fmt.Sprintf("Failed to %s: %s\n\nA policy can change from DRAFT to ACTIVE, from ACTIVE to "+
-					"INACTIVE, and from INACTIVE to ACTIVE. It can't go from DRAFT straight to INACTIVE: "+
-					"apply `status = \"ACTIVE\"` first, then INACTIVE.", action, apiErr.displayBody()),
+				fmt.Sprintf("Failed to %s: %s\n\n%s", action, apiErr.displayBody(), dlpMcpStatusChangeHint),
+			)
+		case dlpErrorCode(apiErr) == dlpMcpRestoreServersUnavailableCode:
+			diags.AddError(
+				"No MCP servers left to activate the policy with",
+				fmt.Sprintf("Failed to %s: %s\n\nNone of the policy's MCP servers exist in the organization's "+
+					"MCP server registry any more. Set `mcp_server_ids` to servers that exist, then apply again.",
+					action, apiErr.displayBody()),
+			)
+		case dlpErrorCode(apiErr) == dlpMcpInvalidPolicyRulesCode:
+			diags.AddError(
+				"The policy's stored rules are no longer valid",
+				fmt.Sprintf("Failed to %s: %s\n\nA rule refers to something that no longer exists, such as a "+
+					"deleted protection profile. Update the rules in `rules` and apply again.",
+					action, apiErr.displayBody()),
 			)
 		case dlpErrorCode(apiErr) == dlpMcpServerAlreadyAssignedCode:
 			diags.AddError(

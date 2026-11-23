@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 )
 
@@ -415,6 +416,143 @@ func TestDlpMcpPolicyResource_statusEmptyServersNeedNonActiveStatus(t *testing.T
 			if n := len(fake.writes()); n != 0 {
 				t.Errorf("%d writes reached the API despite the config error", n)
 			}
+		})
+	}
+}
+
+func TestDlpMcpPolicyResource_statusActivationDroppingServersIsReported(t *testing.T) {
+	fake := setupDlpMcpTest(t)
+	fake.setPoliciesV2(true)
+	servers := `["github", "deleted-server"]`
+	var id string
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllDlpMcpPoliciesDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: dlpMcpStatusConfig("tf-status-drop", servers, "DRAFT"),
+				Check: func(s *terraform.State) error {
+					id = s.RootModule().Resources[statusTestResource].Primary.ID
+					return nil
+				},
+			},
+			{
+				PreConfig:   func() { fake.markServerDeleted("deleted-server") },
+				Config:      dlpMcpStatusConfig("tf-status-drop", servers, "ACTIVE"),
+				ExpectError: regexp.MustCompile(`MCP servers dropped on\s+activation`),
+			},
+			{
+				// State holds what the API kept; removing the dead server
+				// from the configuration converges with no further change.
+				Config: dlpMcpStatusConfig("tf-status-drop", `["github"]`, "ACTIVE"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(statusTestResource, "status", "ACTIVE"),
+					resource.TestCheckResourceAttr(statusTestResource, "mcp_server_ids.#", "1"),
+					func(*terraform.State) error {
+						if got := fake.policyServers(id); !slices.Equal(got, []string{"github"}) {
+							return fmt.Errorf("server holds %v, want [github]", got)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+func TestDlpMcpPolicyResource_statusActivationWithNoLiveServersIs409(t *testing.T) {
+	fake := setupDlpMcpTest(t)
+	fake.setPoliciesV2(true)
+	servers := `["deleted-server"]`
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllDlpMcpPoliciesDeleted(fake),
+		Steps: []resource.TestStep{
+			{Config: dlpMcpStatusConfig("tf-status-dead", servers, "DRAFT")},
+			{
+				PreConfig:   func() { fake.markServerDeleted("deleted-server") },
+				Config:      dlpMcpStatusConfig("tf-status-dead", servers, "ACTIVE"),
+				ExpectError: regexp.MustCompile(`No MCP servers left to activate`),
+			},
+		},
+	})
+}
+
+// A policy moved to the status the plan wants while the apply was pending
+// needs no status request, and must not trip the "changed outside Terraform"
+// guard.
+func TestDlpMcpPolicyResource_statusAlreadyAtPlannedStatusAfterPlan(t *testing.T) {
+	fake := setupDlpMcpTest(t)
+	fake.setPoliciesV2(true)
+	seen := 0
+	var id string
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllDlpMcpPoliciesDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: dlpMcpStatusConfig("tf-status-race", `["github"]`, "ACTIVE"),
+				Check: func(s *terraform.State) error {
+					id = s.RootModule().Resources[statusTestResource].Primary.ID
+					seen = len(fake.writes())
+					return nil
+				},
+			},
+			{
+				Config: dlpMcpStatusConfig("tf-status-race", `["github", "jira"]`, "INACTIVE"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						beforeApplyCheck(func() { fake.setPolicyStatus(t, id, "INACTIVE") }),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(statusTestResource, "status", "INACTIVE"),
+					checkWritesSince(fake, &seen, "PUT content"),
+				),
+			},
+		},
+	})
+}
+
+func TestDlpMcpPolicyResource_statusChangesTheAPIRefusesAreRefusedAtPlan(t *testing.T) {
+	for name, tc := range map[string]struct{ from, to string }{
+		"ACTIVE to DRAFT":   {"ACTIVE", "DRAFT"},
+		"INACTIVE to DRAFT": {"INACTIVE", "DRAFT"},
+		"DRAFT to INACTIVE": {"DRAFT", "INACTIVE"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fake := setupDlpMcpTest(t)
+			fake.setPoliciesV2(true)
+			seen := 0
+			var steps []resource.TestStep
+			if tc.from == "INACTIVE" {
+				// A policy can't be created INACTIVE: go via ACTIVE.
+				steps = append(steps, resource.TestStep{Config: dlpMcpStatusConfig("tf-status-plan", `["github"]`, "ACTIVE")})
+			}
+			steps = append(steps, resource.TestStep{
+				Config: dlpMcpStatusConfig("tf-status-plan", `["github"]`, tc.from),
+				Check: func(*terraform.State) error {
+					seen = len(fake.writes())
+					return nil
+				},
+			},
+				resource.TestStep{
+					// A content edit alongside must not be applied either.
+					Config:      dlpMcpStatusConfig("tf-status-plan", `["github", "jira"]`, tc.to),
+					ExpectError: regexp.MustCompile(`Status change not allowed`),
+				},
+				resource.TestStep{
+					Config: dlpMcpStatusConfig("tf-status-plan", `["github"]`, tc.from),
+					Check:  checkWritesSince(fake, &seen),
+				})
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+				CheckDestroy:             checkAllDlpMcpPoliciesDeleted(fake),
+				Steps:                    steps,
+			})
 		})
 	}
 }

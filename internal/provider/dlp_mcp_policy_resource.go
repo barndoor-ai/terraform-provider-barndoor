@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
@@ -196,16 +197,48 @@ func validateDlpMcpServersForStatus(ctx context.Context, config tfsdk.Config, di
 	)
 }
 
+// dlpMcpAllowedStatusChanges is the API's status matrix for the statuses that
+// appear in state (ARCHIVED never does; archiving is destroy).
+var dlpMcpAllowedStatusChanges = map[string][]string{
+	policyStatusDraft:    {policyStatusActive},
+	policyStatusActive:   {policyStatusInactive},
+	policyStatusInactive: {policyStatusActive},
+}
+
+// dlpMcpStatusChangeHint explains the allowed status changes.
+const dlpMcpStatusChangeHint = "A policy can change from DRAFT to ACTIVE, from ACTIVE to INACTIVE, and from " +
+	"INACTIVE to ACTIVE; it can't go back to DRAFT, and it can't go from DRAFT straight to INACTIVE (apply " +
+	"`status = \"ACTIVE\"` first)."
+
 // ModifyPlan rejects creating a policy directly as INACTIVE: the API only
 // accepts DRAFT or ACTIVE for a new policy. Transitions of an existing policy
-// are left to the API, which names the rejected change in its 409.
+// the API would refuse are rejected at plan time too.
 func (r *dlpMcpPolicyResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
-	if req.Plan.Raw.IsNull() || !req.State.Raw.IsNull() {
+	if req.Plan.Raw.IsNull() {
 		return
 	}
 	var status types.String
 	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("status"), &status)...)
 	if resp.Diagnostics.HasError() {
+		return
+	}
+	if !req.State.Raw.IsNull() {
+		// Refuse a status change the API would reject now, so a content edit
+		// planned alongside it is not applied before the status 409s.
+		var prior types.String
+		resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("status"), &prior)...)
+		if resp.Diagnostics.HasError() || prior.IsNull() || prior.IsUnknown() || status.IsNull() || status.IsUnknown() ||
+			prior.ValueString() == status.ValueString() {
+			return
+		}
+		if !slices.Contains(dlpMcpAllowedStatusChanges[prior.ValueString()], status.ValueString()) {
+			resp.Diagnostics.AddAttributeError(
+				path.Root("status"),
+				"Status change not allowed",
+				fmt.Sprintf("A policy can't change from %s to %s. %s", prior.ValueString(), status.ValueString(),
+					dlpMcpStatusChangeHint),
+			)
+		}
 		return
 	}
 	if !status.IsNull() && !status.IsUnknown() && status.ValueString() == policyStatusInactive {
@@ -444,6 +477,28 @@ func (r *dlpMcpPolicyResource) Update(ctx context.Context, req resource.UpdateRe
 		warnDlpMcpPolicyInactive(&resp.Diagnostics, &policy)
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
+	if !newState.McpServerIDs.Equal(plan.McpServerIDs) {
+		// Activating keeps only servers that still exist in the registry.
+		// State holds what the API kept; the error makes the config follow.
+		resp.Diagnostics.AddError(
+			"MCP servers dropped on activation",
+			"The API activated the policy without some of its MCP servers because they no longer exist in the "+
+				"organization's MCP server registry. Remove them from `mcp_server_ids` and apply again. The "+
+				"policy now covers: "+strings.Join(setStrings(newState.McpServerIDs), ", ")+".",
+		)
+	}
+}
+
+// setStrings lists a string set's elements.
+func setStrings(s types.Set) []string {
+	out := make([]string, 0, len(s.Elements()))
+	for _, e := range s.Elements() {
+		if v, ok := e.(types.String); ok {
+			out = append(out, v.ValueString())
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // dlpMcpPolicyStatusRequest is the body of a status change, which the API
@@ -570,8 +625,8 @@ func warnDlpMcpPolicyInactive(diags *diag.Diagnostics, policy *dlpMcpPolicyRespo
 	if policy.Status == "DRAFT" || policy.Status == "INACTIVE" {
 		diags.AddWarning(
 			"MCP policy does not govern traffic",
-			fmt.Sprintf("MCP policy %q has status %s, so it does not currently govern traffic. This provider "+
-				"version can't change a policy's status.", policy.Name, policy.Status),
+			fmt.Sprintf("MCP policy %q has status %s, so it does not currently govern traffic. Set "+
+				"`status = \"ACTIVE\"` to activate it from Terraform.", policy.Name, policy.Status),
 		)
 	}
 }

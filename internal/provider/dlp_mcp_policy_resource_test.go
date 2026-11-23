@@ -733,7 +733,7 @@ func TestDlpMcpPolicyResource_updateOfPolicyChangedAfterPlan(t *testing.T) {
 			disturb:    func(t *testing.T, f *fakeDlpMcpServer, id string) { f.markPolicyArchived(t, id) },
 			want:       "MCP policy no longer exists",
 		},
-		"deactivated": {
+		"deactivated (unmanaged status)": {
 			policiesV2: true,
 			disturb:    func(t *testing.T, f *fakeDlpMcpServer, id string) { f.setPolicyStatus(t, id, "INACTIVE") },
 			want:       "MCP policy status changed outside Terraform",

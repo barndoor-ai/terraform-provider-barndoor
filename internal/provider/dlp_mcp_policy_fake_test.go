@@ -92,6 +92,8 @@ type fakeDlpMcpServer struct {
 	// policy reads back as 200 ARCHIVED and refuses writes with a 409
 	// `policy_archived`, where it is a 404 otherwise.
 	policiesV2 bool
+	// deletedServers holds MCP server ids gone from the registry.
+	deletedServers map[string]bool
 	// puts counts PUT requests the fake received.
 	puts int
 	// writeLog records each policy write, e.g. "POST status=none",
@@ -632,12 +634,37 @@ func (f *fakeDlpMcpServer) changeStatus(w http.ResponseWriter, p *fakeMcpPolicy,
 		})
 		return
 	}
-	if *status == fakeMcpStatusActive && len(p.Servers) == 0 {
-		writeJSONMessage(w, http.StatusUnprocessableEntity, "An ACTIVE policy must cover at least one MCP server.")
-		return
-	}
-	if *status == fakeMcpStatusActive && !f.refuseConflicts(w, p.Name, p.Servers, p.ID, true) {
-		return
+	if *status == fakeMcpStatusActive {
+		// Activating keeps only servers that still exist in the registry
+		// (a typo'd id counts as deleted); none left is a 409.
+		kept := []string{}
+		for _, srv := range p.Servers {
+			if !f.deletedServers[srv] {
+				kept = append(kept, srv)
+			}
+		}
+		if len(kept) == 0 {
+			writeJSONStatus(w, http.StatusConflict, map[string]string{
+				"message": "None of this policy's MCP servers exist any more.",
+				"code":    dlpMcpRestoreServersUnavailableCode,
+			})
+			return
+		}
+		for _, other := range f.policies {
+			if other.ID == p.ID || other.archived() || other.Status != fakeMcpStatusActive {
+				continue
+			}
+			for _, srv := range kept {
+				if slices.Contains(other.Servers, srv) {
+					writeJSONStatus(w, http.StatusConflict, map[string]string{
+						"message": fmt.Sprintf("Server %s already belongs to '%s'.", srv, other.Name),
+						"code":    dlpMcpServerAlreadyAssignedCode,
+					})
+					return
+				}
+			}
+		}
+		p.Servers = kept
 	}
 	p.Status = *status
 	p.Version++
@@ -722,6 +749,16 @@ func (f *fakeDlpMcpServer) seedBaseline(rules ...dlpMcpRulePayload) {
 	f.baseline = &fakeMcpPolicy{ID: fakeMcpBaselineID, Name: dlpMcpBaselineName, IsBaseline: true, Rules: rules, Status: fakeMcpStatusActive}
 }
 
+// markServerDeleted removes an MCP server from the fake's registry.
+func (f *fakeDlpMcpServer) markServerDeleted(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deletedServers == nil {
+		f.deletedServers = map[string]bool{}
+	}
+	f.deletedServers[id] = true
+}
+
 func (f *fakeDlpMcpServer) setPolicyModel(model string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -802,6 +839,15 @@ func (f *fakeDlpMcpServer) policyVersion(id string) int {
 		return p.Version
 	}
 	return 0
+}
+
+func (f *fakeDlpMcpServer) policyServers(id string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if p := f.findPolicy(id); p != nil {
+		return slices.Clone(p.Servers)
+	}
+	return nil
 }
 
 func (f *fakeDlpMcpServer) ruleIDs(policyID string) []string {
