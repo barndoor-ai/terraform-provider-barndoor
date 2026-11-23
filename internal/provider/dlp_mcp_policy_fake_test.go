@@ -381,7 +381,7 @@ func fakeMcpScopePairingOK(w http.ResponseWriter, n int, block, mode string, lis
 	return true
 }
 
-func (f *fakeDlpMcpServer) normalizeServers(w http.ResponseWriter, in []string) ([]string, bool) {
+func (f *fakeDlpMcpServer) normalizeServers(w http.ResponseWriter, in []string, allowEmpty bool) ([]string, bool) {
 	out := []string{}
 	for _, raw := range in {
 		id := strings.TrimSpace(raw)
@@ -393,8 +393,9 @@ func (f *fakeDlpMcpServer) normalizeServers(w http.ResponseWriter, in []string) 
 			out = append(out, id)
 		}
 	}
-	if len(out) == 0 {
-		writeJSONMessage(w, http.StatusUnprocessableEntity, "A policy must cover at least one MCP server.")
+	// Only a DRAFT or INACTIVE policy may have no servers.
+	if len(out) == 0 && !allowEmpty {
+		writeJSONMessage(w, http.StatusUnprocessableEntity, "An ACTIVE policy must cover at least one MCP server.")
 		return nil, false
 	}
 	slices.Sort(out)
@@ -507,7 +508,7 @@ func (f *fakeDlpMcpServer) createPolicy(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	servers, ok := f.normalizeServers(w, body.McpServerIDs)
+	servers, ok := f.normalizeServers(w, body.McpServerIDs, status != fakeMcpStatusActive)
 	if !ok {
 		return
 	}
@@ -576,7 +577,7 @@ func (f *fakeDlpMcpServer) updatePolicy(w http.ResponseWriter, r *http.Request, 
 	servers := p.Servers
 	if body.McpServerIDs != nil {
 		var ok bool
-		if servers, ok = f.normalizeServers(w, *body.McpServerIDs); !ok {
+		if servers, ok = f.normalizeServers(w, *body.McpServerIDs, p.Status != fakeMcpStatusActive); !ok {
 			return
 		}
 	}
@@ -629,6 +630,10 @@ func (f *fakeDlpMcpServer) changeStatus(w http.ResponseWriter, p *fakeMcpPolicy,
 			"message": fmt.Sprintf("A policy can't change from %s to %s.", p.Status, *status),
 			"code":    dlpMcpInvalidStatusTransitionCode,
 		})
+		return
+	}
+	if *status == fakeMcpStatusActive && len(p.Servers) == 0 {
+		writeJSONMessage(w, http.StatusUnprocessableEntity, "An ACTIVE policy must cover at least one MCP server.")
 		return
 	}
 	if *status == fakeMcpStatusActive && !f.refuseConflicts(w, p.Name, p.Servers, p.ID, true) {

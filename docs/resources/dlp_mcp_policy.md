@@ -32,7 +32,8 @@ resource "barndoor_dlp_mcp_policy" "engineering_tools" {
   # its status alone afterwards. Set DRAFT to stage a policy that does not
   # govern traffic yet, then ACTIVE to start enforcing it; INACTIVE stops
   # enforcing without deleting it. Needs policy lifecycle to be enabled for the
-  # organization.
+  # organization. A DRAFT or INACTIVE policy may have `mcp_server_ids = []`;
+  # an ACTIVE one needs at least one server.
   status = "ACTIVE"
 
   rules = [
@@ -76,7 +77,7 @@ resource "barndoor_dlp_mcp_policy" "engineering_tools" {
 
 ### Required
 
-- `mcp_server_ids` (Set of String) IDs of the MCP servers the policy covers. At least one; a server can belong to only one policy. The `*` wildcard is not accepted: the Baseline policy covers every server not listed in a policy.
+- `mcp_server_ids` (Set of String) IDs of the MCP servers the policy covers. An `ACTIVE` policy needs at least one; set `status` to `DRAFT` or `INACTIVE` to save a policy with `[]`. An active server can belong to only one policy. The `*` wildcard is not accepted: the Baseline policy covers every server not listed in a policy.
 - `name` (String) Policy name, unique among the organization's MCP policies. `Baseline policy` is reserved.
 - `rules` (Attributes List) Rules applied to the policy's servers, in order. Use `[]` for a policy with no rules, which exempts its servers from the Baseline policy. At most 50. (see [below for nested schema](#nestedatt--rules))
 

@@ -359,3 +359,62 @@ func TestDlpMcpPolicyResource_statusImportReadsServerStatus(t *testing.T) {
 		},
 	})
 }
+
+func TestDlpMcpPolicyResource_statusServersMayBeEmptyOnlyWhenNotActive(t *testing.T) {
+	fake := setupDlpMcpTest(t)
+	fake.setPoliciesV2(true)
+	seen := 0
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		CheckDestroy:             checkAllDlpMcpPoliciesDeleted(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: dlpMcpStatusConfig("tf-status-noservers", `[]`, "DRAFT"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(statusTestResource, "status", "DRAFT"),
+					resource.TestCheckResourceAttr(statusTestResource, "mcp_server_ids.#", "0"),
+					checkWritesSince(fake, &seen, "POST status=DRAFT"),
+				),
+			},
+			{
+				// Servers first, then the activation that needs them.
+				Config: dlpMcpStatusConfig("tf-status-noservers", `["github"]`, "ACTIVE"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(statusTestResource, "status", "ACTIVE"),
+					resource.TestCheckResourceAttr(statusTestResource, "mcp_server_ids.#", "1"),
+					checkWritesSince(fake, &seen, "PUT content", "PUT status=ACTIVE"),
+				),
+			},
+			{
+				// Emptying the servers must land on an INACTIVE policy, so the
+				// status goes first.
+				Config: dlpMcpStatusConfig("tf-status-noservers", `[]`, "INACTIVE"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr(statusTestResource, "status", "INACTIVE"),
+					resource.TestCheckResourceAttr(statusTestResource, "mcp_server_ids.#", "0"),
+					checkWritesSince(fake, &seen, "PUT status=INACTIVE", "PUT content"),
+				),
+			},
+		},
+	})
+}
+
+func TestDlpMcpPolicyResource_statusEmptyServersNeedNonActiveStatus(t *testing.T) {
+	for name, status := range map[string]string{"unset": "", "ACTIVE": "ACTIVE"} {
+		t.Run(name, func(t *testing.T) {
+			fake := setupDlpMcpTest(t)
+			fake.setPoliciesV2(true)
+			resource.UnitTest(t, resource.TestCase{
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+				Steps: []resource.TestStep{{
+					Config:      dlpMcpStatusConfig("tf-status-empty", `[]`, status),
+					ExpectError: regexp.MustCompile(`An ACTIVE policy needs at least one MCP server`),
+				}},
+			})
+			if n := len(fake.writes()); n != 0 {
+				t.Errorf("%d writes reached the API despite the config error", n)
+			}
+		})
+	}
+}

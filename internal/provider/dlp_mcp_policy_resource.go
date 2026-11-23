@@ -18,6 +18,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/barndoor-ai/terraform-provider-barndoor/internal/client"
@@ -91,13 +92,13 @@ func (r *dlpMcpPolicyResource) Schema(_ context.Context, _ resource.SchemaReques
 				},
 			},
 			"mcp_server_ids": schema.SetAttribute{
-				MarkdownDescription: "IDs of the MCP servers the policy covers. At least one; a server can " +
-					"belong to only one policy. The `*` wildcard is not accepted: the Baseline policy covers " +
+				MarkdownDescription: "IDs of the MCP servers the policy covers. An `ACTIVE` policy needs at " +
+					"least one; set `status` to `DRAFT` or `INACTIVE` to save a policy with `[]`. An active " +
+					"server can belong to only one policy. The `*` wildcard is not accepted: the Baseline policy covers " +
 					"every server not listed in a policy.",
 				ElementType: types.StringType,
 				Required:    true,
 				Validators: []validator.Set{
-					setvalidator.SizeAtLeast(1),
 					setvalidator.ValueStringsAre(
 						noSurroundingWhitespace,
 						stringvalidator.NoneOf("*"),
@@ -167,6 +168,32 @@ func (r *dlpMcpPolicyResource) Schema(_ context.Context, _ resource.SchemaReques
 
 func (r *dlpMcpPolicyResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
 	validateDlpMcpRules(ctx, req.Config, &resp.Diagnostics)
+	validateDlpMcpServersForStatus(ctx, req.Config, &resp.Diagnostics)
+}
+
+// validateDlpMcpServersForStatus requires at least one server unless the
+// policy is configured as DRAFT or INACTIVE, which the API lets be saved with
+// none. An unset status means ACTIVE for a new policy, so it needs servers
+// too. Unknown values are skipped: they are checked again once known.
+func validateDlpMcpServersForStatus(ctx context.Context, config tfsdk.Config, diags *diag.Diagnostics) {
+	var servers types.Set
+	var status types.String
+	diags.Append(config.GetAttribute(ctx, path.Root("mcp_server_ids"), &servers)...)
+	diags.Append(config.GetAttribute(ctx, path.Root("status"), &status)...)
+	if diags.HasError() || servers.IsNull() || servers.IsUnknown() || status.IsUnknown() {
+		return
+	}
+	if len(servers.Elements()) > 0 {
+		return
+	}
+	if !status.IsNull() && (status.ValueString() == policyStatusDraft || status.ValueString() == policyStatusInactive) {
+		return
+	}
+	diags.AddAttributeError(
+		path.Root("mcp_server_ids"),
+		"An ACTIVE policy needs at least one MCP server",
+		"An ACTIVE policy needs at least one MCP server; set status to DRAFT or INACTIVE to save it without servers.",
+	)
 }
 
 // ModifyPlan rejects creating a policy directly as INACTIVE: the API only
