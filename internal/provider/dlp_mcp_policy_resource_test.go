@@ -247,6 +247,16 @@ func TestAddDlpMcpPolicyAPIError(t *testing.T) {
 			body:   `{"message":"Not available.","code":"policies_v2_not_enabled"}`,
 			want:   "Policy lifecycle is not enabled for this organization",
 		},
+		"invalid status transition": {
+			status: http.StatusConflict,
+			body:   `{"message":"No.","code":"invalid_status_transition"}`,
+			want:   "Status change not allowed",
+		},
+		"invalid policy rules": {
+			status: http.StatusConflict,
+			body:   `{"message":"Rule 1 is invalid.","code":"invalid_policy_rules"}`,
+			want:   "The policy's stored rules are no longer valid",
+		},
 		"name taken": {
 			status: http.StatusConflict,
 			body:   `{"message":"name taken"}`,
@@ -733,7 +743,7 @@ func TestDlpMcpPolicyResource_updateOfPolicyChangedAfterPlan(t *testing.T) {
 			disturb:    func(t *testing.T, f *fakeDlpMcpServer, id string) { f.markPolicyArchived(t, id) },
 			want:       "MCP policy no longer exists",
 		},
-		"deactivated": {
+		"deactivated (unmanaged status)": {
 			policiesV2: true,
 			disturb:    func(t *testing.T, f *fakeDlpMcpServer, id string) { f.setPolicyStatus(t, id, "INACTIVE") },
 			want:       "MCP policy status changed outside Terraform",

@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
@@ -18,6 +19,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/barndoor-ai/terraform-provider-barndoor/internal/client"
@@ -28,6 +30,7 @@ var (
 	_ resource.Resource                   = &dlpMcpPolicyResource{}
 	_ resource.ResourceWithConfigure      = &dlpMcpPolicyResource{}
 	_ resource.ResourceWithValidateConfig = &dlpMcpPolicyResource{}
+	_ resource.ResourceWithModifyPlan     = &dlpMcpPolicyResource{}
 	_ resource.ResourceWithImportState    = &dlpMcpPolicyResource{}
 )
 
@@ -90,13 +93,13 @@ func (r *dlpMcpPolicyResource) Schema(_ context.Context, _ resource.SchemaReques
 				},
 			},
 			"mcp_server_ids": schema.SetAttribute{
-				MarkdownDescription: "IDs of the MCP servers the policy covers. At least one; a server can " +
-					"belong to only one policy. The `*` wildcard is not accepted: the Baseline policy covers " +
+				MarkdownDescription: "IDs of the MCP servers the policy covers. An `ACTIVE` policy needs at " +
+					"least one; set `status` to `DRAFT` or `INACTIVE` to save a policy with `[]`. An active " +
+					"server can belong to only one policy. The `*` wildcard is not accepted: the Baseline policy covers " +
 					"every server not listed in a policy.",
 				ElementType: types.StringType,
 				Required:    true,
 				Validators: []validator.Set{
-					setvalidator.SizeAtLeast(1),
 					setvalidator.ValueStringsAre(
 						noSurroundingWhitespace,
 						stringvalidator.NoneOf("*"),
@@ -106,9 +109,29 @@ func (r *dlpMcpPolicyResource) Schema(_ context.Context, _ resource.SchemaReques
 			"rules": dlpMcpRulesAttribute("Rules applied to the policy's servers, in order. Use `[]` for a " +
 				"policy with no rules, which exempts its servers from the Baseline policy. At most 50."),
 			"status": schema.StringAttribute{
-				MarkdownDescription: "The policy's lifecycle state (`ACTIVE`, `DRAFT` or `INACTIVE`). " +
-					"Read-only in this provider version: only an `ACTIVE` policy governs traffic.",
+				MarkdownDescription: "The policy's lifecycle state: `" + policyStatusActive + "`, `" +
+					policyStatusDraft + "` or `" + policyStatusInactive + "`. Only an `" + policyStatusActive +
+					"` policy governs traffic. A `" + policyStatusDraft + "` or `" + policyStatusInactive +
+					"` policy owns no servers (they follow another policy, or the Baseline policy) and may " +
+					"list servers that other policies also list. Unlike `barndoor_policy`, a new policy is " +
+					"created as `" + policyStatusActive + "` when `status` is not set. A new policy can only " +
+					"be created as `" + policyStatusActive + "` or `" + policyStatusDraft + "`; to reach `" +
+					policyStatusInactive + "` create it as `" + policyStatusActive + "` and change the " +
+					"status in a later apply. `" + policyStatusArchived + "` is not configurable: archiving " +
+					"is what `terraform destroy` does. When `status` is not set Terraform does not manage it, " +
+					"so a status changed in the app is left alone. Setting `status` requires policy " +
+					"lifecycle to be enabled for the organization; without it the API rejects any request " +
+					"that carries a status, so leave it unset (a policy is then always `" +
+					policyStatusActive + "`).",
+				Optional: true,
 				Computed: true,
+				Validators: []validator.String{
+					policyStatusValidator{},
+				},
+				// When status is not configured, carry the last-known value
+				// through the plan instead of "(known after apply)", except
+				// for state written before the attribute existed (null),
+				// where the plan stays unknown so apply can fill it in.
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseNonNullStateForUnknown(),
 				},
@@ -146,6 +169,86 @@ func (r *dlpMcpPolicyResource) Schema(_ context.Context, _ resource.SchemaReques
 
 func (r *dlpMcpPolicyResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
 	validateDlpMcpRules(ctx, req.Config, &resp.Diagnostics)
+	validateDlpMcpServersForStatus(ctx, req.Config, &resp.Diagnostics)
+}
+
+// validateDlpMcpServersForStatus requires at least one server unless the
+// policy is configured as DRAFT or INACTIVE, which the API lets be saved with
+// none. An unset status means ACTIVE for a new policy, so it needs servers
+// too. Unknown values are skipped: they are checked again once known.
+func validateDlpMcpServersForStatus(ctx context.Context, config tfsdk.Config, diags *diag.Diagnostics) {
+	var servers types.Set
+	var status types.String
+	diags.Append(config.GetAttribute(ctx, path.Root("mcp_server_ids"), &servers)...)
+	diags.Append(config.GetAttribute(ctx, path.Root("status"), &status)...)
+	if diags.HasError() || servers.IsNull() || servers.IsUnknown() || status.IsUnknown() {
+		return
+	}
+	if len(servers.Elements()) > 0 {
+		return
+	}
+	if !status.IsNull() && (status.ValueString() == policyStatusDraft || status.ValueString() == policyStatusInactive) {
+		return
+	}
+	diags.AddAttributeError(
+		path.Root("mcp_server_ids"),
+		"An ACTIVE policy needs at least one MCP server",
+		"An ACTIVE policy needs at least one MCP server; set status to DRAFT or INACTIVE to save it without servers.",
+	)
+}
+
+// dlpMcpAllowedStatusChanges is the API's status matrix for the statuses that
+// appear in state (ARCHIVED never does; archiving is destroy).
+var dlpMcpAllowedStatusChanges = map[string][]string{
+	policyStatusDraft:    {policyStatusActive},
+	policyStatusActive:   {policyStatusInactive},
+	policyStatusInactive: {policyStatusActive},
+}
+
+// dlpMcpStatusChangeHint explains the allowed status changes.
+const dlpMcpStatusChangeHint = "A policy can change from DRAFT to ACTIVE, from ACTIVE to INACTIVE, and from " +
+	"INACTIVE to ACTIVE; it can't go back to DRAFT, and it can't go from DRAFT straight to INACTIVE (apply " +
+	"`status = \"ACTIVE\"` first)."
+
+// ModifyPlan rejects creating a policy directly as INACTIVE: the API only
+// accepts DRAFT or ACTIVE for a new policy. Transitions of an existing policy
+// the API would refuse are rejected at plan time too.
+func (r *dlpMcpPolicyResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.Plan.Raw.IsNull() {
+		return
+	}
+	var status types.String
+	resp.Diagnostics.Append(req.Plan.GetAttribute(ctx, path.Root("status"), &status)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if !req.State.Raw.IsNull() {
+		// Refuse a status change the API would reject now, so a content edit
+		// planned alongside it is not applied before the status 409s.
+		var prior types.String
+		resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("status"), &prior)...)
+		if resp.Diagnostics.HasError() || prior.IsNull() || prior.IsUnknown() || status.IsNull() || status.IsUnknown() ||
+			prior.ValueString() == status.ValueString() {
+			return
+		}
+		if !slices.Contains(dlpMcpAllowedStatusChanges[prior.ValueString()], status.ValueString()) {
+			resp.Diagnostics.AddAttributeError(
+				path.Root("status"),
+				"Status change not allowed",
+				fmt.Sprintf("A policy can't change from %s to %s. %s", prior.ValueString(), status.ValueString(),
+					dlpMcpStatusChangeHint),
+			)
+		}
+		return
+	}
+	if !status.IsNull() && !status.IsUnknown() && status.ValueString() == policyStatusInactive {
+		resp.Diagnostics.AddAttributeError(
+			path.Root("status"),
+			"Cannot create a policy as INACTIVE",
+			"A new policy can only be created as `"+policyStatusActive+"` or `"+policyStatusDraft+"`. Create it as `"+
+				policyStatusActive+"` first, then set `status = \""+policyStatusInactive+"\"` in a later apply.",
+		)
+	}
 }
 
 func (r *dlpMcpPolicyResource) Configure(_ context.Context, req resource.ConfigureRequest, resp *resource.ConfigureResponse) {
@@ -180,9 +283,17 @@ func (r *dlpMcpPolicyResource) Create(ctx context.Context, req resource.CreateRe
 		return
 	}
 
+	// Send status only when it is not the server default, so a configuration
+	// that sets `status = "ACTIVE"` still works for an organization without
+	// policy lifecycle (where any request carrying a status is refused).
+	if !plan.Status.IsNull() && !plan.Status.IsUnknown() && plan.Status.ValueString() != policyStatusActive {
+		status := plan.Status.ValueString()
+		body.Status = &status
+	}
+
 	var policy dlpMcpPolicyResponse
 	if err := doJSON(ctx, r.client, http.MethodPost, dlpAPIPrefix+"/mcp-policies", body, &policy); err != nil {
-		addDlpMcpPolicyAPIError(&resp.Diagnostics, "create the MCP policy", err)
+		addDlpMcpPolicyStatusAPIError(&resp.Diagnostics, "create the MCP policy", err)
 		return
 	}
 	if policy.ID == "" {
@@ -195,7 +306,9 @@ func (r *dlpMcpPolicyResource) Create(ctx context.Context, req resource.CreateRe
 		resp.Diagnostics.AddError("Failed to map the Data Protection API response", err.Error())
 		return
 	}
-	warnDlpMcpPolicyInactive(&resp.Diagnostics, &policy)
+	if plan.Status.IsUnknown() {
+		warnDlpMcpPolicyInactive(&resp.Diagnostics, &policy)
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -244,7 +357,6 @@ func (r *dlpMcpPolicyResource) Read(ctx context.Context, req resource.ReadReques
 		resp.Diagnostics.AddError("Failed to map the Data Protection API response", err.Error())
 		return
 	}
-	warnDlpMcpPolicyInactive(&resp.Diagnostics, &policy)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
 }
 
@@ -283,10 +395,22 @@ func (r *dlpMcpPolicyResource) Update(ctx context.Context, req resource.UpdateRe
 	}
 	var current dlpMcpPolicyResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &current)...)
+	var configStatus types.String
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("status"), &configStatus)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	if !current.Status.IsNull() && !current.Status.IsUnknown() && stored.Status != current.Status.ValueString() {
+
+	// A configured status is managed: move the policy to it when it differs
+	// from the server's. Unset means Terraform leaves the status alone.
+	desired := ""
+	if !configStatus.IsNull() && !plan.Status.IsNull() && !plan.Status.IsUnknown() {
+		desired = plan.Status.ValueString()
+	}
+	// The plan was made against the status held in state. If the server moved
+	// since, only carry on when it already is where the plan wants it.
+	if !current.Status.IsNull() && !current.Status.IsUnknown() && stored.Status != current.Status.ValueString() &&
+		stored.Status != desired {
 		resp.Diagnostics.AddError(
 			"MCP policy status changed outside Terraform",
 			fmt.Sprintf("The policy's status is now %s, but Terraform planned this change for status %s. Run "+
@@ -296,10 +420,52 @@ func (r *dlpMcpPolicyResource) Update(ctx context.Context, req resource.UpdateRe
 	}
 	assignDlpMcpRuleIDs(body.Rules, stored.Rules)
 
-	var policy dlpMcpPolicyResponse
-	if err := doJSON(ctx, r.client, http.MethodPut, policyPath, body, &policy); err != nil {
-		addDlpMcpPolicyAPIError(&resp.Diagnostics, "update the MCP policy", err)
+	contentChanged, err := dlpMcpPolicyContentChanged(ctx, req)
+	if err != nil {
+		resp.Diagnostics.AddError("Failed to compare the MCP policy with its prior state", err.Error())
 		return
+	}
+	statusChanged := desired != "" && desired != stored.Status
+
+	policy := stored
+	putContent := func() bool {
+		if !contentChanged {
+			return true
+		}
+		if err := doJSON(ctx, r.client, http.MethodPut, policyPath, body, &policy); err != nil {
+			addDlpMcpPolicyAPIError(&resp.Diagnostics, "update the MCP policy", err)
+			return false
+		}
+		return true
+	}
+	putStatus := func() bool {
+		if !statusChanged {
+			return true
+		}
+		// A status change travels alone: the API refuses it combined with
+		// edits.
+		verb := "change the MCP policy's status"
+		if desired == policyStatusActive {
+			verb = "activate the MCP policy"
+		}
+		if err := doJSON(ctx, r.client, http.MethodPut, policyPath, dlpMcpPolicyStatusRequest{Status: desired}, &policy); err != nil {
+			addDlpMcpPolicyStatusAPIError(&resp.Diagnostics, verb, err)
+			return false
+		}
+		return true
+	}
+
+	// Activating goes last, so its server-conflict check sees the new server
+	// list. Moving off ACTIVE goes first, so the policy stops governing before
+	// its content changes.
+	steps := []func() bool{putContent, putStatus}
+	if statusChanged && desired != policyStatusActive && stored.Status == policyStatusActive {
+		steps = []func() bool{putStatus, putContent}
+	}
+	for _, step := range steps {
+		if !step() {
+			return
+		}
 	}
 
 	newState, err := applyDlpMcpPolicyResponse(ctx, &policy, &plan)
@@ -307,8 +473,63 @@ func (r *dlpMcpPolicyResource) Update(ctx context.Context, req resource.UpdateRe
 		resp.Diagnostics.AddError("Failed to map the Data Protection API response", err.Error())
 		return
 	}
-	warnDlpMcpPolicyInactive(&resp.Diagnostics, &policy)
+	if desired == "" {
+		warnDlpMcpPolicyInactive(&resp.Diagnostics, &policy)
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &newState)...)
+	if !newState.McpServerIDs.Equal(plan.McpServerIDs) {
+		// Activating keeps only servers that still exist in the registry.
+		// State holds what the API kept; the error makes the config follow.
+		resp.Diagnostics.AddError(
+			"MCP servers dropped on activation",
+			"The API activated the policy without some of its MCP servers because they no longer exist in the "+
+				"organization's MCP server registry. Remove them from `mcp_server_ids` and apply again. The "+
+				"policy now covers: "+strings.Join(setStrings(newState.McpServerIDs), ", ")+".",
+		)
+	}
+}
+
+// setStrings lists a string set's elements.
+func setStrings(s types.Set) []string {
+	out := make([]string, 0, len(s.Elements()))
+	for _, e := range s.Elements() {
+		if v, ok := e.(types.String); ok {
+			out = append(out, v.ValueString())
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// dlpMcpPolicyStatusRequest is the body of a status change, which the API
+// accepts only on its own.
+type dlpMcpPolicyStatusRequest struct {
+	Status string `json:"status"`
+}
+
+// dlpMcpPolicyContentChanged reports whether the plan changes the policy's
+// name, servers or rules relative to the prior state, so a change to status
+// alone sends no content PUT.
+func dlpMcpPolicyContentChanged(ctx context.Context, req resource.UpdateRequest) (bool, error) {
+	var plannedName, priorName types.String
+	var plannedServers, priorServers types.Set
+	var plannedRules, priorRules types.List
+	for _, g := range []struct {
+		src interface {
+			GetAttribute(context.Context, path.Path, interface{}) diag.Diagnostics
+		}
+		name   string
+		target interface{}
+	}{
+		{req.Plan, "name", &plannedName}, {req.State, "name", &priorName},
+		{req.Plan, "mcp_server_ids", &plannedServers}, {req.State, "mcp_server_ids", &priorServers},
+		{req.Plan, "rules", &plannedRules}, {req.State, "rules", &priorRules},
+	} {
+		if diags := g.src.GetAttribute(ctx, path.Root(g.name), g.target); diags.HasError() {
+			return false, fmt.Errorf("%s: %v", g.name, diags)
+		}
+	}
+	return !plannedName.Equal(priorName) || !plannedServers.Equal(priorServers) || !plannedRules.Equal(priorRules), nil
 }
 
 // Delete removes the policy; its servers fall back to the Baseline policy. A
@@ -354,6 +575,9 @@ type dlpMcpPolicyWriteRequest struct {
 	Name         string              `json:"name"`
 	McpServerIDs []string            `json:"mcp_server_ids"`
 	Rules        []dlpMcpRulePayload `json:"rules"`
+	// Status is set on create only, and only when it is not the server
+	// default; an update body never carries it (see dlpMcpPolicyStatusRequest).
+	Status *string `json:"status,omitempty"`
 }
 
 func buildDlpMcpPolicyWriteRequest(ctx context.Context, plan *dlpMcpPolicyResourceModel) (*dlpMcpPolicyWriteRequest, error) {
@@ -401,8 +625,8 @@ func warnDlpMcpPolicyInactive(diags *diag.Diagnostics, policy *dlpMcpPolicyRespo
 	if policy.Status == "DRAFT" || policy.Status == "INACTIVE" {
 		diags.AddWarning(
 			"MCP policy does not govern traffic",
-			fmt.Sprintf("MCP policy %q has status %s, so it does not currently govern traffic. This provider "+
-				"version can't change a policy's status.", policy.Name, policy.Status),
+			fmt.Sprintf("MCP policy %q has status %s, so it does not currently govern traffic. Set "+
+				"`status = \"ACTIVE\"` to activate it from Terraform.", policy.Name, policy.Status),
 		)
 	}
 }
